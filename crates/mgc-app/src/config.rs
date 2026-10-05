@@ -514,6 +514,13 @@ pub struct RenderEnhancement {
     /// DEFAULTS ON (deliberate default-on deviation) — toggle off for
     /// the per-tile retail look.
     pub smooth_shading: bool,
+    /// Filter the world art (terrain textures + sprites) in RGB
+    /// instead of retail's chunky nearest texels — as if upscaled 2×
+    /// then bilinear (`mgc_render::SMOOTH_TEXTURE_SHARPNESS`); sprite
+    /// silhouettes soften alike. Presentation only. DEFAULTS ON
+    /// with the Visuals preset (deliberate default-on deviation,
+    /// player review 2026-10-05: "far superior"); Classic = off.
+    pub smooth_textures: bool,
     /// Entities render interpolated between the last two sim ticks —
     /// the camera's one-tick lerp timeline extended to the world —
     /// so movement is frame-smooth at any fps instead of stepping at
@@ -612,6 +619,7 @@ impl Default for RenderEnhancement {
     fn default() -> Self {
         Self {
             smooth_shading: true,
+            smooth_textures: true,
             smooth_motion: true,
             hud_transparency: HudTransparency::default(),
             map_owned_buildings: true,

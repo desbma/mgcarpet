@@ -382,6 +382,7 @@ pub const VISUALS_PRESET: PresetGroup = PresetGroup {
         "render.preference.fog_distance",
         "render.preference.rival_tags",
         "render.enhancement.smooth_motion",
+        "render.enhancement.smooth_textures",
         "render.enhancement.fire",
         "render.enhancement.lightning",
         "render.enhancement.map_owned_buildings",
@@ -408,6 +409,7 @@ pub const VISUALS_PRESET: PresetGroup = PresetGroup {
             RivalTags::Auto
         };
         enh.smooth_motion = true;
+        enh.smooth_textures = enhanced;
         enh.fire = if enhanced {
             FireEffects::Enhanced
         } else {
@@ -1307,6 +1309,26 @@ pub fn registry() -> Vec<Spec> {
                 descs: [
                     "Bare markers, as retail draws them.",
                     "Hunted markers wear a black-or-white contrast halo.",
+                ],
+            },
+        },
+        Spec {
+            domain: Render,
+            group: "render · enhancement",
+            label: "smooth_textures",
+            class: Enhancement,
+            key: None,
+            cli: Some("--smooth-textures"),
+            cfg_path: "render.enhancement.smooth_textures",
+            read: toggle!(c => render.enhancement.smooth_textures),
+            desc: "Texture filtering of the world art. Off = retail's \
+                   chunky pixels; on = terrain textures and sprites \
+                   smoothly filtered, sprite edges included.",
+            ctl: Ctl::Toggle {
+                set: |c, v| c.render.enhancement.smooth_textures = v,
+                descs: [
+                    "Chunky pixels — the original look.",
+                    "Smoothly filtered terrain and sprites.",
                 ],
             },
         },

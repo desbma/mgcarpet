@@ -1,13 +1,13 @@
 // Billboard (world sprite) pass: screen-aligned quads anchored at the
-// entity's feet, textured from the bundle's 8bpp sprite atlas.
+// entity's feet, textured from the RGBA sprite atlas.
 //
-// Same palette-index color path as terrain: the fragment resolves an
-// atlas texel (8-bit palette index; 0 = transparent, exactly the
-// original blitter's per-pixel skip) through the colormap
-// (palette[shade_lut[shade][index]]) and applies the shared distance
-// fog. Pixels stay chunky: integer texel loads, no filtering — the
-// billboard is the original sprite scaled, like the engine's affine
-// rasterizer.
+// Same color path as terrain: the fragment resolves an atlas texel
+// (alpha 0 = transparent, the original blitter's index-0 skip) through
+// the colour grade (grade.rs; the material byte picks the normal or
+// glowing table) and applies the shared distance fog. Pixels stay
+// chunky by default: integer texel loads — the billboard is the
+// original sprite scaled, like the engine's affine rasterizer; the
+// smooth-textures enhancement filters them instead.
 
 struct Globals {
     view_proj: mat4x4<f32>,
@@ -23,11 +23,22 @@ struct Globals {
     // sprite rasterizer by -roll, SetBillboards_3B560).
     bb_right: vec4<f32>,
     bb_up: vec4<f32>,
+    // Terrain-only fields, declared to reach `grade`.
+    viewport: vec4<f32>,
+    lights: array<vec4<f32>, 16>,
+    // x = greyscale amount (retail's black-and-white palette mode),
+    // y = smooth-texture SHARPNESS (0 = off, retail's chunky texels;
+    // 1 = plain bilinear; s = upscale s× nearest, then bilinear).
+    grade: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
+// RGBA sprite atlas (8-bit channels) + its per-texel material byte.
 @group(0) @binding(1) var t_sprites: texture_2d<u32>;
-@group(0) @binding(2) var t_colormap: texture_2d<f32>;
+@group(0) @binding(4) var t_sprite_mat: texture_2d<u32>;
+// The colour grade: layer 0 = normal, 1 = glowing texels.
+@group(0) @binding(2) var t_grade: texture_2d_array<f32>;
+@group(0) @binding(3) var s_grade: sampler;
 // Group 1 is the terrain pass's mirror+sky group (bindings 0/1 are
 // the mirror slots this shader never reads); the sky slots feed the
 // same fog/extinction melts as terrain.wgsl. A 1x1 fog-constant
@@ -161,17 +172,52 @@ fn fs_main(in: VsOut) -> FsOut {
     if in.flags.x != 0u {
         fx = 1.0 - fx;
     }
+    let lo = vec2<i32>(in.uv_pos);
+    let hi = lo + vec2<i32>(in.uv_size) - vec2<i32>(1);
     let texel = vec2<i32>(
         i32(in.uv_pos.x) + min(i32(fx * in.uv_size.x), i32(in.uv_size.x) - 1),
         i32(in.uv_pos.y) + min(i32(in.frac.y * in.uv_size.y), i32(in.uv_size.y) - 1),
     );
-    let index = textureLoad(t_sprites, texel, 0).r;
-    // Palette index 0 = transparent (the original skips zero pixels).
-    if index == 0u {
-        discard;
+    var src: vec3<f32>;
+    if globals.grade.y > 0.0 {
+        // SMOOTH TEXTURES (enhancement): bilinear over the frame's
+        // own texels (clamped to its rect, so atlas neighbours never
+        // bleed in), alpha-weighted so transparent texels lend no
+        // colour; the silhouette is the half-coverage contour.
+        let t = vec2<f32>(fx, in.frac.y) * in.uv_size - vec2<f32>(0.5);
+        let i0 = vec2<i32>(floor(t));
+        // Sharpened weights: each texel keeps a solid core and blends
+        // only in a 1/(2s)-texel band at its border (= upscale s× with
+        // nearest, then bilinear) — full bilinear smudged 1-px detail
+        // (player review 2026-10-05).
+        let f = clamp((t - floor(t) - 0.5) * globals.grade.y + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
+        var acc = vec3<f32>(0.0);
+        var cov = 0.0;
+        for (var k = 0; k < 4; k = k + 1) {
+            let d = vec2<i32>(k & 1, k >> 1u);
+            let at = clamp(lo + i0 + d, lo, hi);
+            let w = select(1.0 - f.x, f.x, d.x == 1) * select(1.0 - f.y, f.y, d.y == 1);
+            let c = textureLoad(t_sprites, at, 0);
+            let a = w * f32(c.a) / 255.0;
+            acc += a * vec3<f32>(c.rgb);
+            cov += a;
+        }
+        if cov < 0.5 {
+            discard;
+        }
+        src = acc / (cov * 255.0);
+    } else {
+        let tx = textureLoad(t_sprites, texel, 0);
+        // Alpha 0 = transparent (the original skips index-0 pixels).
+        if tx.a == 0u {
+            discard;
+        }
+        src = vec3<f32>(tx.rgb) / 255.0;
     }
     let shade = i32(min(in.flags.y, 63u));
-    let base = textureLoad(t_colormap, vec2<i32>(i32(index), shade), 0).rgb;
+    // The material (normal / glowing table) is the nearest texel's.
+    let layer = i32(textureLoad(t_sprite_mat, texel, 0).r & 1u);
+    let base = grade_linear(src, shade, layer);
 
     let dist = distance(in.world, globals.camera.xyz);
     // Distance fog, the retail band law (see terrain.wgsl fog_amount):
@@ -250,4 +296,36 @@ fn sky_backdrop(world: vec3<f32>) -> vec3<f32> {
         vec2<f32>(az * scale, 1.0 - el * scale),
         0.0,
     ).rgb;
+}
+
+// The colour grade — terrain.wgsl's grade_srgb/grade_linear,
+// duplicated verbatim. Retail's shade remap as an RGB function
+// of the texel colour (sRGB, 0..1) at shade `row`, in `layer` (0 =
+// normal, 1 = glowing). The table packs each row's 33³ grid as b-slices
+// of 33x33 side by side; r/g interpolate in hardware, b by hand. Every
+// sample stays inside its own slice/row block (texel centres 0..32),
+// so the bilinear footprint never reaches a neighbour.
+const GRADE_N: f32 = 33.0;
+const GRADE_W: f32 = 1089.0;
+const GRADE_H: f32 = 2112.0;
+
+fn grade_srgb(rgb: vec3<f32>, row: i32, layer: i32) -> vec3<f32> {
+    let u = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * (GRADE_N - 1.0);
+    let b0 = min(floor(u.b), GRADE_N - 2.0);
+    let y = (f32(row) * GRADE_N + u.g + 0.5) / GRADE_H;
+    let x0 = (b0 * GRADE_N + u.r + 0.5) / GRADE_W;
+    let s0 = textureSampleLevel(t_grade, s_grade, vec2<f32>(x0, y), layer, 0.0).rgb;
+    let s1 = textureSampleLevel(t_grade, s_grade, vec2<f32>(x0 + GRADE_N / GRADE_W, y), layer, 0.0).rgb;
+    return mix(s0, s1, u.b - b0);
+}
+
+// Graded colour, greyscale-mixed in sRGB (retail's `(r+g+b)/3` palette
+// mode), returned linear for the blend/fog math.
+fn grade_linear(rgb: vec3<f32>, row: i32, layer: i32) -> vec3<f32> {
+    var c = grade_srgb(rgb, row, layer);
+    let g = globals.grade.x;
+    if g > 0.0 {
+        c = mix(c, vec3<f32>((c.r + c.g + c.b) / 3.0), g);
+    }
+    return select(pow((c + 0.055) / 1.055, vec3<f32>(2.4)), c / 12.92, c <= vec3<f32>(0.04045));
 }

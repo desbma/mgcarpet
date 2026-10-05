@@ -5,16 +5,18 @@
 //!
 //! Design commitments (see project README):
 //! - Terrain, billboarded sprites, and water from baked packages.
-//! - Palette-index data kept all the way to the fragment shader
-//!   (palette-as-LUT) so the authentic 8-bit look is the baseline and
-//!   enhanced rendering is a toggle, not a rewrite.
+//! - World art (terrain atlas, sprites) is RGBA plus a material byte;
+//!   retail's 8-bit shade remap is reproduced as a per-row colour grade
+//!   ([`grade`]) so non-palette art shades exactly like retail art.
 //!
 //! Current scope: the terrain pass — a 256x256 tile mesh (one vertex
 //! per grid point, engine-authentic alternating diagonals), tiles
 //! textured in the fragment shader from the baked terrain atlas (the
 //! terrain-type byte is the atlas cell index), texels resolved through
-//! the engine's shade LUT and palette; flat map colors as the fallback
+//! the colour grade fitted to the engine's shade LUT; flat map colors as the fallback
 //! when no atlas is baked. Per-vertex hillshade, distance fog.
+
+pub mod grade;
 
 use std::sync::Arc;
 
@@ -1088,6 +1090,12 @@ struct Globals {
     /// intensity (1 = retail's 128 spell/explosion baseline; the
     /// standing fire is 80/128). Live count in `viewport.w`.
     lights: [[f32; 4]; MAX_LIGHTS],
+    /// x = greyscale amount ([`Renderer::set_greyscale`]), applied to
+    /// the graded world colour in terrain.wgsl / billboard.wgsl;
+    /// y = smooth-texture sharpness, 0 = off
+    /// ([`Renderer::set_smooth_textures`], [`SMOOTH_TEXTURE_SHARPNESS`]);
+    /// z/w reserved.
+    grade: [f32; 4],
 }
 
 /// Which baked frame of an animated (FLC) sprite entry is on screen:
@@ -1104,6 +1112,15 @@ fn flc_image(frames: usize, seek: Option<u8>, turn: usize) -> usize {
         None => 1 + turn % count,
     }
 }
+
+/// Smooth-textures filter sharpness (the tuning knob): the world art
+/// is filtered as if upscaled this many times with nearest pixels and
+/// then bilinear — each texel keeps a solid core, blending only in a
+/// border band 1/(2·s) texel wide. 1 = plain bilinear, which smudged
+/// 1-px detail inside a crisp silhouette (player review 2026-10-05:
+/// "smudged more than upscaled"); larger = closer to retail's chunky
+/// texels.
+pub const SMOOTH_TEXTURE_SHARPNESS: f32 = 2.0;
 
 /// Uniform-array cap for dynamic lights (retail keeps a 50-slot
 /// cell-grid registry; our per-pixel pass rarely needs more than a
@@ -2062,16 +2079,31 @@ pub struct Renderer {
     bolt_segments: Vec<BoltSegment>,
     /// CPU copy of the sprite index for per-frame view selection.
     sprite_index: Option<mgc_formats::bundle::SpriteIndex>,
+    /// The world sprites as RGBA (alpha = retail's index-0 skip) plus
+    /// the per-texel material byte ([`grade::MAT_EMISSIVE`]).
     sprite_tex: Option<wgpu::Texture>,
-    colormap_tex: Option<wgpu::Texture>,
-    /// The level's full-colour colormap and sky pixels, kept so the
-    /// greyscale palette mode ([`Renderer::set_greyscale`]) can be
-    /// blended in and back out without a reload.
-    colormap_base: Vec<u8>,
+    sprite_mat_tex: Option<wgpu::Texture>,
+    /// The bundle's 8-bit sprite atlas, kept to re-resolve the RGBA
+    /// pair whenever a level brings a new palette/glow set.
+    sprite_indexed: Vec<u8>,
+    /// The level's colour grade ([`grade`]): the shade remap as two
+    /// RGB tables (normal / glowing), sampled by terrain + sprites.
+    grade_tex: Option<wgpu::Texture>,
+    grade_sampler: wgpu::Sampler,
+    /// The level palette + glow classification the RGBA atlases were
+    /// resolved through.
+    level_palette: [[u8; 3]; 256],
+    level_glow: [bool; 256],
+    /// The level's sky pixels, kept so the greyscale palette mode
+    /// ([`Renderer::set_greyscale`]) can be blended in and back out
+    /// without a reload (the world art greys in the shaders).
     sky_base: Option<(wgpu::Texture, Vec<u8>)>,
     /// The current greyscale amount (0 = the level palette, 1 =
     /// retail's black-and-white palette), quantised to sixteenths.
     greyscale: f32,
+    /// Bilinear-filter the world art (terrain atlas + sprites) instead
+    /// of retail's chunky nearest texels.
+    smooth_textures: bool,
     billboards: Vec<Billboard>,
     // Health-bar overlay pass (unfaithful debug enhancement).
     bar_pipeline: wgpu::RenderPipeline,
@@ -2289,12 +2321,14 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // The colour grade (two layers: normal / glowing texels),
+                // hardware-filtered across the grid's r/g axes.
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
                         multisampled: false,
                     },
                     count: None,
@@ -2351,6 +2385,12 @@ impl Renderer {
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -2469,6 +2509,17 @@ impl Renderer {
         // not (mirror) or cannot (reflections off) sample one.
         let reflection_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("reflection"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        // The colour grade's sampler: bilinear over the grid's r/g
+        // axes (the shader keeps every lookup inside its own b-slice
+        // and row block, so clamping never bleeds a neighbour in).
+        let grade_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("grade"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
@@ -3043,11 +3094,30 @@ impl Renderer {
                         },
                         count: None,
                     },
+                    // The colour grade (two layers: normal / glowing texels),
+                    // hardware-filtered across the grid's r/g axes.
                     wgpu::BindGroupLayoutEntry {
                         binding: 2,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2Array,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    // Sprite material bytes (same layout as binding 1).
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Uint,
                             view_dimension: wgpu::TextureViewDimension::D2,
                             multisampled: false,
                         },
@@ -3573,10 +3643,15 @@ impl Renderer {
             fire_particles: Vec::new(),
             sprite_index: None,
             sprite_tex: None,
-            colormap_tex: None,
-            colormap_base: Vec::new(),
+            sprite_mat_tex: None,
+            sprite_indexed: Vec::new(),
+            grade_tex: None,
+            grade_sampler,
+            level_palette: [[0; 3]; 256],
+            level_glow: [false; 256],
             sky_base: None,
             greyscale: 0.0,
+            smooth_textures: false,
             billboards: Vec::new(),
             bar_pipeline,
             bar_bind_group,
@@ -3980,10 +4055,12 @@ impl Renderer {
     /// every entry becomes `(r+g+b)/3`, EF:31996-32006) and its fade
     /// back to the level palette (subMod 1): `amount` 0 = the level's
     /// colours, 1 = fully grey. Drives the death fall's grey flicker
-    /// and the corpse's monochrome. Blended into the palette-resolved
-    /// tables the scene samples (the terrain/billboard colormap, the
-    /// sky, the fog colour), exactly where retail's palette swap
-    /// lands; quantised to sixteenths so a held value costs nothing.
+    /// and the corpse's monochrome. Blended into the graded world
+    /// colour in the terrain/billboard shaders (`Globals::grade.x`,
+    /// the same sRGB `(r+g+b)/3` mix the palette swap produced) and
+    /// into the palette-resolved sky and fog colour, exactly where
+    /// retail's palette swap lands; quantised to sixteenths so a held
+    /// value costs nothing.
     pub fn set_greyscale(&mut self, amount: f32) {
         let q = (amount.clamp(0.0, 1.0) * 16.0).round() / 16.0;
         if q == self.greyscale {
@@ -4007,25 +4084,6 @@ impl Renderer {
             }
             out
         };
-        if let Some(tex) = &self.colormap_tex
-            && !self.colormap_base.is_empty()
-        {
-            let px = mix(&self.colormap_base);
-            self.queue.write_texture(
-                tex.as_image_copy(),
-                &px,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(256 * 4),
-                    rows_per_image: None,
-                },
-                wgpu::Extent3d {
-                    width: 256,
-                    height: (px.len() / (256 * 4)) as u32,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
         if let Some((tex, base)) = &self.sky_base {
             let px = mix(base);
             self.queue.write_texture(
@@ -4058,6 +4116,14 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
         );
+    }
+
+    /// Smooth textures (enhancement): filter the terrain atlas and the
+    /// world sprites in RGB before grading, at
+    /// [`SMOOTH_TEXTURE_SHARPNESS`] (sprites keep a half-coverage
+    /// silhouette); off = retail's nearest texels.
+    pub fn set_smooth_textures(&mut self, on: bool) {
+        self.smooth_textures = on;
     }
 
     pub fn smooth_shading(&self) -> bool {
@@ -4294,9 +4360,59 @@ impl Renderer {
         };
         let shade_tex = byte_tex("tile shading", shading, n as u32, n as u32);
 
-        // Type -> flat base palette index, for tiles rendered without a
+        // The colour grade: the level's shade remap as RGB tables
+        // (normal / glowing), and the glow classification every 8-bit
+        // texel below resolves its material byte through.
+        let grade = grade::build(&level.palette, &level.shade_lut);
+        self.level_palette = level.palette;
+        self.level_glow = grade.glow;
+        // 8-bit palette index -> RGBA8 with the material in alpha
+        // (terrain is opaque): emissive from the glow class, water
+        // from retail's per-texel `index < 0x0C` mirror law.
+        let terrain_texel = |q: u8| -> [u8; 4] {
+            let rgb = level.palette[q as usize];
+            let mut mat = 0;
+            if grade.glow[q as usize] {
+                mat |= grade::MAT_EMISSIVE;
+            }
+            if q < 12 {
+                mat |= grade::MAT_WATER;
+            }
+            [rgb[0], rgb[1], rgb[2], mat]
+        };
+        let rgba_tex = |label: &str, bytes: &[u8], width: u32, height: u32| {
+            let rgba: Vec<u8> = bytes.iter().flat_map(|&q| terrain_texel(q)).collect();
+            let extent = wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            };
+            let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Uint,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.queue.write_texture(
+                tex.as_image_copy(),
+                &rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: None,
+                },
+                extent,
+            );
+            tex
+        };
+
+        // Type -> flat tile colour, for tiles rendered without a
         // texture (no atlas, or type beyond the atlas).
-        let tile_colors_tex = byte_tex("tile colors", &level.tile_colors, 256, 1);
+        let tile_colors_tex = rgba_tex("tile colors", &level.tile_colors, 256, 1);
 
         // Terrain-texture atlas (a 1x1 dummy keeps the bind group layout
         // uniform when the level has none; the shader gates on the cell
@@ -4313,7 +4429,7 @@ impl Renderer {
             .as_ref()
             .map(|a| (a.len() / (ATLAS_WIDTH * ATLAS_CELL)) * (ATLAS_WIDTH / ATLAS_CELL))
             .unwrap_or(0) as u32;
-        let atlas_tex = byte_tex("terrain atlas", atlas_data, atlas_w, atlas_h);
+        let atlas_tex = rgba_tex("terrain atlas", atlas_data, atlas_w, atlas_h);
 
         // Per-tile texture orientation (angle bits 4-6); orientation 0
         // for packages baked before the angle member existed.
@@ -4370,50 +4486,42 @@ impl Renderer {
         );
         let shore_view = shore_tex.create_view(&Default::default());
 
-        // Colormap (x = palette index, y = shade): the engine's shade
-        // remap composed with the palette on the CPU. sRGB format so
-        // sampling yields linear color. Texture texels and flat tile
-        // colors both resolve through this one table, exactly like the
-        // original's textured inner loop `shade_lut[shade*256 + texel]`.
-        assert_eq!(level.shade_lut.len(), SHADE_LEVELS * 256);
-        let mut colormap = vec![0u8; SHADE_LEVELS * 256 * 4];
-        for shade in 0..SHADE_LEVELS {
-            for index in 0..256 {
-                let final_idx = level.shade_lut[shade * 256 + index] as usize;
-                let rgb = level.palette[final_idx];
-                let o = (shade * 256 + index) * 4;
-                colormap[o..o + 3].copy_from_slice(&rgb);
-                colormap[o + 3] = 255;
-            }
-        }
-        let colormap_extent = wgpu::Extent3d {
-            width: 256,
-            height: SHADE_LEVELS as u32,
-            depth_or_array_layers: 1,
+        let grade_extent = wgpu::Extent3d {
+            width: grade::GRADE_W as u32,
+            height: grade::GRADE_H as u32,
+            depth_or_array_layers: 2,
         };
-        let colormap_tex = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("type/shade colormap"),
-            size: colormap_extent,
+        let grade_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("colour grade"),
+            size: grade_extent,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
         self.queue.write_texture(
-            colormap_tex.as_image_copy(),
-            &colormap,
+            grade_tex.as_image_copy(),
+            &grade.table,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(256 * 4),
-                rows_per_image: None,
+                bytes_per_row: Some(grade::GRADE_W as u32 * 4),
+                rows_per_image: Some(grade::GRADE_H as u32),
             },
-            colormap_extent,
+            grade_extent,
         );
+        let grade_view = || {
+            grade_tex.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            })
+        };
+        self.grade_tex = Some(grade_tex.clone());
+        // The sprite atlas resolves through this level's palette and
+        // glow set (a level change can swap both).
+        self.upload_sprite_rgba();
 
-        self.colormap_tex = Some(colormap_tex.clone());
-        self.colormap_base = colormap;
         self.upload_greyscale();
         self.rebuild_billboard_bind_group();
 
@@ -4439,9 +4547,7 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(
-                        &colormap_tex.create_view(&Default::default()),
-                    ),
+                    resource: wgpu::BindingResource::TextureView(&grade_view()),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -4470,6 +4576,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: wgpu::BindingResource::TextureView(&shore_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::Sampler(&self.grade_sampler),
                 },
             ],
         }));
@@ -4497,9 +4607,7 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(
-                        &colormap_tex.create_view(&Default::default()),
-                    ),
+                    resource: wgpu::BindingResource::TextureView(&grade_view()),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -4528,6 +4636,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: wgpu::BindingResource::TextureView(&shore_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::Sampler(&self.grade_sampler),
                 },
             ],
         }));
@@ -4561,9 +4673,7 @@ impl Renderer {
                         },
                         wgpu::BindGroupEntry {
                             binding: 3,
-                            resource: wgpu::BindingResource::TextureView(
-                                &colormap_tex.create_view(&Default::default()),
-                            ),
+                            resource: wgpu::BindingResource::TextureView(&grade_view()),
                         },
                         wgpu::BindGroupEntry {
                             binding: 4,
@@ -4592,6 +4702,10 @@ impl Renderer {
                         wgpu::BindGroupEntry {
                             binding: 8,
                             resource: wgpu::BindingResource::TextureView(&shore_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 9,
+                            resource: wgpu::BindingResource::Sampler(&self.grade_sampler),
                         },
                     ],
                 }));
@@ -4900,38 +5014,85 @@ impl Renderer {
     }
 
     /// Upload the bundle's sprite atlas + index for billboard drawing.
+    /// The 8-bit atlas is kept and resolved to RGBA + material through
+    /// the current level's palette and glow set ([`Self::load_level`]
+    /// re-resolves it).
     pub fn load_sprites(&mut self, index: mgc_formats::bundle::SpriteIndex, atlas: &[u8]) {
         assert_eq!(
             atlas.len(),
             index.atlas_width as usize * index.atlas_height as usize
         );
+        self.sprite_indexed = atlas.to_vec();
+        self.sprite_index = Some(index);
+        self.upload_sprite_rgba();
+    }
+
+    /// Resolve the kept 8-bit sprite atlas into the RGBA (alpha 0 =
+    /// retail's index-0 skip) + material pair the billboard pass reads.
+    fn upload_sprite_rgba(&mut self) {
+        let Some(index) = &self.sprite_index else {
+            return;
+        };
+        if self.sprite_indexed.is_empty() {
+            return;
+        }
+        let (w, h) = (index.atlas_width, index.atlas_height);
+        let mut rgba = Vec::with_capacity(self.sprite_indexed.len() * 4);
+        let mut mat = Vec::with_capacity(self.sprite_indexed.len());
+        for &q in &self.sprite_indexed {
+            if q == 0 {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+                mat.push(0);
+            } else {
+                let c = self.level_palette[q as usize];
+                rgba.extend_from_slice(&[c[0], c[1], c[2], 255]);
+                mat.push(if self.level_glow[q as usize] {
+                    grade::MAT_EMISSIVE
+                } else {
+                    0
+                });
+            }
+        }
         let extent = wgpu::Extent3d {
-            width: index.atlas_width,
-            height: index.atlas_height,
+            width: w,
+            height: h,
             depth_or_array_layers: 1,
         };
-        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("sprite atlas"),
-            size: extent,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Uint,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.queue.write_texture(
-            tex.as_image_copy(),
-            atlas,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(index.atlas_width),
-                rows_per_image: None,
-            },
-            extent,
-        );
-        self.sprite_tex = Some(tex);
-        self.sprite_index = Some(index);
+        let make = |label: &str, format: wgpu::TextureFormat, bytes: &[u8], bpp: u32| {
+            let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.queue.write_texture(
+                tex.as_image_copy(),
+                bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * bpp),
+                    rows_per_image: None,
+                },
+                extent,
+            );
+            tex
+        };
+        self.sprite_tex = Some(make(
+            "sprite atlas",
+            wgpu::TextureFormat::Rgba8Uint,
+            &rgba,
+            4,
+        ));
+        self.sprite_mat_tex = Some(make(
+            "sprite material",
+            wgpu::TextureFormat::R8Uint,
+            &mat,
+            1,
+        ));
         self.rebuild_billboard_bind_group();
     }
 
@@ -5159,7 +5320,9 @@ impl Renderer {
     }
 
     fn rebuild_billboard_bind_group(&mut self) {
-        let (Some(sprites), Some(colormap)) = (&self.sprite_tex, &self.colormap_tex) else {
+        let (Some(sprites), Some(mat), Some(grade)) =
+            (&self.sprite_tex, &self.sprite_mat_tex, &self.grade_tex)
+        else {
             return;
         };
         let device = &self.device;
@@ -5181,8 +5344,21 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&grade.create_view(
+                            &wgpu::TextureViewDescriptor {
+                                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                                ..Default::default()
+                            },
+                        )),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.grade_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
                         resource: wgpu::BindingResource::TextureView(
-                            &colormap.create_view(&Default::default()),
+                            &mat.create_view(&Default::default()),
                         ),
                     },
                 ],
@@ -5793,6 +5969,16 @@ impl Renderer {
                 arr[..self.lights.len()].copy_from_slice(&self.lights);
                 arr
             },
+            grade: [
+                self.greyscale,
+                if self.smooth_textures {
+                    SMOOTH_TEXTURE_SHARPNESS
+                } else {
+                    0.0
+                },
+                0.0,
+                0.0,
+            ],
         };
         self.queue
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
@@ -7331,6 +7517,38 @@ mod tests {
             wgpu::naga::valid::Capabilities::all(),
         );
         v.validate(&module).expect("ui.wgsl validates");
+    }
+
+    /// The world shaders (colour grade, 2026-10-05) validate, and their
+    /// full `Globals` matches the Rust struct byte for byte — billboard
+    /// declares the terrain-only fields just to reach `grade`.
+    #[test]
+    fn world_shaders_validate_and_match_globals() {
+        for (name, src) in [
+            ("terrain.wgsl", include_str!("terrain.wgsl")),
+            ("billboard.wgsl", include_str!("billboard.wgsl")),
+        ] {
+            let module = wgpu::naga::front::wgsl::parse_str(src)
+                .unwrap_or_else(|e| panic!("{name} parses: {}", e.emit_to_string(src)));
+            let mut v = wgpu::naga::valid::Validator::new(
+                wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::all(),
+            );
+            v.validate(&module)
+                .unwrap_or_else(|e| panic!("{name} validates: {e:?}"));
+            let mut layouter = wgpu::naga::proc::Layouter::default();
+            layouter.update(module.to_ctx()).unwrap();
+            let (handle, _) = module
+                .types
+                .iter()
+                .find(|(_, t)| t.name.as_deref() == Some("Globals"))
+                .expect("Globals declared");
+            assert_eq!(
+                layouter[handle].size as usize,
+                std::mem::size_of::<Globals>(),
+                "{name}: Globals layout"
+            );
+        }
     }
 
     fn stamp_at(x: f32, z: f32) -> MapStamp {

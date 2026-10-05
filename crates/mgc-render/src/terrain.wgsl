@@ -1,14 +1,14 @@
-// Terrain pass: palette-indexed terrain textures (or flat tile colors),
-// per-vertex hillshade, distance fog toward the horizon color.
+// Terrain pass: RGB terrain textures (or flat tile colors), per-vertex
+// hillshade, distance fog toward the horizon color.
 //
-// Color path stays index-based to the end (README design): the fragment
-// shader resolves an 8-bit palette index — an atlas texel when the
-// level has a terrain-texture atlas, else the tile's flat color from
-// the tile-colors LUT — then feeds it through the engine's shade remap
-// composed with the palette (t_colormap, sRGB texture):
-//   rgb = palette[shade_lut[shade][index]]
-// exactly the original's textured-terrain inner loop (remc2
-// GameRenderOriginal "mode 7": shade_lut[shade*256 + texel]).
+// The fragment resolves a texel — an atlas texel when the level has a
+// terrain-texture atlas, else the tile's flat color — as RGB plus a
+// material byte, then shades it through the colour grade (grade.rs):
+// the original's textured-terrain inner loop (remc2
+// GameRenderOriginal "mode 7": palette[shade_lut[shade*256 + texel]])
+// fitted as an RGB function per shade row, one table for normal and
+// one for glowing texels (glow is palette-index information the
+// material byte carries over).
 
 struct Globals {
     view_proj: mat4x4<f32>,
@@ -41,6 +41,10 @@ struct Globals {
     // Dynamic point lights: xyz = world pos (tiles), w = intensity
     // (1 = retail's 128 spell baseline). Night/Cave only (app gate).
     lights: array<vec4<f32>, 16>,
+    // x = greyscale amount (retail's black-and-white palette mode),
+    // y = smooth-texture SHARPNESS (0 = off, retail's chunky texels;
+    // 1 = plain bilinear; s = upscale s× nearest, then bilinear).
+    grade: vec4<f32>,
 };
 
 // The mirror texture (last mirror pass's output) for sea reflections;
@@ -63,12 +67,14 @@ const ATLAS_CELLS_PER_ROW: i32 = 8;
 @group(0) @binding(1) var t_type: texture_2d<u32>;
 // Per-tile light level (the generator's shading array), same layout.
 @group(0) @binding(2) var t_shade: texture_2d<u32>;
-// Colormap: x = palette index (texel or flat color), y = shade level;
-// palette[shade_lut[shade][x]] composed on the CPU.
-@group(0) @binding(3) var t_colormap: texture_2d<f32>;
-// Terrain type -> flat base palette index (tile-colors.bin), 256x1.
+// The colour grade (grade.rs): layer 0 = normal, 1 = glowing texels.
+@group(0) @binding(3) var t_grade: texture_2d_array<f32>;
+@group(0) @binding(9) var s_grade: sampler;
+// Terrain type -> flat tile colour (tile-colors.bin through the
+// palette), 256x1; rgb + material byte in alpha.
 @group(0) @binding(4) var t_tile_colors: texture_2d<u32>;
-// Terrain-texture atlas, 8-bit palette indices; 1x1 dummy when absent.
+// Terrain-texture atlas, rgb + material byte in alpha (MAT_* bits:
+// 1 = emissive, 2 = retail water); 1x1 dummy when absent.
 @group(0) @binding(5) var t_atlas: texture_2d<u32>;
 // Per-tile angle/flags byte; bits 4-6 = texture UV orientation.
 @group(0) @binding(6) var t_angle: texture_2d<u32>;
@@ -263,7 +269,7 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> FsOut {
     // SAMPLING side (see the slope fade at the mirror blend below).
     let peek = (globals.atlas.w == 0u && !front) || (globals.atlas.w == 1u && front);
     // (The peek RETURN sits below the texel lookup: watery arm-0
-    // fragments are exempt and need `index` to identify themselves.)
+    // fragments are exempt and need `texel` to identify themselves.)
     // Tile index from world position, wrapped to the 256x256 torus.
     let tile = vec2<i32>(
         (i32(floor(in.world.x)) % 256 + 256) % 256,
@@ -279,9 +285,11 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> FsOut {
         ty = i32(textureLoad(t_type, tile, 0).r);
     }
 
-    // Palette index: atlas texel (terrain type = atlas cell, nearest
-    // sampling like the original rasterizer) or the flat tile color.
-    var index: i32;
+    // Texel: atlas texel (terrain type = atlas cell, nearest sampling
+    // like the original rasterizer) or the flat tile color.
+    var texel: vec4<u32>;
+    var filtered = vec3<f32>(0.0);
+    var smooth_tex = false;
     if globals.atlas.x > 0u && ty < i32(globals.atlas.x) {
         let cell = vec2<i32>(ty % ATLAS_CELLS_PER_ROW, ty / ATLAS_CELLS_PER_ROW);
         // UV orientation from the angle byte (engine UVTable_D4350,
@@ -302,11 +310,34 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> FsOut {
             min(i32(st.x * f32(ATLAS_CELL)), ATLAS_CELL - 1),
             min(i32(st.y * f32(ATLAS_CELL)), ATLAS_CELL - 1),
         );
-        index = i32(textureLoad(t_atlas, cell * ATLAS_CELL + within, 0).r);
+        texel = textureLoad(t_atlas, cell * ATLAS_CELL + within, 0);
+        if globals.grade.y > 0.0 {
+            // SMOOTH TEXTURES (enhancement): bilinear within the
+            // tile's own cell (clamped — a neighbour cell is another
+            // terrain type). The material stays the nearest texel's.
+            let t = st * f32(ATLAS_CELL) - vec2<f32>(0.5);
+            let i0 = vec2<i32>(floor(t));
+            // Sharpened weights: each texel keeps a solid core and blends
+            // only in a 1/(2s)-texel band at its border (= upscale s× with
+            // nearest, then bilinear) — full bilinear smudged 1-px detail
+            // (player review 2026-10-05).
+            let f = clamp((t - floor(t) - 0.5) * globals.grade.y + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
+            var acc = vec3<f32>(0.0);
+            for (var k = 0; k < 4; k = k + 1) {
+                let d = vec2<i32>(k & 1, k >> 1u);
+                let at = clamp(i0 + d, vec2<i32>(0), vec2<i32>(ATLAS_CELL - 1));
+                let w = select(1.0 - f.x, f.x, d.x == 1) * select(1.0 - f.y, f.y, d.y == 1);
+                acc += w * vec3<f32>(textureLoad(t_atlas, cell * ATLAS_CELL + at, 0).rgb);
+            }
+            filtered = acc / 255.0;
+            smooth_tex = true;
+        }
     } else {
-        index = i32(textureLoad(t_tile_colors, vec2<i32>(ty, 0), 0).r);
+        texel = textureLoad(t_tile_colors, vec2<i32>(ty, 0), 0);
     }
-    let watery = index < 12;
+    let watery = (texel.a & 2u) != 0u;
+    let src = select(vec3<f32>(texel.rgb) / 255.0, filtered, smooth_tex);
+    let layer = i32(texel.a & 1u);
 
     // WATERY arm-0 backfaces are exempt from the peek black-out: the
     // shore-edge water corners WAVE, and on the up-swell the camera
@@ -330,9 +361,8 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> FsOut {
     if globals.atlas.y == 1u {
         // Smooth shading (opt-in enhancement): bilinear shade over the
         // four nearest tile centers, then a linear blend between the
-        // two straddling shade-LUT rows. Colors still come only from
-        // LUT rows — the palette pipeline stays intact, the light
-        // gradient just stops snapping at tile edges.
+        // two straddling shade rows. Colors still come only from grade
+        // rows, the light gradient just stops snapping at tile edges.
         let p = in.world.xz - vec2<f32>(0.5, 0.5);
         let t0 = vec2<i32>(i32(floor(p.x)), i32(floor(p.y)));
         let f = fract(p);
@@ -347,11 +377,7 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> FsOut {
         );
         let s0 = i32(floor(s));
         let s1 = min(s0 + 1, 63);
-        base = mix(
-            textureLoad(t_colormap, vec2<i32>(index, s0), 0).rgb,
-            textureLoad(t_colormap, vec2<i32>(index, s1), 0).rgb,
-            fract(s),
-        );
+        base = mix(grade_linear(src, s0, layer), grade_linear(src, s1, layer), fract(s));
     } else {
         // Original look: one shade level per tile, plus the water
         // shimmer and the dynamic-light boost. The original rounds:
@@ -362,7 +388,7 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> FsOut {
             0,
             63,
         );
-        base = textureLoad(t_colormap, vec2<i32>(index, shade), 0).rgb;
+        base = grade_linear(src, shade, layer);
     }
 
     // `light` is 1.0 when the authentic shading array drives the look;
@@ -402,11 +428,12 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> FsOut {
     // WATER IS PER-TEXEL, exactly retail (playtest round 5, player
     // insight "the reflecting property is part of the data"): the
     // water raster blends screen content only where the TEXTURE's
-    // palette index is < 0x0C (remc2 GRO:13945-65 mode 26) — the
+    // palette index is < 0x0C (remc2 GRO:13945-65 mode 26; the
+    // material's water bit, set from that index at upload) — the
     // waterline is painted into the transition-tile textures (atlas
     // data: cell 0 = 1024/1024 sub-0x0C texels, shore cells partial,
     // land 0 plus single-texel noise). So the mirror blend keys on
-    // the fragment's own palette index; no tile flags at all.
+    // the fragment's own texel; no tile flags at all.
     //
     // In the MIRROR pass those water texels are the mirror itself —
     // never part of the mirrored scene (a mirrored self-copy ghosted
@@ -593,4 +620,35 @@ fn sky_backdrop(world: vec3<f32>) -> vec3<f32> {
         vec2<f32>(az * scale, 1.0 - el * scale),
         0.0,
     ).rgb;
+}
+
+// The colour grade (grade.rs): retail's shade remap as an RGB function
+// of the texel colour (sRGB, 0..1) at shade `row`, in `layer` (0 =
+// normal, 1 = glowing). The table packs each row's 33³ grid as b-slices
+// of 33x33 side by side; r/g interpolate in hardware, b by hand. Every
+// sample stays inside its own slice/row block (texel centres 0..32),
+// so the bilinear footprint never reaches a neighbour.
+const GRADE_N: f32 = 33.0;
+const GRADE_W: f32 = 1089.0;
+const GRADE_H: f32 = 2112.0;
+
+fn grade_srgb(rgb: vec3<f32>, row: i32, layer: i32) -> vec3<f32> {
+    let u = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * (GRADE_N - 1.0);
+    let b0 = min(floor(u.b), GRADE_N - 2.0);
+    let y = (f32(row) * GRADE_N + u.g + 0.5) / GRADE_H;
+    let x0 = (b0 * GRADE_N + u.r + 0.5) / GRADE_W;
+    let s0 = textureSampleLevel(t_grade, s_grade, vec2<f32>(x0, y), layer, 0.0).rgb;
+    let s1 = textureSampleLevel(t_grade, s_grade, vec2<f32>(x0 + GRADE_N / GRADE_W, y), layer, 0.0).rgb;
+    return mix(s0, s1, u.b - b0);
+}
+
+// Graded colour, greyscale-mixed in sRGB (retail's `(r+g+b)/3` palette
+// mode), returned linear for the blend/fog math.
+fn grade_linear(rgb: vec3<f32>, row: i32, layer: i32) -> vec3<f32> {
+    var c = grade_srgb(rgb, row, layer);
+    let g = globals.grade.x;
+    if g > 0.0 {
+        c = mix(c, vec3<f32>((c.r + c.g + c.b) / 3.0), g);
+    }
+    return select(pow((c + 0.055) / 1.055, vec3<f32>(2.4)), c / 12.92, c <= vec3<f32>(0.04045));
 }
