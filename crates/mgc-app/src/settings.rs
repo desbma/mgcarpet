@@ -383,6 +383,7 @@ pub const VISUALS_PRESET: PresetGroup = PresetGroup {
         "render.preference.rival_tags",
         "render.enhancement.smooth_motion",
         "render.enhancement.smooth_textures",
+        "render.enhancement.segment_order",
         "render.enhancement.fire",
         "render.enhancement.lightning",
         "render.enhancement.map_owned_buildings",
@@ -410,6 +411,7 @@ pub const VISUALS_PRESET: PresetGroup = PresetGroup {
         };
         enh.smooth_motion = true;
         enh.smooth_textures = enhanced;
+        enh.segment_order = enhanced;
         enh.fire = if enhanced {
             FireEffects::Enhanced
         } else {
@@ -1329,6 +1331,27 @@ pub fn registry() -> Vec<Spec> {
                 descs: [
                     "Chunky pixels — the original look.",
                     "Smoothly filtered terrain and sprites.",
+                ],
+            },
+        },
+        Spec {
+            domain: Render,
+            group: "render · enhancement",
+            label: "segment_order",
+            class: Enhancement,
+            key: None,
+            cli: Some("--segment-order"),
+            cfg_path: "render.enhancement.segment_order",
+            read: toggle!(c => render.enhancement.segment_order),
+            desc: "Draw order of segmented creatures (worms, dragons, \
+                   hydras). Off = retail's tile order, which flickers \
+                   overlapping segments of a creature seen side-on; on = \
+                   the segment nearer the head wins near-ties.",
+            ctl: Ctl::Toggle {
+                set: |c, v| c.render.enhancement.segment_order = v,
+                descs: [
+                    "Retail's tile order — side-on bodies flicker.",
+                    "Head-first segment order, no flicker.",
                 ],
             },
         },

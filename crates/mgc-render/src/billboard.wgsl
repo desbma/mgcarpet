@@ -67,6 +67,10 @@ struct Instance {
     // Screen-plane bank, radians (positive = right edge down), about
     // the quad's centre. 0 for every retail sprite.
     @location(7) roll: f32,
+    // Segment-order painter key, plan distance in tiles (a multipart
+    // body's member under the enhancement); negative = the anchor
+    // tile key + chain rank below.
+    @location(8) key: f32,
 };
 
 struct VsOut {
@@ -158,6 +162,9 @@ fn vs_main(@builtin(vertex_index) vid: u32, inst: Instance) -> VsOut {
         0.0,
         0.999999,
     );
+    if inst.key >= 0.0 {
+        out.anchor_depth = clamp(inst.key / DEPTH_RANGE, 0.0, 0.999999);
+    }
     return out;
 }
 

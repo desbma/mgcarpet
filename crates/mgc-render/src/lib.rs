@@ -1122,6 +1122,73 @@ fn flc_image(frames: usize, seek: Option<u8>, turn: usize) -> usize {
 /// texels.
 pub const SMOOTH_TEXTURE_SHARPNESS: f32 = 2.0;
 
+/// Segment order: a body link within this many degrees of side-on
+/// (|depth difference| ≤ sin θ · link length) counts as a near-tie,
+/// which the segment nearer the head wins (player design 2026-10-05,
+/// 30°). Steeper links keep their true order.
+pub const SEGMENT_TIE_DEGREES: f32 = 30.0;
+/// The most a segment's key may be pulled in front of its own plan
+/// distance to win its ties (tiles). Ties chain along a body, so a
+/// long body seen just inside the band would otherwise drag its head
+/// forward by the whole run; one tile matches the slop the retail
+/// tile key already has (a sprite keys to its tile's near edge).
+pub const SEGMENT_PULL_CAP: f32 = 1.0;
+
+/// Painter keys for the segment-order enhancement, one per billboard
+/// (negative = keep the default tile key). Every body member keys to
+/// its OWN plan distance minus the tile key's half-tile margin — the
+/// tile key made segments jump a whole tile whenever they crossed a
+/// border, swapping side-on neighbours tick after tick. Then, tail to
+/// head along each link, a parent within [`SEGMENT_TIE_DEGREES`] of
+/// side-on with its child is pulled just in front of it (capped by
+/// [`SEGMENT_PULL_CAP`]); branching bodies (MC2 hydras, the kraken)
+/// resolve per link.
+fn segment_depth_keys(billboards: &[Billboard], cam: &CameraView) -> Vec<f32> {
+    use std::collections::HashMap;
+    const EPS: f32 = 1.0 / 1024.0;
+    let full = MAP_TILES as f32;
+    let wrap = |p: f32, c: f32| {
+        let d = (p - c + full / 2.0).rem_euclid(full) - full / 2.0;
+        c + d
+    };
+    let mut keys = vec![-1.0f32; billboards.len()];
+    let mut at: HashMap<u16, usize> = HashMap::new();
+    let mut plan = vec![[0.0f32; 2]; billboards.len()];
+    let mut dist = vec![0.0f32; billboards.len()];
+    let mut members: Vec<usize> = Vec::new();
+    for (i, b) in billboards.iter().enumerate() {
+        let Some(link) = b.body else {
+            continue;
+        };
+        let (x, z) = (wrap(b.x, cam.x), wrap(b.z, cam.z));
+        plan[i] = [x, z];
+        dist[i] = ((x - cam.x).hypot(z - cam.z) - 0.5).max(0.0);
+        keys[i] = dist[i];
+        at.insert(link.slot, i);
+        members.push(i);
+    }
+    // Children before parents: rank descending.
+    members.sort_by_key(|&i| std::cmp::Reverse(billboards[i].body.map_or(0, |l| l.rank)));
+    let tie = SEGMENT_TIE_DEGREES.to_radians().sin();
+    for &c in &members {
+        let link = billboards[c].body.expect("member");
+        if link.rank == 0 {
+            continue;
+        }
+        let Some(&p) = at.get(&link.parent) else {
+            continue;
+        };
+        let len = (plan[p][0] - plan[c][0]).hypot(plan[p][1] - plan[c][1]);
+        if (dist[p] - dist[c]).abs() <= tie * len {
+            keys[p] = keys[p]
+                .min(keys[c] - EPS)
+                .max(dist[p] - SEGMENT_PULL_CAP)
+                .max(0.0);
+        }
+    }
+    keys
+}
+
 /// Uniform-array cap for dynamic lights (retail keeps a 50-slot
 /// cell-grid registry; our per-pixel pass rarely needs more than a
 /// handful on screen).
@@ -1212,6 +1279,10 @@ pub struct Billboard {
     /// ceilings, and the fog this law stands in for is spherical
     /// here.
     pub conceal: bool,
+    /// Multipart body membership (`LivePose::body`): worms, dragons,
+    /// hydras, the kraken. Read only by the segment-order enhancement
+    /// ([`Renderer::set_segment_order`]); `None` everywhere else.
+    pub body: Option<mgc_sim::engine::world::BodyLink>,
 }
 
 /// 16 view sectors folded to 5 sprites (draw type 19, `byte_906E8`).
@@ -1335,6 +1406,10 @@ struct BillboardInstance {
     chain: f32,
     /// Screen-plane bank, radians — see [`Billboard::roll`].
     roll: f32,
+    /// Painter key override, plan distance in tiles (the segment-order
+    /// enhancement, [`segment_depth_keys`]); negative = the default
+    /// anchor-TILE key + chain rank.
+    key: f32,
 }
 
 /// The instance layout of [`BillboardInstance`], shared by BOTH
@@ -1344,10 +1419,10 @@ struct BillboardInstance {
 /// `vertex_attr_array!`s, adding `chain` to one and not the other
 /// built cleanly and blew up at pipeline creation, on the launch path,
 /// where nothing but a real window can reach it.
-const BILLBOARD_ATTRS: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
+const BILLBOARD_ATTRS: [wgpu::VertexAttribute; 9] = wgpu::vertex_attr_array![
     0 => Float32x3, 1 => Float32x2, 2 => Float32x2,
     3 => Float32x2, 4 => Uint32x2, 5 => Float32,
-    6 => Float32, 7 => Float32,
+    6 => Float32, 7 => Float32, 8 => Float32,
 ];
 
 /// Default sky/fog color, the classic hazy horizon (MC1's hand-picked
@@ -2104,6 +2179,9 @@ pub struct Renderer {
     /// Bilinear-filter the world art (terrain atlas + sprites) instead
     /// of retail's chunky nearest texels.
     smooth_textures: bool,
+    /// Order a multipart body's own segments head-first on near-ties
+    /// ([`segment_depth_keys`]) instead of retail's tile painter.
+    segment_order: bool,
     billboards: Vec<Billboard>,
     // Health-bar overlay pass (unfaithful debug enhancement).
     bar_pipeline: wgpu::RenderPipeline,
@@ -3652,6 +3730,7 @@ impl Renderer {
             sky_base: None,
             greyscale: 0.0,
             smooth_textures: false,
+            segment_order: false,
             billboards: Vec::new(),
             bar_pipeline,
             bar_bind_group,
@@ -4124,6 +4203,14 @@ impl Renderer {
     /// silhouette); off = retail's nearest texels.
     pub fn set_smooth_textures(&mut self, on: bool) {
         self.smooth_textures = on;
+    }
+
+    /// Segment order (enhancement): a multipart body's segments take
+    /// a continuous depth key and resolve near-ties head-first
+    /// ([`segment_depth_keys`]); off = retail's tile painter, which
+    /// flickers overlapping segments of a body seen side-on.
+    pub fn set_segment_order(&mut self, on: bool) {
+        self.segment_order = on;
     }
 
     pub fn smooth_shading(&self) -> bool {
@@ -5403,7 +5490,12 @@ impl Renderer {
         let mut out = Vec::with_capacity(self.billboards.len());
         let mut translucent = Vec::new();
         let full = MAP_TILES as f32;
-        for b in &self.billboards {
+        let keys = if self.segment_order {
+            segment_depth_keys(&self.billboards, cam)
+        } else {
+            Vec::new()
+        };
+        for (bi, b) in self.billboards.iter().enumerate() {
             // 16 view sectors from relative yaw, exactly the engine's
             // `(((entityYaw - camYaw) >> 3) & 0xF0) >> 4` on 11-bit
             // angles: floor(rel / 128) of 2048 steps.
@@ -5492,6 +5584,7 @@ impl Renderer {
                 alpha,
                 chain: b.chain_depth,
                 roll: b.roll,
+                key: keys.get(bi).copied().unwrap_or(-1.0),
             };
             if alpha < 1.0 {
                 translucent.push(inst);
@@ -5509,10 +5602,16 @@ impl Renderer {
         // opaque pass gets the same resolution from the depth epsilon).
         // Higher `chain` = later in retail's tile walk = drawn last.
         translucent.sort_by(|a, b| {
+            // (A segment-order key is already a plan distance minus
+            // the half-tile margin; the tile key is put on the same
+            // footing.)
             let d = |i: &BillboardInstance| {
+                if i.key >= 0.0 {
+                    return i.key;
+                }
                 let (tx, tz) = (i.pos[0].floor() + 0.5, i.pos[2].floor() + 0.5);
                 let (dx, dz) = (tx - cam.x, tz - cam.z);
-                dx * dx + dz * dz
+                (dx * dx + dz * dz).sqrt() - 0.5
             };
             d(b).total_cmp(&d(a)).then(a.chain.total_cmp(&b.chain))
         });
@@ -7111,6 +7210,102 @@ mod tests {
 
     /// world_to_screen: a point dead ahead lands at screen center; a
     /// point behind the camera is rejected; the world wrap picks the
+    /// A worm segment billboard at plan (x, z): rank from the head,
+    /// slots = 100 + rank, each linked to the previous.
+    fn seg(x: f32, z: f32, rank: u16) -> Billboard {
+        Billboard {
+            x,
+            y: 0.0,
+            z,
+            yaw: 0.0,
+            sprite_base: 0,
+            draw_type: 0,
+            frame: 0,
+            flc_frame: None,
+            world_h: 1.0,
+            h_stretch: 1.0,
+            chain_depth: 0.5,
+            roll: 0.0,
+            blend: 0,
+            conceal: false,
+            body: Some(mgc_sim::engine::world::BodyLink {
+                root: 100,
+                rank,
+                slot: 100 + rank,
+                parent: 100 + rank.saturating_sub(1),
+            }),
+        }
+    }
+
+    fn seg_cam() -> CameraView {
+        CameraView {
+            x: 0.0,
+            y: 5.0,
+            z: 0.0,
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+            fov_y: 1.0,
+        }
+    }
+
+    /// Side-on (links perpendicular to the view line, the shore-crawl
+    /// case): the head wins every near-tie — keys strictly increase
+    /// head to tail — even where wriggle puts the head slightly
+    /// FARTHER than its neighbour; and the pulls stay small.
+    #[test]
+    fn segment_order_side_on_head_first() {
+        let cam = seg_cam();
+        // Body along x across the view line at z = -10, wriggling
+        // ±0.03 in z (links ~15° off side-on); the head starts farther.
+        let bbs: Vec<Billboard> = (0..8)
+            .map(|r| {
+                let wob = if r % 2 == 0 { -0.03 } else { 0.03 };
+                seg(-0.77 + 0.22 * r as f32, -10.0 + wob, r)
+            })
+            .collect();
+        let keys = segment_depth_keys(&bbs, &cam);
+        for r in 1..8 {
+            assert!(
+                keys[r - 1] < keys[r],
+                "rank {} not in front: {keys:?}",
+                r - 1
+            );
+        }
+        let own = |i: usize| (bbs[i].x.hypot(bbs[i].z) - 0.5).max(0.0);
+        for (i, k) in keys.iter().enumerate() {
+            assert!(own(i) - k <= SEGMENT_PULL_CAP + 1e-4);
+        }
+    }
+
+    /// End-on (links along the view line): true depth stands — a tail
+    /// nearer the camera stays in front of the head.
+    #[test]
+    fn segment_order_end_on_keeps_true_order() {
+        let cam = seg_cam();
+        // Head far (z = -12), tail toward the camera.
+        let bbs: Vec<Billboard> = (0..6)
+            .map(|r| seg(0.0, -12.0 + 0.22 * r as f32, r))
+            .collect();
+        let keys = segment_depth_keys(&bbs, &cam);
+        for r in 1..6 {
+            assert!(
+                keys[r] < keys[r - 1],
+                "tail-ward rank {r} should stay in front"
+            );
+            let own = bbs[r].x.hypot(bbs[r].z) - 0.5;
+            assert!((keys[r] - own).abs() < 1e-5, "no pull outside the band");
+        }
+    }
+
+    /// Non-body billboards keep the tile key.
+    #[test]
+    fn segment_order_ignores_non_bodies() {
+        let mut b = seg(1.0, -5.0, 0);
+        b.body = None;
+        assert_eq!(segment_depth_keys(&[b], &seg_cam()), vec![-1.0]);
+    }
+
     /// nearest image (a target across the seam still projects).
     #[test]
     fn world_to_screen_centers_rejects_and_wraps() {

@@ -94,6 +94,7 @@
       "map_marker_scale": 1.0,
       "map_owned_buildings": true,
       "mc2_fancy_exit": true,
+      "segment_order": true,
       "smooth_motion": true,
       "smooth_shading": true,
       "smooth_textures": true

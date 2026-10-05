@@ -1377,6 +1377,21 @@ pub struct Notification {
     pub tag: Option<NotifyTag>,
 }
 
+/// A posed entity's place in a multipart body: segments link toward
+/// the head through `f52` in both games (MC2's hydras and kraken
+/// BRANCH, so the link is a tree, not a chain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyLink {
+    /// The body's root (the head) — the first non-segment up the links.
+    pub root: u16,
+    /// Link hops from the root (root = 0).
+    pub rank: u16,
+    /// This entity's own slot (the root's link points at itself).
+    pub slot: u16,
+    /// The next entity toward the head (`f52`); `== slot` on the root.
+    pub parent: u16,
+}
+
 /// One live drawable entity, resolved for the app's billboard / map
 /// layer: continuous pose (position in tile units, real-valued yaw)
 /// plus the sprite-stats type index and animation frame the sim's
@@ -1462,6 +1477,12 @@ pub struct LivePose {
     /// Multipart body segment (state 120) — drawn but excluded from
     /// entity counts/lists like the original's map/behavior scans.
     pub segment: bool,
+    /// Multipart BODY membership ([`BodyLink`]) for the segment
+    /// creatures (worms, dragons, hydras, the kraken); `None` for
+    /// everything else. Presentation only: the renderer's
+    /// segment-order enhancement resolves near-ties between a body's
+    /// own segments head-first instead of by tile.
+    pub body: Option<BodyLink>,
     /// ⭐ RETAIL'S CO-TILE PAINT ORDER, in `(0, 1)`: this pose's place
     /// in its tile's entity chain, head → tail, relative to the other
     /// POSES sharing the tile. Higher = later in the walk = drawn
@@ -4821,6 +4842,7 @@ impl World {
                 alt: e.z as f32 / 256.0,
                 yaw: (e.f30 & 0x7FF) as f32 * (TAU / 2048.0),
                 segment: bits.segment,
+                body: None,       // stamped in the post-pass below
                 chain_depth: 0.5, // ranked in the post-pass below
 
                 life_frac: bits.life_frac,
@@ -4901,7 +4923,72 @@ impl World {
             });
         }
         self.rank_co_tile_poses(&mut out);
+        self.rank_body_poses(&mut out);
         out
+    }
+
+    /// Is `e` a multipart body segment (the segment-hide states)? —
+    /// MC1 state 120; MC2 0xE8 (m0/m3 children), 0xE9/0xEA (m27
+    /// branches / tier-2), 0xB4 (m22 tail). Mirrors the per-game
+    /// [`LivePose::segment`] predicates.
+    fn is_body_segment(&self, e: &Ent) -> bool {
+        e.class64 == 5
+            && match self.game {
+                GameId::Mc2 => matches!(e.tick70, 0xB4 | 0xE8..=0xEA),
+                _ => e.tick70 == 120,
+            }
+    }
+
+    /// Stamp [`LivePose::body`]: walk each posed segment's `f52` link
+    /// toward the head until the first non-segment (the root, rank 0),
+    /// counting hops. Bounded (a corrupt or cyclic link just stops);
+    /// a link off the pool leaves the segment body-less.
+    fn rank_body_poses(&self, out: &mut [LivePose]) {
+        const MAX_HOPS: u16 = 256;
+        let n = self.g.ent.len();
+        let mut pose_at = vec![u32::MAX; n];
+        for (k, p) in out.iter().enumerate() {
+            if (p.slot as usize) < n {
+                pose_at[p.slot as usize] = k as u32;
+            }
+        }
+        for k in 0..out.len() {
+            if !out[k].segment {
+                continue;
+            }
+            let mut cur = out[k].slot as usize;
+            let mut rank = 0u16;
+            let root = loop {
+                let next = self.g.ent[cur].f52 as usize;
+                rank += 1;
+                if next == 0 || next >= n || rank > MAX_HOPS {
+                    break None;
+                }
+                if !self.is_body_segment(&self.g.ent[next]) {
+                    break Some(next);
+                }
+                cur = next;
+            };
+            if let Some(root) = root {
+                let slot = out[k].slot;
+                out[k].body = Some(BodyLink {
+                    root: root as u16,
+                    rank,
+                    slot,
+                    parent: self.g.ent[slot as usize].f52,
+                });
+                if let Some(&rk) = pose_at.get(root)
+                    && rk != u32::MAX
+                {
+                    out[rk as usize].body = Some(BodyLink {
+                        root: root as u16,
+                        rank: 0,
+                        slot: root as u16,
+                        parent: root as u16,
+                    });
+                }
+            }
+        }
     }
 
     /// Stamp [`LivePose::chain_depth`] — retail's co-tile paint order,

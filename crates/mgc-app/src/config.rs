@@ -521,6 +521,14 @@ pub struct RenderEnhancement {
     /// with the Visuals preset (deliberate default-on deviation,
     /// player review 2026-10-05: "far superior"); Classic = off.
     pub smooth_textures: bool,
+    /// Segment order: a multipart body's segments (worms, dragons,
+    /// hydras, the kraken) key their depth to their own position and
+    /// resolve near-ties HEAD-FIRST (links within 30° of side-on),
+    /// instead of retail's tile painter, which flickers overlapping
+    /// segments as a body crawls side-on (`mgc_render::
+    /// segment_depth_keys`). Presentation only. DEFAULTS ON with the
+    /// Visuals preset (player design 2026-10-05); Classic = off.
+    pub segment_order: bool,
     /// Entities render interpolated between the last two sim ticks —
     /// the camera's one-tick lerp timeline extended to the world —
     /// so movement is frame-smooth at any fps instead of stepping at
@@ -620,6 +628,7 @@ impl Default for RenderEnhancement {
         Self {
             smooth_shading: true,
             smooth_textures: true,
+            segment_order: true,
             smooth_motion: true,
             hud_transparency: HudTransparency::default(),
             map_owned_buildings: true,

@@ -3218,6 +3218,11 @@ impl App {
                     r.set_smooth_textures(self.cfg.render.enhancement.smooth_textures);
                 }
             }
+            "render.enhancement.segment_order" => {
+                if let Some(r) = &mut self.renderer {
+                    r.set_segment_order(self.cfg.render.enhancement.segment_order);
+                }
+            }
             "render.enhancement.map_marker_scale" => {
                 if let Some(r) = &mut self.renderer {
                     r.set_marker_scale(self.cfg.render.enhancement.map_marker_scale);
@@ -8425,6 +8430,7 @@ impl ApplicationHandler for App {
                 }
                 renderer.set_smooth_shading(self.cfg.render.enhancement.smooth_shading);
                 renderer.set_smooth_textures(self.cfg.render.enhancement.smooth_textures);
+                renderer.set_segment_order(self.cfg.render.enhancement.segment_order);
                 renderer.set_marker_scale(self.cfg.render.enhancement.map_marker_scale);
                 renderer.set_marker_halo(self.cfg.render.enhancement.autocontrasting_markers);
                 renderer.set_extent_fog(self.cfg.render.enhancement.map_extent_fog);
@@ -9637,6 +9643,8 @@ struct Args {
     smooth_shading: Option<bool>,
     /// CLI override of `render.enhancement.smooth_textures`.
     smooth_textures: Option<bool>,
+    /// CLI override of `render.enhancement.segment_order`.
+    segment_order: Option<bool>,
     /// CLI override of `render.debug.map_trigger_areas`.
     map_triggers: Option<bool>,
     /// CLI override of `render.debug.health_bars`.
@@ -9782,6 +9790,7 @@ fn parse_args() -> Result<Args, String> {
     let mut config = None;
     let mut smooth_shading = None;
     let mut smooth_textures = None;
+    let mut segment_order = None;
     let mut map_triggers = None;
     let mut health_bars = None;
     let mut crosshair = None;
@@ -10013,6 +10022,8 @@ fn parse_args() -> Result<Args, String> {
             "--no-smooth-shading" => smooth_shading = Some(false),
             "--smooth-textures" => smooth_textures = Some(true),
             "--no-smooth-textures" => smooth_textures = Some(false),
+            "--segment-order" => segment_order = Some(true),
+            "--no-segment-order" => segment_order = Some(false),
             "--map-triggers" => map_triggers = Some(true),
             "--no-map-triggers" => map_triggers = Some(false),
             "--health-bars" => health_bars = Some(true),
@@ -10190,6 +10201,7 @@ fn parse_args() -> Result<Args, String> {
                      [--tileset 0|1] [--config <path>] \
                      [--smooth-shading|--no-smooth-shading] \
                      [--smooth-textures|--no-smooth-textures] \
+                     [--segment-order|--no-segment-order] \
                      [--map-triggers|--no-map-triggers] \
                      [--crosshair|--no-crosshair] [--coords|--no-coords] \
                      [--health-bars|--no-health-bars] \
@@ -10262,6 +10274,7 @@ fn parse_args() -> Result<Args, String> {
         config,
         smooth_shading,
         smooth_textures,
+        segment_order,
         map_triggers,
         health_bars,
         crosshair,
@@ -11249,6 +11262,7 @@ fn run_screenshot(
     camera: Option<[f32; 5]>,
     smooth_shading: bool,
     smooth_textures: bool,
+    segment_order: bool,
     fog_distance: u32,
     sky_texture: bool,
     reflections: bool,
@@ -11319,6 +11333,7 @@ fn run_screenshot(
     renderer.set_billboards(level.billboards.clone());
     renderer.set_smooth_shading(smooth_shading);
     renderer.set_smooth_textures(smooth_textures);
+    renderer.set_segment_order(segment_order);
     renderer.set_fog_distance(fog_distance as f32);
     if let Some(sky) = mc2_sky_srgb(&level) {
         renderer.set_sky_color(sky);
@@ -11460,6 +11475,7 @@ fn run_screenshot(
             alt,
             yaw: 0.0,
             segment: false,
+            body: None,
             // Synthetic poses on no tile chain — the neutral co-tile
             // rank (`LivePose::chain_depth`).
             chain_depth: 0.5,
@@ -11658,6 +11674,9 @@ pub fn game_main(event_loop: Option<EventLoop<()>>) -> std::process::ExitCode {
     }
     if let Some(v) = args.smooth_textures {
         en.smooth_textures = v;
+    }
+    if let Some(v) = args.segment_order {
+        en.segment_order = v;
     }
     if let Some(v) = args.expose_jar_spells {
         en.expose_jar_spells = v;
@@ -12103,6 +12122,7 @@ pub fn game_main(event_loop: Option<EventLoop<()>>) -> std::process::ExitCode {
             args.camera,
             cfg.render.enhancement.smooth_shading,
             cfg.render.enhancement.smooth_textures,
+            cfg.render.enhancement.segment_order,
             cfg.render.preference.fog_distance,
             cfg.render.preference.sky,
             cfg.render.preference.reflections,

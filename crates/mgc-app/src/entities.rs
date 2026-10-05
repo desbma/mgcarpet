@@ -432,6 +432,7 @@ pub fn billboards_from_poses(
             conceal: game == GameId::Mc2
                 && p.class == 5
                 && (p.model == 26 || (p.model == 23 && dweller_invisibility)),
+            body: p.body,
         });
     }
     out
@@ -2129,6 +2130,7 @@ fn instrument_billboard(
         // An instrument, not a retail entity — never distance-hidden,
         // and on no tile chain, so it takes the neutral co-tile rank.
         conceal: false,
+        body: None,
         chain_depth: 0.5,
         roll: 0.0,
     })
@@ -2173,6 +2175,7 @@ fn push_billboard(
         h_stretch: 1.0,
         blend: 0,
         conceal: false,
+        body: None,
         // The static THING-list path (`--no-terrain-features`
         // comparison renders): no live pool, so no tile chain to
         // read — every sprite takes the neutral co-tile rank and the
@@ -2787,6 +2790,7 @@ mod tests {
             alt: 1.0,
             yaw: 0.0,
             segment: false,
+            body: None,
             chain_depth: 0.5,
             life_frac: None,
             fire_life: None,
