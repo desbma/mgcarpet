@@ -1087,16 +1087,6 @@ pub struct GameplayPatches {
     /// table (bank 7 `win2`). Retail points both win movies at one
     /// script, so `levelw2` plays scored with the wrong bank.
     pub win2_movie_score: PatchArm,
-    /// The standing troglodyte's eighth view is drawn at its proper
-    /// size. Retail ships that one sprite (TMAPS 452, the last view
-    /// of the standing family 445..452) as an UNCROPPED 320x200
-    /// authoring canvas with the 53x72 creature in the middle, and the
-    /// engine scales the whole canvas to the creature's height — so a
-    /// troglodyte standing still, seen from that one-in-eight angle,
-    /// shrinks to about a third of its size and floats off the
-    /// ground. `patched` crops the canvas to the creature;
-    /// presentation-only, hash-silent.
-    pub mc2_troglodyte_sprite_crop: PatchArm,
     /// MC1 Create Castle placement validation (the "latch bug",
     /// certified on the mc1l32 recording). Retail anchors the
     /// placement scan at the casting HAND — a steerable tile beside
@@ -1320,7 +1310,6 @@ impl Default for GameplayPatches {
             mc2_downgrade_overflow: PatchArm::Patched,
             mc2_dweller_invisibility: PatchArm::Patched,
             win2_movie_score: PatchArm::Patched,
-            mc2_troglodyte_sprite_crop: PatchArm::Patched,
             castle_latch_bug: PatchArm::Patched,
             no_spell_loss: PatchArm::Patched,
             mc1_fix_dragon_tail: PatchArm::Patched,
@@ -1359,7 +1348,6 @@ impl GameplayPatches {
             mc2_downgrade_overflow: PatchArm::Retail,
             mc2_dweller_invisibility: PatchArm::Retail,
             win2_movie_score: PatchArm::Retail,
-            mc2_troglodyte_sprite_crop: PatchArm::Retail,
             castle_latch_bug: PatchArm::Retail,
             no_spell_loss: PatchArm::Retail,
             mc1_fix_dragon_tail: PatchArm::Retail,
@@ -1387,9 +1375,8 @@ impl GameplayPatches {
     /// The pinned policy with the PRESENTATION-ONLY arms taken back
     /// from the player's own config. `ball_owner_recolor` (the viewport
     /// sprite family of a far-claimed sphere), `mc2_dweller_invisibility`
-    /// (the (5,23) proximity conceal), `win2_movie_score` (the
-    /// ending's music pick) and `mc2_troglodyte_sprite_crop` (one
-    /// sprite's atlas rectangle) never touch the sim, the hash or the pose —
+    /// (the (5,23) proximity conceal) and `win2_movie_score` (the
+    /// ending's music pick) never touch the sim, the hash or the pose —
     /// nothing a take grades — so pinning them to retail under
     /// `--replay` / `--record` bought no fidelity and read as "my
     /// patches are broken" (player report 2026-09-10: a mc2l22 replay
@@ -1405,7 +1392,6 @@ impl GameplayPatches {
             ball_owner_recolor: user.ball_owner_recolor,
             mc2_dweller_invisibility: user.mc2_dweller_invisibility,
             win2_movie_score: user.win2_movie_score,
-            mc2_troglodyte_sprite_crop: user.mc2_troglodyte_sprite_crop,
             ..self
         }
     }
@@ -1423,7 +1409,6 @@ impl GameplayPatches {
             // plainly, balls wore the sim's row.
             mc2_dweller_invisibility: PatchArm::Retail,
             ball_owner_recolor: PatchArm::Retail,
-            mc2_troglodyte_sprite_crop: PatchArm::Retail,
             no_spell_loss: PatchArm::Retail,
             mc1_fix_dragon_tail: PatchArm::Retail,
             mc2_phantom_castle: PatchArm::Retail,
@@ -1688,7 +1673,7 @@ fn merge(base: &mut serde_json::Value, overlay: serde_json::Value) {
 /// renamed, retyped or its default changes, so stale generated
 /// baselines regenerate instead of feeding outdated values/shapes
 /// into the merge.
-const DEFAULTS_VERSION: u64 = 47;
+const DEFAULTS_VERSION: u64 = 48;
 
 /// Generate the defaults baseline so every option is spelled out and
 /// discoverable. Regenerates automatically when its `_version` stamp

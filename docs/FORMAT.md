@@ -493,23 +493,43 @@ same model with bigger axes. Types and the lookup law live in
 `Renderer::load_impostors`. The sim never sees a pack — sprite sizes
 and draw types stay on the retail bank.
 
-Today the retail pack is **derived at level load** from the level's
-sprite bundle (`mgc-app` `entities::retail_impostors`: one model per
-family the game's sprite table names — MC1/HW sprite-stats rows, MC2
-sprite-param rows), so bundles carry no pack and no bake epoch moved.
-The same pack can be written to and read from disk:
+Every graphics variant bundle (`mc1-temperate`, `mc1-arctic`,
+`mc2-day`, `mc2-night`, `mc2-night-fog`, `mc2-cave`) carries its pack
+since bake epoch 27:
 
 | member | contents |
 |---|---|
 | `impostors.json` | `ImpostorIndex` (below) |
 | `impostors.bin` | the atlas texels, `PixelFormat::byte_len` bytes |
 
-Instruments (mgc-app): `MGC_EXPORT_IMPOSTORS=<dir>` writes the level's
-retail pack; `MGC_IMPOSTOR_PACK=<dir>` draws from the pack in `<dir>`
-instead — a whole-pack replacement that must cover every family the
-level draws (an indexed pack resolves through the level's palette, so
-use it on the bank it was made from). An unreadable or invalid pack
-falls back to retail with a warning.
+The importer bakes it from the variant's TMAPS bank
+(`mgc_import::impostors::bake`): one model per family the game's
+sprite table names (MC1/HW sprite-stats rows; MC2 sprite-param rows,
+draw type = the bank's flags high byte), the bank's **asset
+corrections** applied, retail's dispatch tabulated, then repacked into
+the pack's own tight atlas (only texels some picture shows; a shared
+rect stored once; shelves tallest first). `sprites.json` / `.bin` stay
+the uncorrected retail bank — the SIM's view of the art (sizes, draw
+types); the renderer reads only the pack.
+
+Asset corrections are retail data that is plainly wrong art, fixed in
+the picture only — never a sim input, never an option:
+
+- **MC2 TMAPS 452** (the standing troglodyte's eighth view) ships as an
+  uncropped 320x200 authoring canvas around a 53x72 creature; retail
+  scales the whole canvas to the creature's height, so from that angle
+  a standing troglodyte shrank to a third of its size and floated. The
+  pack's picture is the canvas cut to its bounding box. (Shipped
+  2026-09-30 as the patch option `mc2_troglodyte_sprite_crop`; ruled a
+  correction and moved into the bake 2026-10-06.)
+
+Instrument (mgc-app): `MGC_IMPOSTOR_PACK=<dir>` draws from the pack in
+`<dir>` (`impostors.json` + `impostors.bin`) instead of the bundle's —
+for putting an experimental pack side by side with retail. It is a
+whole-pack replacement that must cover every family the level draws
+(an indexed pack resolves through the level's palette, so make it from
+the same bank); an unreadable or invalid pack falls back to the
+bundle's with a warning. `ImpostorPack::repacked` re-atlases any pack.
 
 `ImpostorIndex` (`version` = 1):
 
@@ -548,4 +568,5 @@ sector and `pose_count` poses (the type's own frame count); everything
 else (0/1/21, unknown) one cell on the base. Each sprite becomes one
 clip (its FLC stream if flagged animated, else its still), shared by
 every family that draws it. Parity with the pre-impostor renderer is
-asserted over every bank (`retail_impostors_reproduce_the_sprite_bank_dispatch`).
+asserted over every baked bundle by content
+(`baked_impostors_reproduce_the_sprite_bank_dispatch`).

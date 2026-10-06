@@ -2358,30 +2358,6 @@ pub fn registry() -> Vec<Spec> {
         Spec {
             domain: Gameplay,
             group: "gameplay · patches",
-            label: "mc2_troglodyte_sprite_crop",
-            class: Patch,
-            key: None,
-            cli: None,
-            cfg_path: "gameplay.patches.mc2_troglodyte_sprite_crop",
-            read: |c| Val::Toggle {
-                on: c.gameplay.patches.mc2_troglodyte_sprite_crop.on(),
-                faithful: false,
-            },
-            desc: "A standing troglodyte keeps its size from every angle.                    Retail ships one of its eight standing views as an                    uncropped 320x200 drawing canvas with the creature in                    the middle, and scales the whole canvas to the                    creature's height - seen from that angle it shrinks to                    a third of its size and floats. Drawing only; the sim                    is untouched.",
-            ctl: Ctl::Toggle {
-                set: |c, v| {
-                    c.gameplay.patches.mc2_troglodyte_sprite_crop =
-                        crate::config::PatchArm::from_on(v)
-                },
-                descs: [
-                    "One standing view is tiny and floating, as retail draws it.",
-                    "That view is cropped to the creature (default).",
-                ],
-            },
-        },
-        Spec {
-            domain: Gameplay,
-            group: "gameplay · patches",
             label: "mc2_leviathan_high_lunge",
             class: Patch,
             key: None,
@@ -3266,11 +3242,12 @@ mod tests {
         // volcano_register_revalidate the same round (w158b; renamed
         // from mc1_volcano_register_revalidate when w158e gave it the
         // MC2 twin). mc2_troglodyte_sprite_crop 2026-09-30
-        // (presentation-only), mc2_leviathan_high_lunge the same day
+        // (presentation-only; retired 2026-10-06 into a bake-time
+        // asset correction), mc2_leviathan_high_lunge the same day
         // (a balance deviation riding the class for its pin), and
         // mc2_flyers_clear_terrain 2026-10-03, and
         // skeletons_convert_traders 2026-10-05.
-        assert_eq!(patches, 29, "all twenty-nine patches ship on");
+        assert_eq!(patches, 28, "all twenty-eight patches ship on");
     }
 
     #[test]

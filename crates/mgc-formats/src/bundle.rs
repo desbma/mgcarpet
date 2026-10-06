@@ -26,6 +26,11 @@
 //!   texture atlas ([`TerrainAtlasInfo`])
 //! - `sprites.bin` + `sprites.json` — one 8bpp sprite atlas + its
 //!   index ([`SpriteIndex`]; billboard frames, animations pre-decoded)
+//!   — the SIM's view of the art (sizes, draw types)
+//! - `impostors.bin` + `impostors.json` — the world-sprite impostor
+//!   pack the renderer draws ([`crate::impostor::ImpostorPack`]):
+//!   retail's view dispatch tabulated over its own tight atlas, with
+//!   the bake's asset corrections applied
 //! - `search.bin`, `build.tab.bin`, `build.dat.bin` — terrain-feature
 //!   pass data (ring search order — both games; building footprints —
 //!   MC1)
@@ -285,6 +290,9 @@ pub struct Bundle {
     pub tile_colors: [u8; 256],
     pub terrain_atlas: Option<(TerrainAtlasInfo, Vec<u8>)>,
     pub sprites: Option<(SpriteIndex, Vec<u8>)>,
+    /// The world-sprite impostor pack (`impostors.json` + `.bin`),
+    /// validated.
+    pub impostors: Option<crate::impostor::ImpostorPack>,
     /// UI sprite library (HSPR: spell icons, HUD, map markers) — same
     /// index schema as `sprites`, single frame per entry.
     pub ui_sprites: Option<(SpriteIndex, Vec<u8>)>,
@@ -458,6 +466,20 @@ impl Bundle {
             None => None,
         };
 
+        let impostors = match read_opt(crate::impostor::ImpostorPack::PIXELS_FILE) {
+            Some(pixels) => {
+                let name = crate::impostor::ImpostorPack::INDEX_FILE;
+                let index_path = dir.join(name);
+                let index = serde_json::from_slice(&read(name)?)
+                    .map_err(|e| BundleError::Json(index_path.clone(), e))?;
+                let pack = crate::impostor::ImpostorPack { index, pixels };
+                pack.validate()
+                    .map_err(|e| BundleError::Malformed(index_path, e))?;
+                Some(pack)
+            }
+            None => None,
+        };
+
         let ui_sprites = match read_opt("ui-sprites.bin") {
             Some(data) => {
                 let index_path = dir.join("ui-sprites.json");
@@ -546,6 +568,7 @@ impl Bundle {
             tile_colors,
             terrain_atlas,
             sprites,
+            impostors,
             ui_sprites,
             font,
             web_sprites,

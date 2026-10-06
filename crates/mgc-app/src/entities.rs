@@ -23,156 +23,29 @@ use mgc_sim::{HEIGHT_SCALE, MAP_TILES};
 /// Engine fixed-point units per tile.
 const UNITS_PER_TILE: f32 = 256.0;
 
-/// TMAPS 452 — the eighth (last) view of the MC2 troglodyte's
-/// STANDING family 445..=452 (sprite-param row 336, draw type 17: it
-/// is drawn for view sectors 7 and 8, the second one mirrored).
-const MC2_TROGLODYTE_STAND_VIEW_7: usize = 452;
-
-/// The sprite index the renderer draws from: the bundle's own, or —
-/// patch option `mc2_troglodyte_sprite_crop` — with the one UNCROPPED
-/// AUTHORING CANVAS retail ships cut down to its picture.
-///
-/// Every other view of the standing troglodyte is a tight 50..58 x
-/// 72..74 cel; view 7 is a 320x200 canvas (a whole VGA screen) whose
-/// only non-transparent pixels are a 53x72 creature at (140,74).
-/// Retail's rasteriser sizes a billboard as `height = projScale *
-/// rotSpeed_8 / depth`, `width = height * sprite.width /
-/// sprite.height` (remc2 GameRenderOriginal.cpp:3770-72) — the whole
-/// canvas at the creature's 450-unit height — so from that angle the
-/// troglodyte draws at 72/200 of its size with its feet 27% of the
-/// way up the quad. It only shows on the standing row (the (5,24)
-/// state 192 pose, `sub_287B0`), i.e. on troglodytes that are not
-/// chasing anything, which retail's 19-tile fog mostly kept out of
-/// sight (player-reported 2026-09-30: "troglodytes occasionally
-/// visually shrink to tiny size … a parked pose, or seeing them from
-/// a specific angle"). The crop re-points the entry at the picture's
-/// bounding box inside the SAME atlas pixels; nothing is re-baked.
-///
-/// A census of every bank (MC1 arctic/temperate, MC2 day/night/cave)
-/// finds no second entry of the kind: the other mostly-empty cels
-/// are frames of grow/sink families that share one canvas on purpose.
-pub fn draw_sprite_index(
-    game: GameId,
-    index: &mgc_formats::bundle::SpriteIndex,
-    atlas: &[u8],
-    crop_troglodyte: bool,
-) -> mgc_formats::bundle::SpriteIndex {
-    let mut out = index.clone();
-    if crop_troglodyte && game == GameId::Mc2 {
-        if let Some(e) = out.sprites.get_mut(MC2_TROGLODYTE_STAND_VIEW_7) {
-            crop_authoring_canvas(e, atlas, index.atlas_width as usize);
-        }
-    }
-    out
-}
-
-/// The world-sprite impostor pack for a level's sprite bank: retail's
-/// draw dispatch tabulated ([`mgc_formats::impostor::retail`]) for
-/// every visual family the game's sprite table can name — the MC1/HW
-/// sprite-stats rows, the MC2 sprite-param rows (draw type = the
-/// bank's flags high byte, exactly as [`resolve_pose_sprite`] reads
-/// it). Every billboard the app makes resolves through one of those
-/// rows, so the pack covers them all. `crop_troglodyte` is
-/// [`draw_sprite_index`]'s patch.
-pub fn retail_impostors(
-    game: GameId,
-    index: &mgc_formats::bundle::SpriteIndex,
-    atlas: &[u8],
-    crop_troglodyte: bool,
-) -> mgc_formats::impostor::ImpostorPack {
-    use mgc_formats::impostor::{ModelKey, retail};
-    let dims = |id: u16| {
-        index
-            .sprites
-            .get(id as usize)
-            .map(|s| (s.width, s.height, s.flags))
-    };
-    let rows = match game {
-        GameId::Mc1 | GameId::Mc1Hw => SPRITE_STATS.len(),
-        GameId::Mc2 => mgc_sim::mc2::sprite_params::SPRITE_PARAMS.len(),
-    };
-    let keys: Vec<ModelKey> = (0..rows as u16)
-        .filter_map(|row| resolve_pose_sprite(game, row, &dims))
-        .map(|s| ModelKey {
-            sprite_base: s.sprite_base,
-            draw_type: s.draw_type,
-        })
-        .collect();
-    let drawn = draw_sprite_index(game, index, atlas, crop_troglodyte);
-    retail::build(&drawn, atlas, &keys)
-}
-
-/// The pack a level's billboards draw through: [`retail_impostors`],
-/// with two instruments for working on packs outside the game —
-/// `MGC_EXPORT_IMPOSTORS=<dir>` writes the retail pack there
-/// (`impostors.json` + `impostors.bin`, docs/FORMAT.md "Impostor
-/// packs"), and `MGC_IMPOSTOR_PACK=<dir>` draws from the pack in that
-/// directory INSTEAD (whole-pack replacement; it must cover every
-/// family the level draws, and an indexed pack resolves through the
-/// level's palette — so match the bank it was made from). A pack that
-/// fails to read or validate falls back to retail with a warning.
+/// The impostor pack a level's billboards draw through: the bundle's
+/// own (`impostors.json` + `.bin`, baked by `mgc_import::impostors`),
+/// or — `MGC_IMPOSTOR_PACK=<dir>` — the pack in that directory INSTEAD,
+/// for putting an experimental pack side by side with retail (a
+/// whole-pack swap: it must cover every family the level draws, and an
+/// indexed pack resolves through the level's palette, so make it from
+/// the same bank). An unusable override falls back to the bundle's
+/// pack with a warning; `None` = the bundle has no pack (a stale bake —
+/// the epoch check reports it) and no override.
 pub fn level_impostors(
-    game: GameId,
-    index: &mgc_formats::bundle::SpriteIndex,
-    atlas: &[u8],
-    crop_troglodyte: bool,
-) -> mgc_formats::impostor::ImpostorPack {
-    let pack = retail_impostors(game, index, atlas, crop_troglodyte);
-    if let Some(dir) = std::env::var_os("MGC_EXPORT_IMPOSTORS") {
-        let dir = std::path::PathBuf::from(dir);
-        match pack.write_dir(&dir) {
-            Ok(()) => eprintln!(
-                "impostors: wrote {} models / {} images to {}",
-                pack.index.models.len(),
-                pack.index.images.len(),
-                dir.display()
-            ),
-            Err(e) => eprintln!("impostors: export to {} failed: {e}", dir.display()),
-        }
-    }
+    bundled: Option<&mgc_formats::impostor::ImpostorPack>,
+) -> Option<mgc_formats::impostor::ImpostorPack> {
     if let Some(dir) = std::env::var_os("MGC_IMPOSTOR_PACK") {
         let dir = std::path::PathBuf::from(dir);
         match mgc_formats::impostor::ImpostorPack::read_dir(&dir) {
-            Ok(p) => return p,
+            Ok(p) => return Some(p),
             Err(e) => eprintln!(
-                "impostors: {} unusable ({e}); drawing retail",
+                "impostors: {} unusable ({e}); drawing the bundle's pack",
                 dir.display()
             ),
         }
     }
-    pack
-}
-
-/// Cut a single-frame 320x200 sprite entry down to the bounding box
-/// of its non-transparent (non-zero) pixels. Anything else — another
-/// size, an animated entry, an empty canvas — is left as it is, so a
-/// bank that ships the cel properly cropped is untouched.
-fn crop_authoring_canvas(e: &mut mgc_formats::bundle::SpriteEntry, atlas: &[u8], atlas_w: usize) {
-    if (e.width, e.height) != (320, 200) || e.frames.len() != 1 {
-        return;
-    }
-    let (fx, fy) = (e.frames[0].x as usize, e.frames[0].y as usize);
-    let (w, h) = (e.width as usize, e.height as usize);
-    let row = |r: usize| atlas.get((fy + r) * atlas_w + fx..(fy + r) * atlas_w + fx + w);
-    let (mut r0, mut r1, mut c0, mut c1) = (h, 0, w, 0);
-    for r in 0..h {
-        let Some(px) = row(r) else { return };
-        let Some(first) = px.iter().position(|p| *p != 0) else {
-            continue;
-        };
-        let last = px.iter().rposition(|p| *p != 0).unwrap_or(first);
-        r0 = r0.min(r);
-        r1 = r;
-        c0 = c0.min(first);
-        c1 = c1.max(last);
-    }
-    if r0 > r1 || c0 > c1 {
-        return; // fully transparent
-    }
-    e.frames[0].x += c0 as u32;
-    e.frames[0].y += r0 as u32;
-    e.width = (c1 - c0 + 1) as u16;
-    e.height = (r1 - r0 + 1) as u16;
+    bundled.cloned()
 }
 
 /// A live pose's sprite row resolved under the game's own table.
@@ -3338,61 +3211,6 @@ mod tests {
         assert_eq!(mc1.sprite_base, SPRITE_STATS[43].sprite_base);
     }
 
-    /// Patch option `mc2_troglodyte_sprite_crop`: the standing
-    /// troglodyte's 320x200 authoring canvas is re-pointed at the
-    /// creature inside it; the retail arm, MC1, every other entry and
-    /// a properly cropped cel are left alone.
-    #[test]
-    fn the_troglodyte_canvas_is_cropped_to_its_creature() {
-        use mgc_formats::bundle::{FramePos, SpriteEntry, SpriteIndex};
-        let (aw, ah) = (400usize, 260usize);
-        let mut atlas = vec![0u8; aw * ah];
-        // The canvas sits at (20,30); the creature is a 53x72 block
-        // at (140,74) inside it, as in the shipped bank.
-        let (fx, fy) = (20usize, 30usize);
-        for r in 74..146 {
-            for c in 140..193 {
-                atlas[(fy + r) * aw + fx + c] = 7;
-            }
-        }
-        let entry = |id: u32, w: u16, h: u16| SpriteEntry {
-            id,
-            group: 445,
-            width: w,
-            height: h,
-            flags: 0x1102,
-            frames: vec![FramePos {
-                x: fx as u32,
-                y: fy as u32,
-            }],
-        };
-        let mut sprites: Vec<SpriteEntry> = (0..453).map(|id| entry(id, 58, 72)).collect();
-        sprites[452] = entry(452, 320, 200);
-        sprites[451] = entry(451, 320, 200); // same shape, NOT the cel
-        let index = SpriteIndex {
-            atlas_width: aw as u32,
-            atlas_height: ah as u32,
-            sprites,
-            pointer_base: 0,
-        };
-        let on = draw_sprite_index(GameId::Mc2, &index, &atlas, true);
-        let e = &on.sprites[452];
-        assert_eq!((e.width, e.height), (53, 72), "the creature's own box");
-        assert_eq!(
-            (e.frames[0].x, e.frames[0].y),
-            (fx as u32 + 140, fy as u32 + 74),
-            "same atlas pixels, no re-bake"
-        );
-        assert_eq!(on.sprites[451], index.sprites[451], "only TMAPS 452");
-        // The retail arm and MC1 draw the bundle's own index.
-        assert_eq!(draw_sprite_index(GameId::Mc2, &index, &atlas, false), index);
-        assert_eq!(draw_sprite_index(GameId::Mc1, &index, &atlas, true), index);
-        // A bank that ships the cel cropped is untouched.
-        let mut fine = index.clone();
-        fine.sprites[452] = entry(452, 58, 72);
-        assert_eq!(draw_sprite_index(GameId::Mc2, &fine, &atlas, true), fine);
-    }
-
     /// Retail proximity concealment marking: the MC2 wraith (5,26)
     /// carries it unconditionally (its retail concealment was the
     /// short draw radius, not a flag), the mana dweller (5,23) only
@@ -3596,16 +3414,19 @@ mod tests {
         );
     }
 
-    /// THE IMPOSTOR PARITY LAW, on every real sprite bank (self-skips
+    /// THE IMPOSTOR PARITY LAW, on every real baked bundle (self-skips
     /// without baked data): for every family the game's sprite table
     /// names, every one of the 16 view sectors, every pose, free-running
-    /// and seeked clocks, both troglodyte-crop arms, the retail impostor
-    /// pack draws exactly the rectangle + mirror the renderer's direct
-    /// sprite-bank dispatch drew before impostors existed. The oracle
-    /// below is that dispatch, kept verbatim.
+    /// and seeked clocks, the bundle's impostor pack draws exactly the
+    /// picture (texels, size, mirror) the renderer's direct sprite-bank
+    /// dispatch drew before impostors existed — over the bank with its
+    /// asset corrections applied (`mgc_import::impostors::
+    /// corrected_index`). The oracle below is that dispatch, kept
+    /// verbatim; the pack's atlas is its own, so pictures compare by
+    /// content.
     #[test]
-    fn retail_impostors_reproduce_the_sprite_bank_dispatch() {
-        use mgc_formats::impostor::{ModelKey, flc_image};
+    fn baked_impostors_reproduce_the_sprite_bank_dispatch() {
+        use mgc_formats::impostor::{ImpostorImage, ModelKey, flc_image};
         const VIEW_FOLD_5: [u8; 16] = [0, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 2, 2, 1, 1, 0];
         const VIEW_FOLD_3: [u8; 16] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 2, 1, 1, 1, 0, 0];
         let oracle = |index: &mgc_formats::bundle::SpriteIndex,
@@ -3642,14 +3463,23 @@ mod tests {
             let f = entry.frames[fi];
             Some((f.x, f.y, entry.width as u32, entry.height as u32, mirror))
         };
+        let cut = |px: &[u8], aw: u32, (x, y, w, h): (u32, u32, u32, u32)| -> Vec<u8> {
+            (0..h)
+                .flat_map(|r| {
+                    let s = ((y + r) * aw + x) as usize;
+                    px[s..s + w as usize].iter().copied()
+                })
+                .collect()
+        };
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../baked/assets");
         let mut checked = 0usize;
         for (game, variant) in [
-            (GameId::Mc1, "mc1-temperate"),
-            (GameId::Mc1, "mc1-arctic"),
-            (GameId::Mc2, "mc2-day"),
-            (GameId::Mc2, "mc2-night"),
-            (GameId::Mc2, "mc2-cave"),
+            (mgc_formats::Game::MagicCarpet1, "mc1-temperate"),
+            (mgc_formats::Game::MagicCarpet1, "mc1-arctic"),
+            (mgc_formats::Game::MagicCarpet2, "mc2-day"),
+            (mgc_formats::Game::MagicCarpet2, "mc2-night"),
+            (mgc_formats::Game::MagicCarpet2, "mc2-night-fog"),
+            (mgc_formats::Game::MagicCarpet2, "mc2-cave"),
         ] {
             let Ok(bundle) = mgc_formats::bundle::Bundle::load(&root.join(variant)) else {
                 eprintln!("skipped {variant}: baked data not present");
@@ -3658,32 +3488,46 @@ mod tests {
             let Some((index, atlas)) = &bundle.sprites else {
                 continue;
             };
-            for crop in [false, true] {
-                let pack = retail_impostors(game, index, atlas, crop);
-                pack.validate().unwrap();
-                let drawn = draw_sprite_index(game, index, atlas, crop);
-                for model in &pack.index.models {
-                    let key = model.key;
-                    let poses = mgc_formats::impostor::retail::pose_count(key.draw_type);
-                    for frame in 0..poses as u8 {
-                        for s in 0..64 {
-                            // Four probes per sector, its edges included;
-                            // a negative turn exercises the wrap.
-                            let rel = s as f32 * std::f32::consts::TAU / 64.0 - 3.5;
-                            for (seek, turn) in
-                                [(None, 0), (None, 7), (None, 23), (Some(0), 5), (Some(3), 1)]
-                            {
-                                let got =
-                                    pack.index.view(key, frame, rel, 12.0, seek, turn).map(|v| {
-                                        (v.image.x, v.image.y, v.image.w, v.image.h, v.mirror)
-                                    });
-                                assert_eq!(
-                                    got,
-                                    oracle(&drawn, key, frame, rel, seek, turn),
-                                    "{variant} crop={crop} {key:?} frame {frame} rel {rel} {seek:?}/{turn}"
-                                );
-                                checked += 1;
+            let pack = bundle
+                .impostors
+                .as_ref()
+                .unwrap_or_else(|| panic!("{variant}: no impostor pack (stale bake?)"));
+            let pw = pack.index.atlas_width;
+            let drawn = mgc_import::impostors::corrected_index(game, index, atlas);
+            for key in mgc_import::impostors::retail_keys(game, index) {
+                assert!(
+                    pack.index.model(key).is_some(),
+                    "{variant}: {key:?} missing"
+                );
+                let poses = mgc_formats::impostor::retail::pose_count(key.draw_type);
+                for frame in 0..poses as u8 {
+                    for s in 0..64 {
+                        // Four probes per sector, its edges included;
+                        // a negative turn exercises the wrap.
+                        let rel = s as f32 * std::f32::consts::TAU / 64.0 - 3.5;
+                        for (seek, turn) in
+                            [(None, 0), (None, 7), (None, 23), (Some(0), 5), (Some(3), 1)]
+                        {
+                            let got = pack.index.view(key, frame, rel, 12.0, seek, turn);
+                            let want = oracle(&drawn, key, frame, rel, seek, turn);
+                            let ctx = format!(
+                                "{variant} {key:?} frame {frame} rel {rel} {seek:?}/{turn}"
+                            );
+                            match (got, want) {
+                                (None, None) => {}
+                                (Some(v), Some((x, y, w, h, mirror))) => {
+                                    let ImpostorImage { w: gw, h: gh, .. } = v.image;
+                                    assert_eq!((gw, gh, v.mirror), (w, h, mirror), "{ctx}");
+                                    assert_eq!(v.image.anchor, [0.5, 0.0], "{ctx}");
+                                    assert!(
+                                        cut(&pack.pixels, pw, (v.image.x, v.image.y, gw, gh))
+                                            == cut(atlas, index.atlas_width, (x, y, w, h)),
+                                        "{ctx}: texels differ"
+                                    );
+                                }
+                                (g, w) => panic!("{ctx}: pack {g:?} vs dispatch {w:?}"),
                             }
+                            checked += 1;
                         }
                     }
                 }

@@ -321,6 +321,106 @@ impl ImpostorPack {
         Ok(())
     }
 
+    /// The same pack over a fresh, tight atlas `atlas_width` texels
+    /// wide: only the texels some image shows are kept, an atlas rect
+    /// shared by several images is stored once, and the rects are
+    /// shelf-packed tallest first (ties in first-use order —
+    /// deterministic). Lookups resolve to the same pictures; only the
+    /// atlas coordinates move.
+    ///
+    /// Panics if an image is wider than `atlas_width`.
+    pub fn repacked(&self, atlas_width: u32) -> ImpostorPack {
+        use std::collections::HashMap;
+        let src = &self.index;
+        let (bpp, plane) = match src.pixels {
+            PixelFormat::Indexed8 => (1usize, false),
+            PixelFormat::Rgba8 => (4, true),
+        };
+        // Unique source rects, in first-use order.
+        let mut rects: Vec<(u32, u32, u32, u32)> = Vec::new();
+        let mut slot_of: HashMap<(u32, u32, u32, u32), usize> = HashMap::new();
+        let image_slot: Vec<usize> = src
+            .images
+            .iter()
+            .map(|im| {
+                let r = (im.x, im.y, im.w, im.h);
+                *slot_of.entry(r).or_insert_with(|| {
+                    rects.push(r);
+                    rects.len() - 1
+                })
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..rects.len()).collect();
+        order.sort_by_key(|&i| (std::cmp::Reverse(rects[i].3), i));
+        // Shelf packing.
+        struct Shelf {
+            y: u32,
+            h: u32,
+            x: u32,
+        }
+        let mut shelves: Vec<Shelf> = Vec::new();
+        let mut height = 0u32;
+        let mut placed = vec![(0u32, 0u32); rects.len()];
+        for &i in &order {
+            let (_, _, w, h) = rects[i];
+            assert!(
+                w <= atlas_width,
+                "impostor image {w} wide > atlas {atlas_width}"
+            );
+            let shelf = match shelves
+                .iter_mut()
+                .find(|s| s.h >= h && s.x + w <= atlas_width)
+            {
+                Some(s) => s,
+                None => {
+                    shelves.push(Shelf { y: height, h, x: 0 });
+                    height += h;
+                    shelves.last_mut().expect("just pushed")
+                }
+            };
+            placed[i] = (shelf.x, shelf.y);
+            shelf.x += w;
+        }
+        // Copy the texels (and the material plane).
+        let (sw, sh) = (src.atlas_width as usize, src.atlas_height as usize);
+        let (dw, dh) = (atlas_width as usize, height as usize);
+        let mut pixels = vec![0u8; PixelFormat::byte_len(src.pixels, atlas_width, height)];
+        for (i, &(x, y, w, h)) in rects.iter().enumerate() {
+            let (px, py) = placed[i];
+            for row in 0..h as usize {
+                let s = ((y as usize + row) * sw + x as usize) * bpp;
+                let d = ((py as usize + row) * dw + px as usize) * bpp;
+                let n = w as usize * bpp;
+                pixels[d..d + n].copy_from_slice(&self.pixels[s..s + n]);
+                if plane {
+                    let (s0, d0) = (sw * sh * 4, dw * dh * 4);
+                    let (s, d) = (s / 4, d / 4);
+                    let n = w as usize;
+                    pixels[d0 + d..d0 + d + n].copy_from_slice(&self.pixels[s0 + s..s0 + s + n]);
+                }
+            }
+        }
+        let images = src
+            .images
+            .iter()
+            .zip(&image_slot)
+            .map(|(im, &slot)| ImpostorImage {
+                x: placed[slot].0,
+                y: placed[slot].1,
+                ..*im
+            })
+            .collect();
+        ImpostorPack {
+            index: ImpostorIndex {
+                atlas_width,
+                atlas_height: height,
+                images,
+                ..src.clone()
+            },
+            pixels,
+        }
+    }
+
     /// Write `impostors.json` + `impostors.bin` into `dir`.
     pub fn write_dir(&self, dir: &std::path::Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
@@ -650,6 +750,73 @@ mod tests {
         let back = ImpostorPack::read_dir(&dir).unwrap();
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(back, pack);
+    }
+
+    /// The texels a view shows, row-major (+ the material plane for
+    /// RGBA packs).
+    fn texels(pack: &ImpostorPack, im: &ImpostorImage) -> Vec<u8> {
+        let ix = &pack.index;
+        let (w, h) = (ix.atlas_width as usize, ix.atlas_height as usize);
+        let mut out = Vec::new();
+        for r in 0..im.h as usize {
+            for c in 0..im.w as usize {
+                let p = (im.y as usize + r) * w + im.x as usize + c;
+                match ix.pixels {
+                    PixelFormat::Indexed8 => out.push(pack.pixels[p]),
+                    PixelFormat::Rgba8 => {
+                        out.extend_from_slice(&pack.pixels[p * 4..p * 4 + 4]);
+                        out.push(pack.pixels[w * h * 4 + p]);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Repacking keeps every lookup's picture, shrinks the atlas to
+    /// the texels in use, and stores a shared rect once — for both
+    /// pixel formats.
+    #[test]
+    fn repacking_keeps_every_picture() {
+        let (index, atlas) = bank();
+        let keys: Vec<ModelKey> = [(2, 17), (2, 18), (0, 19), (30, 0), (10, 5)]
+            .iter()
+            .map(|&(b, d)| ModelKey {
+                sprite_base: b,
+                draw_type: d,
+            })
+            .collect();
+        let indexed = retail::build(&index, &atlas, &keys);
+        let mut rgba = indexed.clone();
+        rgba.index.pixels = PixelFormat::Rgba8;
+        rgba.pixels = indexed
+            .pixels
+            .iter()
+            .flat_map(|&q| [q, q ^ 0x55, q.wrapping_mul(3), 255])
+            .chain(indexed.pixels.iter().map(|&q| q & 1))
+            .collect();
+        for pack in [indexed, rgba] {
+            let small = pack.repacked(16);
+            small.validate().unwrap();
+            assert!(small.pixels.len() < pack.pixels.len());
+            for key in &keys {
+                for pose in 0..retail::pose_count(key.draw_type) as u8 {
+                    for s in 0..16 {
+                        let rel = (s as f32 + 0.5) * TAU / 16.0;
+                        for turn in 0..4 {
+                            let a = pack.index.view(*key, pose, rel, 0.0, None, turn);
+                            let b = small.index.view(*key, pose, rel, 0.0, None, turn);
+                            assert_eq!(a.is_some(), b.is_some());
+                            if let (Some(a), Some(b)) = (a, b) {
+                                assert_eq!(a.mirror, b.mirror);
+                                assert_eq!((a.image.w, a.image.h), (b.image.w, b.image.h));
+                                assert_eq!(texels(&pack, &a.image), texels(&small, &b.image));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Pitch rings pick the nearest elevation.

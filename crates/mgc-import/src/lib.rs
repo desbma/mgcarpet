@@ -21,6 +21,7 @@ pub mod gamedata;
 pub mod hmp;
 pub mod hscreen;
 pub mod hspr;
+pub mod impostors;
 pub mod iso;
 pub mod level_mc1;
 pub mod level_mc2;

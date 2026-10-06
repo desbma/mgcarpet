@@ -147,7 +147,13 @@ pub const FORMAT_VERSION: u32 = 2;
 /// 26: every MC2 variant bundle gains `clrd.bin` — the map type's
 ///    minimap colour table (CLR{D,N,C}-0.DAT); the map dots read it
 ///    instead of a nearest-palette guess.
-pub const BAKE_EPOCH: u32 = 26;
+/// 27: every graphics variant bundle gains `impostors.json` +
+///    `impostors.bin` — the world-sprite impostor pack the renderer
+///    draws (retail dispatch tabulated, own tight atlas), with the
+///    bank's asset corrections applied (MC2: the troglodyte's
+///    uncropped canvas, formerly the runtime patch option
+///    `mc2_troglodyte_sprite_crop`). The app requires it.
+pub const BAKE_EPOCH: u32 = 27;
 
 /// Which original game an asset belongs to. Serialized as the short
 /// tags used in `meta.json`.

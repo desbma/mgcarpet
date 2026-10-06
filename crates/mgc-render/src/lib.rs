@@ -5183,25 +5183,6 @@ impl Renderer {
         self.rebuild_billboard_bind_group();
     }
 
-    /// Swap the impostor index over the atlas already uploaded by
-    /// [`Self::load_impostors`] — same texels, different rectangles
-    /// (the app's live sprite-crop patch toggle). Ignored unless the
-    /// installed pack has the same atlas shape, or if the index fails
-    /// validation.
-    pub fn set_impostor_index(&mut self, index: mgc_formats::impostor::ImpostorIndex) {
-        let Some(pack) = &mut self.impostors else {
-            return;
-        };
-        let same_atlas = (
-            pack.index.atlas_width,
-            pack.index.atlas_height,
-            pack.index.pixels,
-        ) == (index.atlas_width, index.atlas_height, index.pixels);
-        if same_atlas && index.validate().is_ok() {
-            pack.index = index;
-        }
-    }
-
     /// Upload the RGBA UI atlas (app-side composited: HSPR indices
     /// resolved through the blend LUT + palette; index-0 texels carry
     /// alpha 0).

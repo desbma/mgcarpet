@@ -20,10 +20,12 @@ use mgc_formats::bundle::{
     BUNDLE_VERSION, BundleManifest, BundleSource, MovieEntry, MovieIndex, MusicIndex, MusicTrack,
     SpeechClip, SpeechIndex, TerrainAtlasInfo,
 };
+use mgc_formats::impostor::ImpostorPack;
 use mgc_formats::{Game, Importer};
 
 use crate::bake::BakeError;
 use crate::gamedata::GameSource;
+use crate::impostors;
 use crate::sprites;
 use crate::tmaps::TmapsArchive;
 
@@ -1834,6 +1836,22 @@ fn bake_variant(
     emit(
         "sprites.json",
         &serde_json::to_vec_pretty(&packed.index).expect("sprite index serializes"),
+    )?;
+    // The renderer's world art: the bank as impostors (asset
+    // corrections applied, own tight atlas) — `crate::impostors`.
+    let pack = impostors::bake(
+        spec.game,
+        &packed.index,
+        &packed.atlas,
+        SPRITE_ATLAS_WIDTH,
+        MAX_TEXTURE_DIM,
+    );
+    pack.validate()
+        .map_err(|e| BakeError::Level(Path::new(&tmaps_dat_file).to_path_buf(), 0, e))?;
+    emit(ImpostorPack::PIXELS_FILE, &pack.pixels)?;
+    emit(
+        ImpostorPack::INDEX_FILE,
+        &serde_json::to_vec(&pack.index).expect("impostor index serializes"),
     )?;
 
     // Ring search-order table — the same 1024-byte 32x32 format in

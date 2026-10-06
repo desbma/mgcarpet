@@ -711,8 +711,12 @@ struct LoadedLevel {
     /// The sim-side game profile — picks the sprite table the pose
     /// snapshot resolves through (MC1 stats vs MC2 params).
     game: mgc_sim::ids::GameId,
-    /// Bundle sprite data for the renderer (index, atlas pixels).
+    /// The bundle's retail sprite bank (index, atlas pixels): the
+    /// sim-side view of the art — sizes and draw types.
     sprites: Option<(mgc_formats::bundle::SpriteIndex, Vec<u8>)>,
+    /// The bundle's world-sprite impostor pack: what the renderer
+    /// draws (`entities::level_impostors`).
+    impostors: Option<mgc_formats::impostor::ImpostorPack>,
     /// World entities resolved to billboards (initial population).
     billboards: Vec<Billboard>,
     /// Entity dots for the overhead map (the original's 1px markers).
@@ -1647,6 +1651,7 @@ fn load_level(
         label: format!("{game} level {}", package.meta.level),
         game: game_id,
         sprites: bundle.sprites,
+        impostors: bundle.impostors,
         billboards,
         map_dots,
         start,
@@ -3500,19 +3505,6 @@ impl App {
                     });
                 }
             }
-            // The troglodyte sprite crop is an index swap over the
-            // atlas already on the GPU — presentation-only, so it
-            // applies under a recording or a replay as well.
-            "gameplay.patches.mc2_troglodyte_sprite_crop" => {
-                let on = self.cfg.gameplay.patches.mc2_troglodyte_sprite_crop.on();
-                if let (Some(r), Some(sess)) = (&mut self.renderer, self.session.as_deref())
-                    && let Some((index, atlas)) = &sess.level.sprites
-                {
-                    r.set_impostor_index(
-                        entities::level_impostors(sess.level.game, index, atlas, on).index,
-                    );
-                }
-            }
             // The retail-bug patches: one live re-apply covers all of
             // them — the sim consumes the whole set per tick/event,
             // and the movie-score patch is read at play time. While a
@@ -4550,13 +4542,8 @@ impl App {
         let overlay = map_overlay(&sess.level, &self.cfg);
         if let Some(r) = &mut self.renderer {
             r.load_level(&sess.level.view, &overlay);
-            if let Some((index, atlas)) = &sess.level.sprites {
-                r.load_impostors(entities::level_impostors(
-                    sess.level.game,
-                    index,
-                    atlas,
-                    self.cfg.gameplay.patches.mc2_troglodyte_sprite_crop.on(),
-                ));
+            if let Some(pack) = entities::level_impostors(sess.level.impostors.as_ref()) {
+                r.load_impostors(pack);
             }
             if let Some(assets) = &sess.level.ui {
                 r.load_ui_atlas(assets.atlas_w, assets.atlas_h, &assets.atlas_rgba);
@@ -8397,13 +8384,8 @@ impl ApplicationHandler for App {
                 if let Some(sess) = self.session.as_deref() {
                     let overlay = map_overlay(&sess.level, &self.cfg);
                     renderer.load_level(&sess.level.view, &overlay);
-                    if let Some((index, atlas)) = &sess.level.sprites {
-                        renderer.load_impostors(entities::level_impostors(
-                            sess.level.game,
-                            index,
-                            atlas,
-                            self.cfg.gameplay.patches.mc2_troglodyte_sprite_crop.on(),
-                        ));
+                    if let Some(pack) = entities::level_impostors(sess.level.impostors.as_ref()) {
+                        renderer.load_impostors(pack);
                     }
                     if let Some(assets) = &sess.level.ui {
                         renderer.load_ui_atlas(assets.atlas_w, assets.atlas_h, &assets.atlas_rgba);
@@ -11264,7 +11246,6 @@ fn run_screenshot(
     map_triggers: bool,
     dev_spells: bool,
     cfg_hud_transparent: bool,
-    troglodyte_crop: bool,
 ) -> Result<(), String> {
     // Same 2×-native 4:3 size as the live default window: integer
     // pixel grid (no fractional-scale aliasing), retail aspect.
@@ -11304,13 +11285,8 @@ fn run_screenshot(
         // so a still capture shows the full overlay.
         renderer.set_objective_marks(marks, 68);
     }
-    if let Some((index, atlas)) = &level.sprites {
-        renderer.load_impostors(entities::level_impostors(
-            level.game,
-            index,
-            atlas,
-            troglodyte_crop,
-        ));
+    if let Some(pack) = entities::level_impostors(level.impostors.as_ref()) {
+        renderer.load_impostors(pack);
     }
     if let Some(assets) = &level.ui {
         renderer.load_ui_atlas(assets.atlas_w, assets.atlas_h, &assets.atlas_rgba);
@@ -12126,7 +12102,6 @@ pub fn game_main(event_loop: Option<EventLoop<()>>) -> std::process::ExitCode {
             cfg.render.debug.map_trigger_areas,
             cfg.gameplay.cheat.dev_spells,
             cfg.render.enhancement.hud_transparency.transparent(),
-            cfg.gameplay.patches.mc2_troglodyte_sprite_crop.on(),
         ) {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => {
