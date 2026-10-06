@@ -1098,21 +1098,6 @@ struct Globals {
     grade: [f32; 4],
 }
 
-/// Which baked frame of an animated (FLC) sprite entry is on screen:
-/// `frames` = the entry's frame count (base + one per delta), `seek` =
-/// an explicit stream image ([`Billboard::flc_frame`]), `turn` = the
-/// animation clock. A free-running stream loops frames `1..=Count`
-/// and never returns to frame 0 — see the call site.
-fn flc_image(frames: usize, seek: Option<u8>, turn: usize) -> usize {
-    let Some(count) = frames.checked_sub(1).filter(|c| *c > 0) else {
-        return 0;
-    };
-    match seek {
-        Some(k) => (k as usize).min(count),
-        None => 1 + turn % count,
-    }
-}
-
 /// Smooth-textures filter sharpness (the tuning knob): the world art
 /// is filtered as if upscaled this many times with nearest pixels and
 /// then bilinear — each texel keeps a solid core, blending only in a
@@ -1195,8 +1180,9 @@ fn segment_depth_keys(billboards: &[Billboard], cam: &CameraView) -> Vec<f32> {
 const MAX_LIGHTS: usize = 16;
 
 /// One world sprite to draw, resolved from a level entity. Static data;
-/// the view-dependent part (which rotation view, mirroring) is computed
-/// per frame from `yaw` and the camera.
+/// the view-dependent part (which picture, mirroring) is computed per
+/// frame from `yaw` and the camera through the impostor model keyed
+/// `(sprite_base, draw_type)` ([`Renderer::load_impostors`]).
 #[derive(Debug, Clone, Copy)]
 pub struct Billboard {
     /// Feet-center position, world units (x/z tile coords, y altitude).
@@ -1284,11 +1270,6 @@ pub struct Billboard {
     /// ([`Renderer::set_segment_order`]); `None` everywhere else.
     pub body: Option<mgc_sim::engine::world::BodyLink>,
 }
-
-/// 16 view sectors folded to 5 sprites (draw type 19, `byte_906E8`).
-const VIEW_FOLD_5: [u8; 16] = [0, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 2, 2, 1, 1, 0];
-/// 16 view sectors folded to 3 sprites (draw type 20, `byte_906F8`).
-const VIEW_FOLD_3: [u8; 16] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 2, 1, 1, 1, 0, 0];
 
 /// One monster health bar (unfaithful debug overlay): the classic
 /// red-on-black rectangle floating above the sprite.
@@ -1410,6 +1391,10 @@ struct BillboardInstance {
     /// enhancement, [`segment_depth_keys`]); negative = the default
     /// anchor-TILE key + chain rank.
     key: f32,
+    /// The entity's place in the quad (fractions from the left /
+    /// bottom edge): the impostor image's anchor, mirrored with the
+    /// cell. Retail = `[0.5, 0.0]`.
+    anchor: [f32; 2],
 }
 
 /// The instance layout of [`BillboardInstance`], shared by BOTH
@@ -1419,10 +1404,11 @@ struct BillboardInstance {
 /// `vertex_attr_array!`s, adding `chain` to one and not the other
 /// built cleanly and blew up at pipeline creation, on the launch path,
 /// where nothing but a real window can reach it.
-const BILLBOARD_ATTRS: [wgpu::VertexAttribute; 9] = wgpu::vertex_attr_array![
+const BILLBOARD_ATTRS: [wgpu::VertexAttribute; 10] = wgpu::vertex_attr_array![
     0 => Float32x3, 1 => Float32x2, 2 => Float32x2,
     3 => Float32x2, 4 => Uint32x2, 5 => Float32,
     6 => Float32, 7 => Float32, 8 => Float32,
+    9 => Float32x2,
 ];
 
 /// Default sky/fog color, the classic hazy horizon (MC1's hand-picked
@@ -2152,15 +2138,17 @@ pub struct Renderer {
     bolt_buf: Option<wgpu::Buffer>,
     bolt_capacity: usize,
     bolt_segments: Vec<BoltSegment>,
-    /// CPU copy of the sprite index for per-frame view selection.
-    sprite_index: Option<mgc_formats::bundle::SpriteIndex>,
-    /// The world sprites as RGBA (alpha = retail's index-0 skip) plus
+    /// The world-sprite impostor pack ([`mgc_formats::impostor`]): the
+    /// index drives per-frame view selection, the texels are kept to
+    /// re-resolve an [`PixelFormat::Indexed8`] atlas whenever a level
+    /// brings a new palette/glow set. Every billboard draws through it.
+    ///
+    /// [`PixelFormat::Indexed8`]: mgc_formats::impostor::PixelFormat::Indexed8
+    impostors: Option<mgc_formats::impostor::ImpostorPack>,
+    /// The pack's atlas as RGBA (alpha = retail's index-0 skip) plus
     /// the per-texel material byte ([`grade::MAT_EMISSIVE`]).
     sprite_tex: Option<wgpu::Texture>,
     sprite_mat_tex: Option<wgpu::Texture>,
-    /// The bundle's 8-bit sprite atlas, kept to re-resolve the RGBA
-    /// pair whenever a level brings a new palette/glow set.
-    sprite_indexed: Vec<u8>,
     /// The level's colour grade ([`grade`]): the shade remap as two
     /// RGB tables (normal / glowing), sampled by terrain + sprites.
     grade_tex: Option<wgpu::Texture>,
@@ -3719,10 +3707,9 @@ impl Renderer {
             bolt_segments: Vec::new(),
             fire_capacity: 0,
             fire_particles: Vec::new(),
-            sprite_index: None,
+            impostors: None,
             sprite_tex: None,
             sprite_mat_tex: None,
-            sprite_indexed: Vec::new(),
             grade_tex: None,
             grade_sampler,
             level_palette: [[0; 3]; 256],
@@ -5100,46 +5087,59 @@ impl Renderer {
         };
     }
 
-    /// Upload the bundle's sprite atlas + index for billboard drawing.
-    /// The 8-bit atlas is kept and resolved to RGBA + material through
-    /// the current level's palette and glow set ([`Self::load_level`]
-    /// re-resolves it).
-    pub fn load_sprites(&mut self, index: mgc_formats::bundle::SpriteIndex, atlas: &[u8]) {
-        assert_eq!(
-            atlas.len(),
-            index.atlas_width as usize * index.atlas_height as usize
-        );
-        self.sprite_indexed = atlas.to_vec();
-        self.sprite_index = Some(index);
+    /// Install the world-sprite impostor pack every billboard draws
+    /// through. An [`Indexed8`] atlas is kept and resolved to RGBA +
+    /// material through the current level's palette and glow set
+    /// ([`Self::load_level`] re-resolves it); an [`Rgba8`] atlas
+    /// uploads as it is. Panics on a pack that fails validation — packs
+    /// are validated where they are built or read.
+    ///
+    /// [`Indexed8`]: mgc_formats::impostor::PixelFormat::Indexed8
+    /// [`Rgba8`]: mgc_formats::impostor::PixelFormat::Rgba8
+    pub fn load_impostors(&mut self, pack: mgc_formats::impostor::ImpostorPack) {
+        if let Err(e) = pack.validate() {
+            panic!("impostor pack: {e}");
+        }
+        self.impostors = Some(pack);
         self.upload_sprite_rgba();
     }
 
-    /// Resolve the kept 8-bit sprite atlas into the RGBA (alpha 0 =
-    /// retail's index-0 skip) + material pair the billboard pass reads.
+    /// Resolve the kept impostor atlas into the RGBA (alpha 0 =
+    /// transparent, retail's index-0 skip) + material pair the
+    /// billboard pass reads.
     fn upload_sprite_rgba(&mut self) {
-        let Some(index) = &self.sprite_index else {
+        use mgc_formats::impostor::PixelFormat;
+        let Some(pack) = &self.impostors else {
             return;
         };
-        if self.sprite_indexed.is_empty() {
+        let (w, h) = (pack.index.atlas_width, pack.index.atlas_height);
+        if w == 0 || h == 0 {
             return;
         }
-        let (w, h) = (index.atlas_width, index.atlas_height);
-        let mut rgba = Vec::with_capacity(self.sprite_indexed.len() * 4);
-        let mut mat = Vec::with_capacity(self.sprite_indexed.len());
-        for &q in &self.sprite_indexed {
-            if q == 0 {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
-                mat.push(0);
-            } else {
-                let c = self.level_palette[q as usize];
-                rgba.extend_from_slice(&[c[0], c[1], c[2], 255]);
-                mat.push(if self.level_glow[q as usize] {
-                    grade::MAT_EMISSIVE
-                } else {
-                    0
-                });
+        let n = w as usize * h as usize;
+        let (rgba, mat) = match pack.index.pixels {
+            PixelFormat::Indexed8 => {
+                let mut rgba = Vec::with_capacity(n * 4);
+                let mut mat = Vec::with_capacity(n);
+                for &q in &pack.pixels {
+                    if q == 0 {
+                        rgba.extend_from_slice(&[0, 0, 0, 0]);
+                        mat.push(0);
+                    } else {
+                        let c = self.level_palette[q as usize];
+                        rgba.extend_from_slice(&[c[0], c[1], c[2], 255]);
+                        mat.push(if self.level_glow[q as usize] {
+                            grade::MAT_EMISSIVE
+                        } else {
+                            0
+                        });
+                    }
+                }
+                (rgba, mat)
             }
-        }
+            // The shaders test alpha 0 only; anything else is opaque.
+            PixelFormat::Rgba8 => (pack.pixels[..n * 4].to_vec(), pack.pixels[n * 4..].to_vec()),
+        };
         let extent = wgpu::Extent3d {
             width: w,
             height: h,
@@ -5183,20 +5183,25 @@ impl Renderer {
         self.rebuild_billboard_bind_group();
     }
 
-    /// Swap the sprite index over the atlas already uploaded by
-    /// [`Self::load_sprites`] — same pixels, different rectangles
-    /// (the app's live sprite-crop patch toggle). Ignored until an
-    /// atlas of the same size is loaded.
-    pub fn set_sprite_index(&mut self, index: mgc_formats::bundle::SpriteIndex) {
-        let same_atlas = self.sprite_index.as_ref().is_some_and(|cur| {
-            (cur.atlas_width, cur.atlas_height) == (index.atlas_width, index.atlas_height)
-        });
-        if same_atlas {
-            self.sprite_index = Some(index);
+    /// Swap the impostor index over the atlas already uploaded by
+    /// [`Self::load_impostors`] — same texels, different rectangles
+    /// (the app's live sprite-crop patch toggle). Ignored unless the
+    /// installed pack has the same atlas shape, or if the index fails
+    /// validation.
+    pub fn set_impostor_index(&mut self, index: mgc_formats::impostor::ImpostorIndex) {
+        let Some(pack) = &mut self.impostors else {
+            return;
+        };
+        let same_atlas = (
+            pack.index.atlas_width,
+            pack.index.atlas_height,
+            pack.index.pixels,
+        ) == (index.atlas_width, index.atlas_height, index.pixels);
+        if same_atlas && index.validate().is_ok() {
+            pack.index = index;
         }
     }
 
-    /// Replace the set of world sprites drawn each frame.
     /// Upload the RGBA UI atlas (app-side composited: HSPR indices
     /// resolved through the blend LUT + palette; index-0 texels carry
     /// alpha 0).
@@ -5475,18 +5480,22 @@ impl Renderer {
         ((END2 - d2) / (END2 - START2)).clamp(0.0, 1.0)
     }
 
-    /// Resolve each billboard against the camera (rotation view,
-    /// mirroring, wrap-nearest position) into instance data — the
-    /// original's per-sprite draw dispatch (remc1 DrawSprite3D_2F170),
-    /// with the yaw quantization done in engine angle units.
+    /// Resolve each billboard against the camera through its impostor
+    /// model (yaw sector, elevation ring, pose, clip clock, mirroring;
+    /// wrap-nearest position) into instance data. For a retail pack
+    /// this is the original's per-sprite draw dispatch (remc1
+    /// DrawSprite3D_2F170) tabulated — see
+    /// [`mgc_formats::impostor::retail`].
     ///
     /// Returns the instances with all opaque ones first and the
     /// translucent tail sorted back-to-front, plus the opaque count —
     /// the two draw ranges (opaque pipeline / blend pipeline).
     fn billboard_instances(&self, cam: &CameraView) -> (Vec<BillboardInstance>, u32) {
-        let Some(index) = &self.sprite_index else {
+        use mgc_formats::impostor::ModelKey;
+        let Some(pack) = &self.impostors else {
             return (Vec::new(), 0);
         };
+        let pack = &pack.index;
         let mut out = Vec::with_capacity(self.billboards.len());
         let mut translucent = Vec::new();
         let full = MAP_TILES as f32;
@@ -5496,55 +5505,6 @@ impl Renderer {
             Vec::new()
         };
         for (bi, b) in self.billboards.iter().enumerate() {
-            // 16 view sectors from relative yaw, exactly the engine's
-            // `(((entityYaw - camYaw) >> 3) & 0xF0) >> 4` on 11-bit
-            // angles: floor(rel / 128) of 2048 steps.
-            let rel = (b.yaw - cam.yaw).rem_euclid(std::f32::consts::TAU);
-            let view = ((rel * (2048.0 / std::f32::consts::TAU)) as i32 >> 7).clamp(0, 15) as u16;
-            let (offset, mirror) = match b.draw_type {
-                17 => {
-                    if view < 8 {
-                        (view, false)
-                    } else {
-                        (15 - view, true)
-                    }
-                }
-                18 => (view, false),
-                19 => (VIEW_FOLD_5[view as usize] as u16, view >= 8),
-                20 => (VIEW_FOLD_3[view as usize] as u16, view >= 8),
-                // Animation modes: the entity's anim byte selects the
-                // family member (DrawSprite3D :37552; MC2 adds the
-                // 22-36 band, remc2 GameRenderOriginal LABEL_26 —
-                // same frame-offset draw).
-                2..=16 | 22..=36 => (b.frame as u16, false),
-                // 0/1/21 single view, and anything unknown: base.
-                _ => (0, false),
-            };
-            let id = (b.sprite_base + offset) as usize;
-            let Some(entry) = index.sprites.get(id) else {
-                continue;
-            };
-            if entry.frames.is_empty() {
-                continue; // known-corrupt source entry
-            }
-            // Animated entries (flags bit 0, the TMAPS FLC streams) step
-            // one delta per turn in a forward loop, all in lockstep —
-            // the original's per-frame driver (remc1 sub_590D0_595E0 /
-            // remc2 sub_715B0 → sub_72350). Baked frame 0 is the base
-            // image and frame k the canvas after the k-th delta; the
-            // LAST delta is the stream's ring back to the base, and
-            // retail wraps `FrameIndex > CountOfFrames` straight to
-            // delta 1 — so the loop is frames 1..=Count, never 0 (the
-            // base is only on screen before a stream's first step).
-            // Cycling all Count+1 held the base for two turns a loop.
-            let fi = if entry.flags & 1 != 0 {
-                flc_image(entry.frames.len(), b.flc_frame, self.anim_turn as usize)
-            } else {
-                0
-            };
-            let frame = &entry.frames[fi];
-            let (w, h) = (entry.width as f32, entry.height as f32);
-            let world_w = b.world_h * w / h;
             // Nearest torus copy relative to the camera.
             let wrap = |p: f32, c: f32| {
                 let mut d = p - c;
@@ -5560,6 +5520,34 @@ impl Renderer {
             if retail_sprite_near_culled(pos, cam) {
                 continue;
             }
+            // The camera's elevation seen from the entity (picks the
+            // pitch ring; retail packs have one).
+            let elevation = (cam.y - pos[1])
+                .atan2((pos[0] - cam.x).hypot(pos[2] - cam.z))
+                .to_degrees();
+            let key = ModelKey {
+                sprite_base: b.sprite_base,
+                draw_type: b.draw_type,
+            };
+            // Unknown families and missing/corrupt cells draw nothing.
+            let Some(view) = pack.view(
+                key,
+                b.frame,
+                b.yaw - cam.yaw,
+                elevation,
+                b.flc_frame,
+                self.anim_turn as usize,
+            ) else {
+                continue;
+            };
+            let im = view.image;
+            let (w, h) = (im.w as f32, im.h as f32);
+            let world_w = b.world_h * w / h;
+            let anchor = if view.mirror {
+                [1.0 - im.anchor[0], im.anchor[1]]
+            } else {
+                im.anchor
+            };
             let mut alpha = match b.blend {
                 2 => 1.0 / 3.0,
                 3 => 2.0 / 3.0,
@@ -5578,13 +5566,14 @@ impl Renderer {
             let inst = BillboardInstance {
                 pos,
                 size: [world_w, b.world_h * b.h_stretch],
-                uv_pos: [frame.x as f32, frame.y as f32],
+                uv_pos: [im.x as f32, im.y as f32],
                 uv_size: [w, h],
-                flags: [mirror as u32, 32],
+                flags: [view.mirror as u32, 32],
                 alpha,
                 chain: b.chain_depth,
                 roll: b.roll,
                 key: keys.get(bi).copied().unwrap_or(-1.0),
+                anchor,
             };
             if alpha < 1.0 {
                 translucent.push(inst);
@@ -7173,25 +7162,6 @@ mod tests {
         assert_eq!(red(&half, 1, 1), 127);
         let none = sight_field_pixels(&[SightArea { weight: 0.0, ..a }]);
         assert!(none.iter().all(|&v| v == 0));
-    }
-
-    /// A free-running FLC stream loops its DELTAS: a 25-frame bake
-    /// (base + 24 deltas, the last ringing back to the base) shows
-    /// frames 1..=24 and wraps straight to 1 — retail's `FrameIndex >
-    /// CountOfFrames` reset (remc2 `sub_72350`) — and a sim-seeked
-    /// stream shows exactly the image it names.
-    #[test]
-    fn flc_streams_loop_their_deltas_and_honour_a_seek() {
-        let run: Vec<usize> = (0..50).map(|t| flc_image(25, None, t)).collect();
-        let want: Vec<usize> = (0..50).map(|t| 1 + t % 24).collect();
-        assert_eq!(run, want);
-        assert!(!run.contains(&0), "the base is never part of the loop");
-        assert_eq!(flc_image(25, Some(0), 7), 0, "a seek can show the base");
-        assert_eq!(flc_image(25, Some(24), 7), 24);
-        assert_eq!(flc_image(25, Some(200), 7), 24, "clamped to the stream");
-        // Frame-less and single-frame entries have nothing to step.
-        assert_eq!(flc_image(0, None, 3), 0);
-        assert_eq!(flc_image(1, Some(5), 3), 0);
     }
 
     /// The retail proximity-concealment ramp: full inside FogStart

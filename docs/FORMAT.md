@@ -480,3 +480,72 @@ pass-through, whole-song cc116/117 loop = loop the FLAC), and the 27
 redbook audio tracks inside the CD image (`game.gog` + `game.ins`
 cue) — the redbook is the per-level objective VOICEOVER (sliced into
 `speech/`, above), never gameplay music.
+
+## Impostor packs
+
+Every world sprite (billboard) the renderer draws goes through an
+**impostor pack** — a picture-based stand-in model: per visual family,
+a table of pre-rendered VIEWS picked by where the camera stands, plus
+the family's animation. Retail art is the most basic pack; richer
+packs (more yaw views, elevation rings, art baked from meshes) are the
+same model with bigger axes. Types and the lookup law live in
+`mgc_formats::impostor`; the renderer installs a pack with
+`Renderer::load_impostors`. The sim never sees a pack — sprite sizes
+and draw types stay on the retail bank.
+
+Today the retail pack is **derived at level load** from the level's
+sprite bundle (`mgc-app` `entities::retail_impostors`: one model per
+family the game's sprite table names — MC1/HW sprite-stats rows, MC2
+sprite-param rows), so bundles carry no pack and no bake epoch moved.
+The same pack can be written to and read from disk:
+
+| member | contents |
+|---|---|
+| `impostors.json` | `ImpostorIndex` (below) |
+| `impostors.bin` | the atlas texels, `PixelFormat::byte_len` bytes |
+
+Instruments (mgc-app): `MGC_EXPORT_IMPOSTORS=<dir>` writes the level's
+retail pack; `MGC_IMPOSTOR_PACK=<dir>` draws from the pack in `<dir>`
+instead — a whole-pack replacement that must cover every family the
+level draws (an indexed pack resolves through the level's palette, so
+use it on the bank it was made from). An unreadable or invalid pack
+falls back to retail with a warning.
+
+`ImpostorIndex` (`version` = 1):
+
+| field | meaning |
+|---|---|
+| `atlas_width`, `atlas_height` | atlas size, texels |
+| `pixels` | `indexed8` — 1 byte/texel, a palette index resolved through the level's palette + glow set at load, 0 = transparent (retail art); `rgba8` — 4 bytes/texel sRGB RGBA (alpha 0 = transparent, any other alpha opaque) followed by a second plane of 1 MATERIAL byte/texel (bit 0 = emissive: resists darkness, not fog) |
+| `images[]` | `{x, y, w, h, anchor}`: an atlas rect; `anchor` = where the entity's position (its feet) sits in the drawn quad, fractions from the left / bottom edge — retail `[0.5, 0.0]`, mirrored with a mirrored cell |
+| `clips[]` | `{first, len, playback}`: a run of images. `still` = always the first; `flc_loop` = retail's FLC stream — image 0 the base, free-running it loops images `1..len` one per animation turn in lockstep and never returns to 0; an entity may seek an explicit image (the sim-positioned one-shots) |
+| `models[]` | sorted by `key` (unique): `{key: {sprite_base, draw_type}, yaw_sectors, pitches[], poses, cells[]}` |
+
+A model's `cells` (`{clip, mirror}`; `clip: null` draws nothing — a
+missing or known-corrupt retail member) are indexed `(pose ·
+len(pitches) + ring) · yaw_sectors + sector`:
+
+- **pose** — the entity's animation byte (retail's frame offset for the
+  2..=16 / 22..=36 animation draw types); past the last pose shows the
+  last.
+- **ring** — the `pitches` entry (degrees, 0 = level, positive = camera
+  above) nearest the camera's elevation seen from the entity. Retail
+  has one ring, `[0.0]`.
+- **sector** — relative yaw (entity facing − camera yaw) on the
+  engine's 2048-step circle, `floor(steps · yaw_sectors / 2048)`.
+  Sector 0 starts AT relative yaw 0 (retail's convention), so a view
+  baked for sector `s` is rendered at its middle, `(s + ½) · 360° /
+  yaw_sectors`. 16 sectors reproduce the engine's `(rel >> 7) & 15`.
+
+The drawn quad is the entity's world height tall (from the sim's
+sprite table, `× h_stretch`) and the image's pixel aspect wide.
+
+**Retail tabulation** (`impostor::retail`): view draw types 17-20 get
+16 sectors — 17 = 8 views with the back half mirrored (`15 − s`), 18 =
+16 views, 19 / 20 = the 5- / 3-picture folds (`byte_906E8` /
+`byte_906F8`) mirrored from sector 8; the animation types get one
+sector and `pose_count` poses (the type's own frame count); everything
+else (0/1/21, unknown) one cell on the base. Each sprite becomes one
+clip (its FLC stream if flagged animated, else its still), shared by
+every family that draws it. Parity with the pre-impostor renderer is
+asserted over every bank (`retail_impostors_reproduce_the_sprite_bank_dispatch`).

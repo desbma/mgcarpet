@@ -66,6 +66,83 @@ pub fn draw_sprite_index(
     out
 }
 
+/// The world-sprite impostor pack for a level's sprite bank: retail's
+/// draw dispatch tabulated ([`mgc_formats::impostor::retail`]) for
+/// every visual family the game's sprite table can name — the MC1/HW
+/// sprite-stats rows, the MC2 sprite-param rows (draw type = the
+/// bank's flags high byte, exactly as [`resolve_pose_sprite`] reads
+/// it). Every billboard the app makes resolves through one of those
+/// rows, so the pack covers them all. `crop_troglodyte` is
+/// [`draw_sprite_index`]'s patch.
+pub fn retail_impostors(
+    game: GameId,
+    index: &mgc_formats::bundle::SpriteIndex,
+    atlas: &[u8],
+    crop_troglodyte: bool,
+) -> mgc_formats::impostor::ImpostorPack {
+    use mgc_formats::impostor::{ModelKey, retail};
+    let dims = |id: u16| {
+        index
+            .sprites
+            .get(id as usize)
+            .map(|s| (s.width, s.height, s.flags))
+    };
+    let rows = match game {
+        GameId::Mc1 | GameId::Mc1Hw => SPRITE_STATS.len(),
+        GameId::Mc2 => mgc_sim::mc2::sprite_params::SPRITE_PARAMS.len(),
+    };
+    let keys: Vec<ModelKey> = (0..rows as u16)
+        .filter_map(|row| resolve_pose_sprite(game, row, &dims))
+        .map(|s| ModelKey {
+            sprite_base: s.sprite_base,
+            draw_type: s.draw_type,
+        })
+        .collect();
+    let drawn = draw_sprite_index(game, index, atlas, crop_troglodyte);
+    retail::build(&drawn, atlas, &keys)
+}
+
+/// The pack a level's billboards draw through: [`retail_impostors`],
+/// with two instruments for working on packs outside the game —
+/// `MGC_EXPORT_IMPOSTORS=<dir>` writes the retail pack there
+/// (`impostors.json` + `impostors.bin`, docs/FORMAT.md "Impostor
+/// packs"), and `MGC_IMPOSTOR_PACK=<dir>` draws from the pack in that
+/// directory INSTEAD (whole-pack replacement; it must cover every
+/// family the level draws, and an indexed pack resolves through the
+/// level's palette — so match the bank it was made from). A pack that
+/// fails to read or validate falls back to retail with a warning.
+pub fn level_impostors(
+    game: GameId,
+    index: &mgc_formats::bundle::SpriteIndex,
+    atlas: &[u8],
+    crop_troglodyte: bool,
+) -> mgc_formats::impostor::ImpostorPack {
+    let pack = retail_impostors(game, index, atlas, crop_troglodyte);
+    if let Some(dir) = std::env::var_os("MGC_EXPORT_IMPOSTORS") {
+        let dir = std::path::PathBuf::from(dir);
+        match pack.write_dir(&dir) {
+            Ok(()) => eprintln!(
+                "impostors: wrote {} models / {} images to {}",
+                pack.index.models.len(),
+                pack.index.images.len(),
+                dir.display()
+            ),
+            Err(e) => eprintln!("impostors: export to {} failed: {e}", dir.display()),
+        }
+    }
+    if let Some(dir) = std::env::var_os("MGC_IMPOSTOR_PACK") {
+        let dir = std::path::PathBuf::from(dir);
+        match mgc_formats::impostor::ImpostorPack::read_dir(&dir) {
+            Ok(p) => return p,
+            Err(e) => eprintln!(
+                "impostors: {} unusable ({e}); drawing retail",
+                dir.display()
+            ),
+        }
+    }
+    pack
+}
+
 /// Cut a single-frame 320x200 sprite entry down to the bounding box
 /// of its non-transparent (non-zero) pixels. Anything else — another
 /// size, an animated entry, an empty canvas — is left as it is, so a
@@ -3517,6 +3594,102 @@ mod tests {
             Some((134.5, 119.5)),
             "the LAST (3,4) row, not row 0's (248,247)"
         );
+    }
+
+    /// THE IMPOSTOR PARITY LAW, on every real sprite bank (self-skips
+    /// without baked data): for every family the game's sprite table
+    /// names, every one of the 16 view sectors, every pose, free-running
+    /// and seeked clocks, both troglodyte-crop arms, the retail impostor
+    /// pack draws exactly the rectangle + mirror the renderer's direct
+    /// sprite-bank dispatch drew before impostors existed. The oracle
+    /// below is that dispatch, kept verbatim.
+    #[test]
+    fn retail_impostors_reproduce_the_sprite_bank_dispatch() {
+        use mgc_formats::impostor::{ModelKey, flc_image};
+        const VIEW_FOLD_5: [u8; 16] = [0, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 2, 2, 1, 1, 0];
+        const VIEW_FOLD_3: [u8; 16] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 2, 1, 1, 1, 0, 0];
+        let oracle = |index: &mgc_formats::bundle::SpriteIndex,
+                      key: ModelKey,
+                      frame: u8,
+                      rel: f32,
+                      seek: Option<u8>,
+                      turn: usize| {
+            let rel = rel.rem_euclid(std::f32::consts::TAU);
+            let view = ((rel * (2048.0 / std::f32::consts::TAU)) as i32 >> 7).clamp(0, 15) as u16;
+            let (offset, mirror) = match key.draw_type {
+                17 => {
+                    if view < 8 {
+                        (view, false)
+                    } else {
+                        (15 - view, true)
+                    }
+                }
+                18 => (view, false),
+                19 => (VIEW_FOLD_5[view as usize] as u16, view >= 8),
+                20 => (VIEW_FOLD_3[view as usize] as u16, view >= 8),
+                2..=16 | 22..=36 => (frame as u16, false),
+                _ => (0, false),
+            };
+            let entry = index.sprites.get((key.sprite_base + offset) as usize)?;
+            if entry.frames.is_empty() {
+                return None;
+            }
+            let fi = if entry.flags & 1 != 0 {
+                flc_image(entry.frames.len(), seek, turn)
+            } else {
+                0
+            };
+            let f = entry.frames[fi];
+            Some((f.x, f.y, entry.width as u32, entry.height as u32, mirror))
+        };
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../baked/assets");
+        let mut checked = 0usize;
+        for (game, variant) in [
+            (GameId::Mc1, "mc1-temperate"),
+            (GameId::Mc1, "mc1-arctic"),
+            (GameId::Mc2, "mc2-day"),
+            (GameId::Mc2, "mc2-night"),
+            (GameId::Mc2, "mc2-cave"),
+        ] {
+            let Ok(bundle) = mgc_formats::bundle::Bundle::load(&root.join(variant)) else {
+                eprintln!("skipped {variant}: baked data not present");
+                continue;
+            };
+            let Some((index, atlas)) = &bundle.sprites else {
+                continue;
+            };
+            for crop in [false, true] {
+                let pack = retail_impostors(game, index, atlas, crop);
+                pack.validate().unwrap();
+                let drawn = draw_sprite_index(game, index, atlas, crop);
+                for model in &pack.index.models {
+                    let key = model.key;
+                    let poses = mgc_formats::impostor::retail::pose_count(key.draw_type);
+                    for frame in 0..poses as u8 {
+                        for s in 0..64 {
+                            // Four probes per sector, its edges included;
+                            // a negative turn exercises the wrap.
+                            let rel = s as f32 * std::f32::consts::TAU / 64.0 - 3.5;
+                            for (seek, turn) in
+                                [(None, 0), (None, 7), (None, 23), (Some(0), 5), (Some(3), 1)]
+                            {
+                                let got =
+                                    pack.index.view(key, frame, rel, 12.0, seek, turn).map(|v| {
+                                        (v.image.x, v.image.y, v.image.w, v.image.h, v.mirror)
+                                    });
+                                assert_eq!(
+                                    got,
+                                    oracle(&drawn, key, frame, rel, seek, turn),
+                                    "{variant} crop={crop} {key:?} frame {frame} rel {rel} {seek:?}/{turn}"
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("impostor parity: {checked} lookups");
     }
 
     #[test]

@@ -3508,12 +3508,9 @@ impl App {
                 if let (Some(r), Some(sess)) = (&mut self.renderer, self.session.as_deref())
                     && let Some((index, atlas)) = &sess.level.sprites
                 {
-                    r.set_sprite_index(entities::draw_sprite_index(
-                        sess.level.game,
-                        index,
-                        atlas,
-                        on,
-                    ));
+                    r.set_impostor_index(
+                        entities::level_impostors(sess.level.game, index, atlas, on).index,
+                    );
                 }
             }
             // The retail-bug patches: one live re-apply covers all of
@@ -4554,15 +4551,12 @@ impl App {
         if let Some(r) = &mut self.renderer {
             r.load_level(&sess.level.view, &overlay);
             if let Some((index, atlas)) = &sess.level.sprites {
-                r.load_sprites(
-                    entities::draw_sprite_index(
-                        sess.level.game,
-                        index,
-                        atlas,
-                        self.cfg.gameplay.patches.mc2_troglodyte_sprite_crop.on(),
-                    ),
+                r.load_impostors(entities::level_impostors(
+                    sess.level.game,
+                    index,
                     atlas,
-                );
+                    self.cfg.gameplay.patches.mc2_troglodyte_sprite_crop.on(),
+                ));
             }
             if let Some(assets) = &sess.level.ui {
                 r.load_ui_atlas(assets.atlas_w, assets.atlas_h, &assets.atlas_rgba);
@@ -8404,15 +8398,12 @@ impl ApplicationHandler for App {
                     let overlay = map_overlay(&sess.level, &self.cfg);
                     renderer.load_level(&sess.level.view, &overlay);
                     if let Some((index, atlas)) = &sess.level.sprites {
-                        renderer.load_sprites(
-                            entities::draw_sprite_index(
-                                sess.level.game,
-                                index,
-                                atlas,
-                                self.cfg.gameplay.patches.mc2_troglodyte_sprite_crop.on(),
-                            ),
+                        renderer.load_impostors(entities::level_impostors(
+                            sess.level.game,
+                            index,
                             atlas,
-                        );
+                            self.cfg.gameplay.patches.mc2_troglodyte_sprite_crop.on(),
+                        ));
                     }
                     if let Some(assets) = &sess.level.ui {
                         renderer.load_ui_atlas(assets.atlas_w, assets.atlas_h, &assets.atlas_rgba);
@@ -11314,10 +11305,12 @@ fn run_screenshot(
         renderer.set_objective_marks(marks, 68);
     }
     if let Some((index, atlas)) = &level.sprites {
-        renderer.load_sprites(
-            entities::draw_sprite_index(level.game, index, atlas, troglodyte_crop),
+        renderer.load_impostors(entities::level_impostors(
+            level.game,
+            index,
             atlas,
-        );
+            troglodyte_crop,
+        ));
     }
     if let Some(assets) = &level.ui {
         renderer.load_ui_atlas(assets.atlas_w, assets.atlas_h, &assets.atlas_rgba);

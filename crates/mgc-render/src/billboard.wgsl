@@ -71,6 +71,10 @@ struct Instance {
     // body's member under the enhancement); negative = the anchor
     // tile key + chain rank below.
     @location(8) key: f32,
+    // Where the entity stands in the quad, fractions from the left /
+    // bottom edge (the impostor image's anchor, already mirrored with
+    // a mirrored cell). Retail = (0.5, 0).
+    @location(9) anchor: vec2<f32>,
 };
 
 struct VsOut {
@@ -127,14 +131,16 @@ fn vs_main(@builtin(vertex_index) vid: u32, inst: Instance) -> VsOut {
         up = -up;
     }
     // The quad corner in the billboard plane, banked about the quad's
-    // centre (a flat carpet rolls about its own middle, not its feet).
-    let half_h = 0.5 * inst.size.y;
+    // centre (a flat carpet rolls about its own middle, not its feet),
+    // the centre placed off the entity by the picture's anchor (retail
+    // = feet-centre (0.5, 0): centre straight above, half the height
+    // up — the same arithmetic as before anchors existed).
     let ox = c.x * inst.size.x;
-    let oy = c.y * inst.size.y - half_h;
+    let oy = c.y * inst.size.y - 0.5 * inst.size.y;
     let cr = cos(inst.roll);
     let sr = sin(inst.roll);
-    let rx = ox * cr + oy * sr;
-    let ry = -ox * sr + oy * cr + half_h;
+    let rx = ox * cr + oy * sr + (0.5 - inst.anchor.x) * inst.size.x;
+    let ry = -ox * sr + oy * cr + (0.5 - inst.anchor.y) * inst.size.y;
     let world = anchor
         + globals.bb_right.xyz * rx
         + up * ry;
