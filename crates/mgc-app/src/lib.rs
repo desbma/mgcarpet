@@ -26,6 +26,7 @@ mod replay;
 mod saves;
 mod settings;
 mod sight;
+mod sprite_export;
 mod stats_screen;
 mod ui;
 mod worldmap;
@@ -11594,6 +11595,12 @@ fn run_screenshot(
 /// `None` builds a plain one — and only on the windowed path, so the
 /// headless modes (`--screenshot`, `--map`) keep working with no
 /// display server at all.
+/// The `mgc-sprite-export` tool (world sprites as files for outside
+/// work — see `sprite_export`).
+pub fn sprite_export_main() -> std::process::ExitCode {
+    sprite_export::main()
+}
+
 pub fn game_main(event_loop: Option<EventLoop<()>>) -> std::process::ExitCode {
     let args = match parse_args() {
         Ok(a) => a,

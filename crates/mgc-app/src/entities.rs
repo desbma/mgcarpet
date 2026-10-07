@@ -49,11 +49,11 @@ pub fn level_impostors(
 }
 
 /// A live pose's sprite row resolved under the game's own table.
-struct PoseSprite {
-    sprite_base: u16,
-    draw_type: u8,
+pub(crate) struct PoseSprite {
+    pub(crate) sprite_base: u16,
+    pub(crate) draw_type: u8,
     /// Billboard height in tiles.
-    world_h: f32,
+    pub(crate) world_h: f32,
     /// Billboard width in tiles (health-bar sizing; the renderer
     /// derives its own draw width from the frame's pixel aspect).
     world_w: f32,
@@ -75,7 +75,7 @@ struct PoseSprite {
 /// `byte_12` — the loader overwrites it from the TMAPS entry header
 /// byte (payload[1] = the flags high byte, :44906), which the bake
 /// preserves in `SpriteEntry.flags`.
-fn resolve_pose_sprite(
+pub(crate) fn resolve_pose_sprite(
     game: GameId,
     type_index: u16,
     sprite_dims: &impl Fn(u16) -> Option<(u16, u16, u16)>,
