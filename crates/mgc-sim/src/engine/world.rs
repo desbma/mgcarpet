@@ -8297,8 +8297,13 @@ impl World {
         // Retail seats the MC2 human (and runs `sub_574A0`) inside the
         // first tick; the port seats at load and the campaign book
         // lands after construction, so the census waits for tick 1.
-        if std::mem::take(&mut self.g.stats.0.mc2_spell_census_due) {
-            self.stats_mc2_spell_census();
+        // MC1's enhanced offer set waits for the same book.
+        if std::mem::take(&mut self.g.stats.0.spell_census_due) {
+            if self.game == GameId::Mc2 {
+                self.stats_mc2_spell_census();
+            } else {
+                self.stats_mc1_offered();
+            }
         }
         let mut player = player;
         // ⭐ THE SPEED TOKEN'S DIRECTION SOURCE. Echo the human's
@@ -19052,8 +19057,8 @@ impl World {
             // after the load consumed the dis −1 / 0 records, so it
             // sees only jars a later disposition brings. Count every
             // authored jar the wizard did not start with.
-            s.spells_offered_fixed = led.mc2_offered.count_ones();
-            s.spells_found_fixed = (led.mc2_offered & led.mc2_found).count_ones();
+            s.spells_offered_fixed = led.offered.count_ones();
+            s.spells_found_fixed = (led.offered & led.mc2_found).count_ones();
         } else {
             // :54653-66 — DWORD i of the byte-indexed census (the
             // retail census bug: dword i covers MODELS 4i..4i+3) gates
@@ -19064,8 +19069,9 @@ impl World {
                     s.spells_offered += 1;
                     s.spells_found += owned as u32;
                 }
-                // What the census meant: jar MODEL m offers spell m.
-                if led.offer_byte(i) != 0 {
+                // What the census meant: jar MODEL m offers spell m —
+                // unless the wizard started the level holding it.
+                if led.offered & (1 << i) != 0 {
                     s.spells_offered_fixed += 1;
                     s.spells_found_fixed += owned as u32;
                 }
@@ -20536,10 +20542,11 @@ impl World {
             // sub_4A1E0 also memsets the spell census (EF:32985); the
             // seating re-counts it (`stats_mc2_spell_census`).
             self.g.stats.0.clear_spell_census();
-            self.g.stats.0.mc2_spell_census_due = true;
+            self.g.stats.0.spell_census_due = true;
             return;
         }
         self.g.stats.0.clear_spell_census();
+        self.g.stats.0.spell_census_due = true;
         for i in 1..self.table.len() {
             let r = self.table[i];
             match r.class {
@@ -20565,7 +20572,7 @@ impl World {
         let held = (0..crate::mc2::rivals::MC2_SPELLS)
             .filter(|&s| self.mc2_book.ent[s] != 0)
             .fold(0u32, |m, s| m | 1 << s);
-        self.g.stats.0.mc2_offered = self.g.stats.0.mc2_jars & !held;
+        self.g.stats.0.offered = self.g.stats.0.mc2_jars & !held;
         self.g.stats.0.clear_spell_census();
         for i in 1..self.table.len() {
             let r = self.table[i];
@@ -20576,6 +20583,22 @@ impl World {
                 }
             }
         }
+    }
+
+    /// MC1's enhanced offer set (player ruling 2026-10-08), the MC2
+    /// one's twin: every spell the level authors a jar for (the
+    /// census's per-model bytes, whatever the disposition) that the
+    /// wizard did not start the level with. A level re-offers a spell
+    /// an earlier level placed — a backup for the player who missed
+    /// it — and the carried copy must not count as offered AND found.
+    fn stats_mc1_offered(&mut self) {
+        let mut offered = 0u32;
+        for m in 0..SPELL_COUNT {
+            if self.g.stats.0.offer_byte(m) != 0 && self.player.owned[m] == 0 {
+                offered |= 1 << m;
+            }
+        }
+        self.g.stats.0.offered = offered;
     }
 
     /// The MODEL of the THING at `slot` in the level table (used by the
@@ -30828,6 +30851,49 @@ mod tests {
             w.g.ent[w.player.owned[3] as usize].next20 as usize,
             w.player.owned[0] as usize
         );
+    }
+
+    /// THE MC1 SPELL STAT SKIPS A CARRIED SPELL'S BACKUP JAR (player
+    /// ruling 2026-10-08). MC1 map 14 places a Meteor jar at load for
+    /// the player who missed map 12's, and offers Duel later. Retail's
+    /// census (and the old enhanced row) counted both and credited the
+    /// carried Meteor as found; the enhanced row now counts Duel alone.
+    #[test]
+    fn mc1_spell_stat_skips_a_carried_spells_backup_jar() {
+        let jar = |slot, model, dis_id| Thing {
+            slot,
+            kind: ThingKind::Entity,
+            class: 12,
+            model,
+            x: 130,
+            y: 130,
+            dis_id,
+            swi_sz: 0,
+            swi_id: 1,
+            parent: 0,
+            child: 0,
+            par3: None,
+        };
+        let mut things = micro_things();
+        things.push(jar(3, 7, 0)); // Meteor, the backup
+        things.push(jar(4, 11, 1)); // Duel, a later disposition
+        let planes = Planes {
+            height: vec![100; 0x10000],
+            tile_type: vec![5; 0x10000],
+            shading: vec![32; 0x10000],
+            angle: vec![5; 0x10000],
+            ceiling: Vec::new(),
+        };
+        let mut w = World::new(planes, &things, 1, assets());
+        w.grant_level_book(&[0, 7]);
+        w.tick(
+            PlayerPose::level(10 << 8, 10 << 8, 3400, 0),
+            PlayerCommand::default(),
+        );
+        let st = w.level_stats();
+        assert_eq!(st.spells_offered_fixed, 1, "Duel only; Meteor was carried");
+        assert_eq!(st.spells_found_fixed, 0, "the carried Meteor is no find");
+        assert_eq!(w.g.stats.0.offered, 1 << 11);
     }
 
     /// THE HUMAN TOKEN'S `+70` FOLLOWS THE WORLD'S ENCODING (round 154,

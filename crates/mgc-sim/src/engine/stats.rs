@@ -56,9 +56,11 @@ pub(crate) struct StatsLedger {
     /// the time the prekill bills it. (slot, owner tag); consumed by
     /// the prekill.
     pub(crate) hints: Vec<(u16, u16)>,
-    /// MC2: the spell census is owed at the next tick top (retail
-    /// runs it at the first tick's seating, after the book carry).
-    pub(crate) mc2_spell_census_due: bool,
+    /// The spell census is owed at the next tick top, once the level's
+    /// starting book has landed. MC2: retail runs it at the first
+    /// tick's seating, after the book carry. MC1: only the enhanced
+    /// [`Self::offered`] set is derived there.
+    pub(crate) spell_census_due: bool,
     /// MC2 `array_0x403_1027x` — spells PICKED UP this level (the
     /// collect block `sub_68FF0` EF:56044 sets it; the derive reads
     /// it as "found"). Bit per spell.
@@ -66,9 +68,11 @@ pub(crate) struct StatsLedger {
     /// MC2: every spell the level authors a class-15 jar for (bit per
     /// spell, read at load before any record is consumed).
     pub(crate) mc2_jars: u32,
-    /// MC2: `mc2_jars` minus the spells the wizard started with — the
-    /// enhanced "Spells found" denominator.
-    pub(crate) mc2_offered: u32,
+    /// Both games: every spell the level authors a jar for, minus the
+    /// spells the wizard started the level with — the enhanced
+    /// "Spells found" denominator (MC2 player ruling 2026-09-24, MC1
+    /// 2026-10-08: a backup jar for a carried spell is no offer).
+    pub(crate) offered: u32,
     /// The ENHANCED accuracy tally — retail's gated shots and hits
     /// minus the possession bolts (player ruling 2026-09-24). MC1
     /// shadows `Gen::shots/hits`; in MC2 it is the only shot count
@@ -84,10 +88,10 @@ impl Default for StatsLedger {
             spell_census: [0; SPELL_CENSUS_BYTES],
             deaths: [0; 9],
             hints: Vec::new(),
-            mc2_spell_census_due: false,
+            spell_census_due: false,
             mc2_found: 0,
             mc2_jars: 0,
-            mc2_offered: 0,
+            offered: 0,
             offensive_shots: 0,
             offensive_hits: 0,
         }
@@ -175,10 +179,10 @@ impl Snap for StatsLedger {
             w.put(&s);
             w.put(&t);
         }
-        w.put(&self.mc2_spell_census_due);
+        w.put(&self.spell_census_due);
         w.put(&self.mc2_found);
         w.put(&self.mc2_jars);
-        w.put(&self.mc2_offered);
+        w.put(&self.offered);
         w.put(&self.offensive_shots);
         w.put(&self.offensive_hits);
     }
@@ -191,10 +195,10 @@ impl Snap for StatsLedger {
         for _ in 0..n {
             hints.push((r.get()?, r.get()?));
         }
-        let mc2_spell_census_due = r.get()?;
+        let spell_census_due = r.get()?;
         let mc2_found = r.get()?;
         let mc2_jars = r.get()?;
-        let mc2_offered = r.get()?;
+        let offered = r.get()?;
         let offensive_shots = r.get()?;
         let offensive_hits = r.get()?;
         Ok(StatsLedger {
@@ -202,10 +206,10 @@ impl Snap for StatsLedger {
             spell_census,
             deaths,
             hints,
-            mc2_spell_census_due,
+            spell_census_due,
             mc2_found,
             mc2_jars,
-            mc2_offered,
+            offered,
             offensive_shots,
             offensive_hits,
         })
@@ -633,10 +637,10 @@ mod tests {
         l.bill(Killer::Rival(3));
         l.bill(Killer::Environment);
         l.hint(40, 0xFFFF);
-        l.mc2_spell_census_due = true;
+        l.spell_census_due = true;
         l.mc2_found = 0b101;
         l.mc2_jars = 0b111;
-        l.mc2_offered = 0b110;
+        l.offered = 0b110;
         let mut w = Writer::new();
         w.put(&l);
         let buf = w.into_buf();
@@ -646,9 +650,9 @@ mod tests {
         assert_eq!(back.spell_census, l.spell_census);
         assert_eq!(back.deaths, l.deaths);
         assert_eq!(back.hints, l.hints);
-        assert!(back.mc2_spell_census_due);
+        assert!(back.spell_census_due);
         assert_eq!(back.mc2_found, 0b101);
         assert_eq!(back.mc2_jars, 0b111);
-        assert_eq!(back.mc2_offered, 0b110);
+        assert_eq!(back.offered, 0b110);
     }
 }
