@@ -207,6 +207,113 @@ the STATE hashes byte-identical (2 jars drawn until the all-spells cheat
 arms, 0 after).
 ---
 
+## MC2 fireball resistance and the firestorm bystander leak (RETAIL, player-ruled keep)
+
+**The player-facing symptom** (raised 2026-10-07, second-hand report):
+the charged fireball's FIRESTORM (fireball tier 3) wraps a wyvern,
+stun-locks it, and barely hurts it: "well over 50 casts" for a 60000-life
+creature. Then "sometimes a hit lands squarely in the body" and the
+storm suddenly does huge damage. **Both halves are retail, and the port
+reproduces them exactly.** This entry exists so nobody has to dig it
+again.
+
+**Original — three separate decisions about one shot:**
+
+1. **The resistance — `sub_65C20` strike arm, EF:63166-67.** When the
+   fireball worker (action 0 = plain fireball, action 29 = charged)
+   STRIKES a victim whose BEHAVIOR row has flag `0x10`, it overwrites
+   its own payload: `subSpellIndex_0x2A_42 = 1`. Shipped bytes,
+   `NETHERW.EXE` file 0x8A5C4-0x8A5D0: `mov 0xa0(%eax),%eax` /
+   `testb $0x10,0x20(%eax)` / `je` / `movw $0x1,0x2a(%ebx)`. It is the
+   ONLY reader of that bit in the decompile. The wyvern (5,16) ctor
+   assigns behaviour row 84 (flags `0x11`), so **any fireball that hits
+   a wyvern carries 1**. The generic impact core `sub_65820` (meteor and
+   the others) has no such line, so those spells hurt wyverns normally.
+   Retail witness: mc2l6-rsg t=28338, a rival's (9,0) at slot 171 hits a
+   wyvern and retail's own record shows `f2a 250 -> 1`.
+2. **The leader — `sub_65B50`, EF:63016-29.** The action-29 wrapper
+   copies the projectile's homing LOCK (`word_0x96_150`) onto the
+   (10,76) firestorm hub as its leader, NOT the struck victim. The lock
+   is cleared only when nothing was struck (EF:63196, 0x8A73E). So
+   "strike anything" + "locked on X" = the storm follows X.
+3. **The snap and the damage — `sub_33C70` / `sub_33C00`.** Every tick
+   the hub HARD-SNAPS to `leader.pos + (0, 0, leader.f78)`, the leader's
+   box centre. Each of the 5 slot-0 carriers then area-writes the hub's
+   payload on ch0.
+
+Nobody checks whether rule 1's victim is rule 2's leader. So:
+
+| Charged fireball… | bursts on | storm follows | per sphere-hit | wyvern, casts to kill |
+|---|---|---|---|---|
+| locked on the wyvern, hits it | wyvern | wyvern | **1** | ~450 (stun-lock only) |
+| locked on the wyvern, a firefly crosses the path | firefly | **wyvern** (the lock) | **180** | **2-3** ("all-encompassing") |
+| misses or expires | — | nobody (leader cleared) | 180 | rarely touches it |
+
+The plain fireball has no leak: its (10,0) splat has no leader and
+burns where it lands.
+
+mc2:17 (player level 18) is where this shows up: 12 wyverns and 80
+fireflies (5,19), behaviour row 88 with flags `0x1`, so no resistance.
+A firefly wandering into the line of fire is enough. "50+ casts" means
+mostly 1-damage casts, finished off by one or two lucky bystander casts.
+
+**Numbers that were checked (don't re-derive):**
+- Fireball tier 3 `subSpellIndex_2` = **180** (SPELLS.DAT; tiers
+  250/160/180). The orb ctor's 70 is the AUTHORED map-orb default only.
+- Wyvern box: `f78` = **937** = 5 x `D951C[207].rotSpeed_8` (1500) / 8.
+  `x_BYTE_D9F50` is the D951C + 0xA34 alias, see the Vissuluth size law.
+  Half-extents 128/128/128 (`SetEntityShiftRot(128,128)`).
+- Pinned ring: phase-0 sizing off the leader's `f80` 128 gives a
+  [128,192] breathe. With REAL satellite extents (row 340 derived
+  speed_6 97, so `f80` 48) about 86% of carrier-ticks land (one cast
+  pinned at 70 was 9030 damage, ~6.6 casts at 70, ~2.6 at 180).
+  Geometry is NOT the problem.
+
+**Probe pitfalls (each one cost time on 2026-10-07):**
+- A flat test world built without `with_mc2_sprite_ext` gives the
+  satellites `f80 = 0`. That fakes a ~1/8 hit rate and an "orb
+  geometry" theory, which was wrong.
+- Under `dev_spells` the token's MANA (`f140`) is 1. It does not feed
+  the hub. A hub payload of 1 in a probe is the `0x10` clobber, not the
+  cheat.
+
+**Port.** `mc2/proj.rs`: the strike-arm clobber (`no_mc2_strike_subspell_1`,
+an A/B instrument, not an option), the `leader` match (`29 => lock`),
+and the payload stamp onto the hub. `mc2/tail.rs::mc2_fire_orb_tick` has
+the snap and the carrier pass.
+
+**Verified.** Native-unit:
+`mc2_firestorm_bystander_strike_pins_the_lock_at_full_payload` runs both
+arms from one setup (direct hit: payload 1, pinned to the wyvern;
+firefly on the line: bursts on the firefly, pinned to the wyvern,
+payload 180, at least 100x the billing). Kill-switch proof:
+`MGC_NO_MC2_STRIKE_SUBSPELL_1=1` fails it on the payload assert. Retail
+corpus: the mc2l6-rsg t=28338 clobber row. Not yet seen in a retail
+recording of a firestorm on a wyvern; the player has one queued.
+
+**Options.** None. ⚖ Player ruling 2026-10-07: keep retail. Too
+entangled to deviate from now. The same family as the MC1 rebound
+economy, also ruled "leave it" (2026-09-18): a griffon's deflections are
+paid from the purse that becomes its loot; a broke griffon lets
+fireballs fly through; a fireball from above that flies through bursts
+on the terrain and the ground fire's area write hurts it anyway. In all
+of these, several code paths each decide "does this hit count?" on
+their own. Revisit only in a future no-backward-compatibility rewrite,
+once retail has nothing left to give: unify attack resistance into one
+decision made against the creature that actually takes the damage (here,
+the storm's leader).
+
+**Open, not dug:** (a) the player's retail observation that firestorm
+will not lock an ALLIED wyvern (meteor will). That's lock selection,
+recording promised. (b) Which entity classes the fireball's victim probe
+`sub_10780` can strike, e.g. the wyvern's own (9,0) bolts as accidental
+bystanders. (c) The port's BEHAVIOR table and the EXE image disagree on
+`0x10` from row ~108 onward (EXE: 109/111/115/119/124/150). No ctor
+assigns those rows today, so it is inert, but retail may have meant
+more fireball-resistant creatures.
+
+---
+
 ## MC1 rival spell repertoire — APPROX (five spells mint no projectile)
 
 **Original.** MC1's class-12 token machines in `str_2563D8`

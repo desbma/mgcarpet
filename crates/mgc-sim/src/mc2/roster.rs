@@ -3163,10 +3163,15 @@ impl Gen {
         self.link(i, x, y, z);
         self.refill_life(i);
         self.mc2_set_sprite(i, 207);
-        // :34192-94: array.yaw = 5·word(D9F50+294)/8. D9F50 row 21's
-        // word_0 = 0x5DC (1500), and offset 294 is never written at
-        // runtime (the table's only writers hit 0x87A/0x5B6/0x126) —
-        // so the wyvern's z-box center is the CONSTANT 937.
+        // :34192-94: array.yaw = 5·word(D9F50+294)/8. `x_BYTE_D9F50`
+        // is the mis-split alias of `particlesParameters_D951C`
+        // (+0xA34 — the Vissuluth size law, docs/CONFORMANCE-FINDINGS.md),
+        // so D9F50+0x126 = 0xDA076 = `D951C[207].rotSpeed_8`: the
+        // wyvern's OWN sprite row height, 1500. Nothing writes that
+        // row at runtime (the doomsday machine patches row 341 only),
+        // so the z-box center is 5·1500/8 = the CONSTANT 937. (The
+        // 07-18 note read this as "D9F50 row 21 word_0 = 0x5DC" — the
+        // right number for the wrong reason.)
         self.ent[i].f78 = 937;
         self.mc2_shift_rot(i, 128, 128);
         Some(i)

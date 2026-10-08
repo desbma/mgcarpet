@@ -1353,7 +1353,27 @@ pub fn replay_check(
     let mut d = ReplayDriver::install(file, &mut sim)?;
     let mut rec: Option<PortRecorder> = None;
     let mut cut_at = None;
+    // INSTRUMENT `MGC_SPRITE_CENSUS=<file>`: which sprite rows the take
+    // actually puts on screen — every drawable live pose's sprite row
+    // (and the owner-recolour row it may be drawn under), keyed with
+    // its (class, model) and whether it is a fire cell, counted in
+    // pose-ticks, appended to <file> as TSV at the end. Read-only.
+    let census_path = std::env::var_os("MGC_SPRITE_CENSUS").map(PathBuf::from);
+    let mut census: std::collections::BTreeMap<(u16, u8, u8, bool), u64> = Default::default();
     while let Some(input) = d.next(&mut sim) {
+        if census_path.is_some()
+            && let Some(w) = sim.world.as_ref()
+        {
+            for p in w.live_poses() {
+                if p.map_only {
+                    continue;
+                }
+                let fire = p.fire_life.is_some();
+                for row in std::iter::once(p.type_index).chain(p.owner_type_index) {
+                    *census.entry((row, p.class, p.model, fire)).or_default() += 1;
+                }
+            }
+        }
         if let Some(path) = record {
             let anchored = d.take_anchored();
             match &rec {
@@ -1403,6 +1423,19 @@ pub fn replay_check(
         }
     }
     println!("replay-check: {}", d.summary());
+    if let Some(path) = census_path {
+        use std::io::Write;
+        let mut out = String::new();
+        for ((row, class, model, fire), n) in &census {
+            out += &format!("{game:?}\t{row}\t{class}\t{model}\t{}\t{n}\n", *fire as u8);
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(out.as_bytes()))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
     if let Some(r) = rec {
         let (path, n, res) = r.finish();
         res?;

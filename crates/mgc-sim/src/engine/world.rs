@@ -58195,6 +58195,144 @@ mod tests {
         );
     }
 
+    /// THE WYVERN'S FIREBALL RESISTANCE LEAKS THROUGH A BYSTANDER.
+    /// `sub_65C20`'s strike arm (EF:63166-67) clobbers the fireball's
+    /// payload to 1 when the STRUCK victim's behaviour row carries
+    /// 0x10 — the wyvern's row 84 does (0x11), the firefly's row 88
+    /// does not (0x1). But `sub_65B50` leaders the (10,76) hub with
+    /// the projectile's LOCK, not the victim (EF:63016-29). So a
+    /// charged fireball locked on a wyvern that bursts on a firefly
+    /// crossing its path births a firestorm that snaps onto the
+    /// WYVERN carrying the full 180 — the "all-encompassing" casts on
+    /// mc2:17 (12 wyverns, 80 fireflies), where every direct hit
+    /// pays 1 per sphere.
+    #[test]
+    fn mc2_firestorm_bystander_strike_pins_the_lock_at_full_payload() {
+        use crate::engine::features::Gen;
+        use crate::mc1::mobs::MobCtx;
+
+        let ctx = MobCtx {
+            px: 0,
+            py: 0,
+            pz: 0,
+            pyaw: 0,
+            pmana: 0,
+            pmana_max: 0,
+            pdead: false,
+            pdead_top: false,
+            strict: false,
+            patches: crate::patches::WorldPatches::RETAIL,
+            mc2_turn: 0,
+        };
+        // (struck victim's slot, hub leader, hub payload, wyvern damage)
+        let mut arms = Vec::new();
+        for bystander in [false, true] {
+            let mut w = mc2_flat_world();
+            let (tx, ty) = mc2_pos(110, 100);
+            let ground = w.g.ground_z(tx, ty) as i16;
+            let wyv = w.g.mc2_spawn_m16(tx, ty, ground + 16 * 256).unwrap();
+            w.g.ent[wyv].flags |= 8;
+            assert_eq!(w.g.ent[wyv].row156, 84);
+            // Fire straight down the x axis, level with the wyvern's
+            // box centre (z + f78).
+            let aim_z = w.g.ent[wyv].z + w.g.ent[wyv].f78 as i16;
+            let (mx, my) = mc2_pos(100, 100);
+            let ff = bystander.then(|| {
+                // A firefly parked on the flight line, a few strides
+                // out — the boxes are centred at z + f78 on both.
+                let (fx, fy) = mc2_pos(104, 100);
+                let f = w.g.mc2_spawn_m19(fx, fy, 0).unwrap();
+                let fz = aim_z - w.g.ent[f].f78 as i16;
+                w.g.move_relink(f, fx, fy, fz);
+                w.g.ent[f].flags |= 8;
+                assert_eq!(w.g.ent[f].row156, 88);
+                f
+            });
+            let m = w.g.mc2_spawn_bolt(mx, my, aim_z).unwrap();
+            {
+                let e = &mut w.g.ent[m];
+                e.id24 = PLAYER_TARGET;
+                e.model65 = 28; // the CHARGED fireball,
+                e.tick70 = 29; // action 29 (`sub_65B50`)
+                e.f146 = wyv as u16; // LOCKED on the wyvern
+                e.f68 = 10;
+                e.f69 = 76;
+                e.f44 = 180; // fireball tier 3's SPELLS.DAT subSpell
+                e.f30 = Gen::angle_between(mx, my, tx, ty);
+                e.f32 = 0;
+            }
+            let pctx = MobCtx {
+                px: mx,
+                py: my,
+                pz: aim_z,
+                ..ctx
+            };
+            for _ in 0..60 {
+                if w.g.ent[m].flags & 0x400 != 0 {
+                    break;
+                }
+                w.g.mc2_flyer_tick(m, &pctx);
+            }
+            assert!(w.g.ent[m].flags & 0x400 != 0, "the fireball detonated");
+            let h = (1..w.g.ent.len())
+                .find(|&j| {
+                    let e = &w.g.ent[j];
+                    e.class64 == 10 && e.model65 == 76 && e.flags & 0x400 == 0
+                })
+                .expect("the firestorm hub spawned");
+            // Where did it burst? Next to the firefly, or the wyvern.
+            let burst = (w.g.ent[h].x, w.g.ent[h].y);
+            let near = |s: usize| {
+                let e = &w.g.ent[s];
+                (burst.0 as i32 - e.x as i32).abs() < 512
+                    && (burst.1 as i32 - e.y as i32).abs() < 512
+            };
+            let struck = match ff {
+                Some(f) if near(f) => f,
+                _ if near(wyv) => wyv,
+                _ => panic!("burst at {burst:?} is next to neither creature"),
+            };
+            let (leader, payload) = (w.g.ent[h].f146, w.g.ent[h].f140);
+            // Run the whole storm, banking what the wyvern is billed.
+            let life0 = w.g.ent[wyv].act_life;
+            let mut billed = 0u32;
+            for _ in 0..40 {
+                if w.g.ent[h].f71 >= 2 {
+                    break;
+                }
+                w.g.ent[wyv].mail[0] = (0, 0);
+                w.g.mc2_fire_orb_tick(h, &ctx);
+                billed += w.g.ent[wyv].mail[0].0;
+            }
+            // The hub rides the wyvern's box centre either way.
+            let e = &w.g.ent[h];
+            let v = &w.g.ent[wyv];
+            assert_eq!(
+                (e.x, e.y, e.z),
+                (v.x, v.y, v.z + v.f78 as i16),
+                "the storm snapped onto the lock (bystander = {bystander})"
+            );
+            assert_eq!(w.g.ent[wyv].act_life, life0, "mail only, unread");
+            arms.push((struck, ff, wyv, leader, payload, billed));
+        }
+        // Direct hit: the wyvern is struck, the payload clobbered.
+        let (struck, _, wyv, leader, payload, billed) = arms[0];
+        assert_eq!(struck, wyv, "no bystander: the ball strikes the wyvern");
+        assert_eq!(leader, wyv as u16, "pinned to the wyvern");
+        assert_eq!(payload, 1, "row 84's 0x10 flag clobbers the payload");
+        assert!(billed > 0 && billed <= 150, "1 per sphere-hit: {billed}");
+        // Bystander: the firefly is struck, the LOCK still leaders.
+        let (struck, ff, wyv, leader, payload, billed_full) = arms[1];
+        assert_eq!(Some(struck), ff, "the ball bursts on the firefly");
+        assert_eq!(leader, wyv as u16, "…but the storm follows the lock");
+        assert_eq!(payload, 180, "row 88 has no 0x10: full payload");
+        assert!(billed_full > 0 && billed_full % 180 == 0, "{billed_full}");
+        assert!(
+            billed_full >= 100 * billed,
+            "the bystander storm hurts the wyvern ~180x harder: {billed_full} vs {billed}"
+        );
+    }
+
     /// A firestorm leadered to a CASTLE BRAIN stretches over the
     /// building envelope: phase-0 sizing from the brain's
     /// `SetShiftByCastle` extents flips the breathe bounds into the

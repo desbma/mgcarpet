@@ -3707,6 +3707,11 @@ impl Gen {
         // — but the table divergence itself is an open lead (round 98's
         // "the table the decompile shows is not the table the game
         // runs" class: `frames89` was filled at boot from the assets).
+        // ⚖ This IS the wyvern's fireball resistance, and it LEAKS: the
+        // firestorm's leader is the LOCK, not this victim, so a locked
+        // shot bursting on a bystander pins a full-payload storm onto
+        // the wyvern. Player-ruled keep (2026-10-07) — docs/FIDELITY.md
+        // "MC2 fireball resistance and the firestorm bystander leak".
         if !no_mc2_strike_subspell_1()
             && matches!(self.ent[i].tick70, 0 | 29)
             && let Some(MailTarget::Pool(v)) = hit
