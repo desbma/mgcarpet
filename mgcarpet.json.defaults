@@ -18,6 +18,8 @@
     "preferences": {
       "autofire": true,
       "bindings": "wasd",
+      "disable_barrel_roll": false,
+      "disable_suicide_key": false,
       "fly_assistant": "off",
       "invert_y": false,
       "mouse_sensitivity": 1.0,

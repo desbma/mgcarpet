@@ -4665,7 +4665,14 @@ impl App {
         // command MC2-only; the book map swallows it with the rest of
         // the movement input.
         let strafes = (k.left && !book, k.right && !book);
-        let barrel_roll = strafes.0 && strafes.1 && !self.prev_strafe.0 && !self.prev_strafe.1;
+        // `controls.preferences.disable_barrel_roll` drops the trigger
+        // here; the edge state still tracks, so re-enabling mid-hold
+        // does not fire a roll.
+        let barrel_roll = strafes.0
+            && strafes.1
+            && !self.prev_strafe.0
+            && !self.prev_strafe.1
+            && !self.cfg.controls.preferences.disable_barrel_roll;
         self.prev_strafe = strafes;
         // While a roll runs, the virtual stick recenters (retail's
         // driver zeroes `rollDelta` — the mouse stick — every tick,
@@ -9213,10 +9220,11 @@ impl ApplicationHandler for App {
                 // `life = -1`, the ordinary death chain follows).
                 // Sits ABOVE the option keys because bare K is the
                 // coords-overlay toggle and option_key carries no
-                // shift test.
+                // shift test. `controls.preferences.disable_suicide_key`
+                // still swallows the press (no fall-through to bare K).
                 if down && self.shift_held && event.physical_key == PhysicalKey::Code(KeyCode::KeyK)
                 {
-                    self.pending_suicide = true;
+                    self.pending_suicide = !self.cfg.controls.preferences.disable_suicide_key;
                     return;
                 }
                 // The win-level cheat (Shift+C — retail's tester key

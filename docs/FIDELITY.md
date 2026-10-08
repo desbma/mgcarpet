@@ -149,6 +149,10 @@ faithful defaults:
 - `autofire` — enhancement: a held fire button re-clicks a click-only
   projectile spell at 4 Hz (an input macro; the sim sees ordinary
   clicks). On by default, off under the Classic controls preset.
+- `disable_suicide_key`, `disable_barrel_roll` — P-class opt-outs
+  (player-set 2026-10-08): swallow Shift+K / ignore MC2's
+  both-strafes roll trigger. Off by default (retail behaviour); not
+  preset members.
 
 **Deviations & interims.**
 - Camera ROLL is unrendered (the original banks slightly in turns).

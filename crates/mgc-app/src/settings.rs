@@ -1827,6 +1827,52 @@ pub fn registry() -> Vec<Spec> {
                 ],
             },
         },
+        Spec {
+            domain: Controls,
+            group: "controls · preferences",
+            label: "disable_suicide_key",
+            class: Preference,
+            key: None,
+            cli: None,
+            cfg_path: "controls.preferences.disable_suicide_key",
+            read: |c| Val::Toggle {
+                on: c.controls.preferences.disable_suicide_key,
+                faithful: false,
+            },
+            desc: "Disable the Shift+K suicide key, which both originals \
+                   have and which is easy to hit by accident next to \
+                   Shift+L.",
+            ctl: Ctl::Toggle {
+                set: |c, v| c.controls.preferences.disable_suicide_key = v,
+                descs: [
+                    "Shift+K kills you, as in both originals (the default).",
+                    "Shift+K does nothing.",
+                ],
+            },
+        },
+        Spec {
+            domain: Controls,
+            group: "controls · preferences",
+            label: "disable_barrel_roll",
+            class: Preference,
+            key: None,
+            cli: None,
+            cfg_path: "controls.preferences.disable_barrel_roll",
+            read: |c| Val::Toggle {
+                on: c.controls.preferences.disable_barrel_roll,
+                faithful: false,
+            },
+            desc: "Disable MC2's barrel roll (pressing both strafe keys \
+                   together tumbles the carpet). MC2 only; MC1 has no roll.",
+            ctl: Ctl::Toggle {
+                set: |c, v| c.controls.preferences.disable_barrel_roll = v,
+                descs: [
+                    "Both strafe keys together roll the carpet, as in \
+                     MC2 (the default).",
+                    "Both strafe keys together just strafe; no roll.",
+                ],
+            },
+        },
         // ---- controls · models ------------------------------------------
         Spec {
             domain: Controls,

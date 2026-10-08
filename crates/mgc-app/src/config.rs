@@ -745,6 +745,15 @@ pub struct ControlPreferences {
     /// CONTROLS PRESET member: on under Enhanced (the default), off
     /// under Classic.
     pub autofire: bool,
+    /// Swallow the Shift+K suicide key (player-set 2026-10-08): both
+    /// originals kill the player on it, and it sits one key from
+    /// Shift+L. Off (the key works) by default; not a preset member.
+    pub disable_suicide_key: bool,
+    /// Ignore MC2's both-strafe-keys barrel roll (player-set
+    /// 2026-10-08): the two strafes then just strafe (right wins, as
+    /// retail decodes them). Off (the roll works) by default; not a
+    /// preset member.
+    pub disable_barrel_roll: bool,
 }
 
 /// The Enhanced controls preset is the default (see
@@ -760,6 +769,8 @@ impl Default for ControlPreferences {
             invert_y: false,
             fly_assistant: FlyAssistant::default(),
             autofire: true,
+            disable_suicide_key: false,
+            disable_barrel_roll: false,
         }
     }
 }
