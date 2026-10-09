@@ -1176,8 +1176,10 @@ impl BlastLedger {
             }
         }
         // Retire once the rim smoke horizon has passed: the longest-
-        // lived cells (life 14) are born at wave 1's end (~pass 6).
-        self.entries.retain(|e| e.elapsed < e.passes + 16.0);
+        // lived cells (life 14, clock starting ~1.6 ticks after their
+        // ring fires — `crater_particles`' SMOKE_DELAY_T) are born at
+        // wave 1's end (~pass 6).
+        self.entries.retain(|e| e.elapsed < e.passes + 18.0);
     }
 
     /// Drop everything (level restart / session teardown).
@@ -1574,9 +1576,11 @@ fn flame_style(class: u8, model: u8) -> FlameStyle {
 /// replaces). Two walls per blast, mirroring the driver's real comb:
 /// wave 1 = the outward even-radii sweep, wave 2 = the odd back-fill
 /// re-burn crossing the interior afterwards. Each wall is a continuous
-/// band of hot leading discs with a soot trail, terrain-draped like the
-/// shockwave, sub-tick smooth, with total time = the driver's real pass
-/// schedule. The per-blast angular sample set is FIXED (sized for the
+/// band of hot discs — a leading head plus blazing body discs stacked
+/// at half-disc steps three layers deep, overlapping into one unbroken
+/// wall before the soot trail — terrain-draped like the shockwave,
+/// sub-tick smooth, with total time = the driver's real pass schedule.
+/// The per-blast angular sample set is FIXED (sized for the 
 /// final radius), so each sample behaves like a tiny outward-flying
 /// projectile — stable identity, no re-sampling shimmer; they bunch
 /// into one bright ball at detonation and fan out with the front.
@@ -1598,6 +1602,25 @@ pub fn crater_particles(
     const SPACING: f32 = 0.55;
     // How long a wall lingers (fading) after its front stops (ticks).
     const FADE_T: f32 = 1.3;
+    // The wall's radial build, in "layers" of one disc width (tiles).
+    // The hot band runs HOT_LAYERS layers back from the head
+    const LAYER: f32 = 1.05;
+    const HOT_LAYERS: f32 = 3.0;
+    // Discs are stacked at HALF a layer so neighbours overlap into one
+    // continuous wall (at a full layer the discs read as separate rings
+    // with a gap between them in slow motion — player 2026-10-10).
+    const DISC_STEP: f32 = LAYER / 2.0;
+    // How far the head disc leads the front.
+    const HEAD_LEAD: f32 = 0.30;
+    // Hot discs, then soot discs trailing the band (one layer of them).
+    const N_HOT: u32 = (2.0 * HOT_LAYERS - 1.0) as u32;
+    const N_SOOT: u32 = 2;
+    // The crater smoke under a ring fades in only once the hot band has
+    // swept past it (the smoke draws OVER the walls — push order, no
+    // depth sort — so an early fade-in would grey out the band). The
+    // band's trailing edge sits ~(HOT_LAYERS-1)·LAYER + a disc radius
+    // behind the front, which advances 2 rings (1.25 tiles) per tick.
+    const SMOKE_DELAY_T: f32 = 1.6;
     let hash = |a: u32| {
         let mut x = a.wrapping_mul(0x9E37_79B9);
         x ^= x >> 15;
@@ -1660,21 +1683,45 @@ pub fn crater_particles(
                 // not a blown-out core.
                 let converge = (r / (r + 1.2)).clamp(0.25, 1.0);
                 let n = ((TAU * r_max / SPACING) as u32).max(10);
-                for k in 0..n {
-                    let ph = hash(seed_base ^ (k * 7919) ^ (wi * 331));
-                    let ang = (k as f32 + ph * 0.7) / n as f32 * TAU;
-                    let (ox, oz) = (ang.cos(), ang.sin());
-                    let flick = 0.8 + 0.2 * (time * 11.0 + ph * 40.0).sin();
-                    // Two stacked discs per sample on the radial axis:
-                    // a hot LEADING head just past the front and a
-                    // cooling trail behind it — the same outer-hot →
-                    // inner-soot gradient the smoke streaks carry, so
-                    // heavy tangential overlap reinforces the direction
-                    // instead of washing it out.
-                    for (axis, heat, aw, ah, al) in [
-                        (0.30, (0.9 + 0.1 * ph) * flick, 1.05, 1.15, 0.9),
-                        (-0.75, 0.28 * flick, 1.3, 1.2, 0.72),
-                    ] {
+                // A stack of discs per sample on the radial axis: a
+                // white-hot LEADING head just past the front, blazing
+                // body discs behind it cooling steadily toward orange
+                // (every one above the shader's soot threshold), then
+                // the soot trail — the same outer-hot → inner-soot
+                // gradient the smoke streaks carry, so heavy overlap
+                // reinforces the direction instead of washing it out.
+                // Layer-major push order: the density cap keeps the
+                // first arrivals per cell, so a crowded cell sheds its
+                // soot tail first, never a random head.
+                for i in 0..(N_HOT + N_SOOT) {
+                    let axis = HEAD_LEAD - i as f32 * DISC_STEP;
+                    // 0 at the head → 1 at the last hot disc.
+                    let f = (i as f32 / (N_HOT - 1) as f32).min(1.0);
+                    let soot = i >= N_HOT;
+                    for k in 0..n {
+                        let ph = hash(seed_base ^ (k * 7919) ^ (wi * 331));
+                        let ang = (k as f32 + ph * 0.7) / n as f32 * TAU;
+                        let (ox, oz) = (ang.cos(), ang.sin());
+                        let flick = 0.8 + 0.2 * (time * 11.0 + ph * 40.0).sin();
+                        let (heat, aw, ah, al) = if soot {
+                            let j = (i - N_HOT) as f32;
+                            (0.28 * flick, 1.3, 1.2, 0.72 - 0.12 * j)
+                        } else {
+                            (
+                                ((0.9 + 0.1 * ph) * (1.0 - f) + 0.62 * f) * flick,
+                                1.05 + 0.15 * f,
+                                1.15 + 0.05 * f,
+                                0.9 - 0.05 * f,
+                            )
+                        };
+                        // A trailing disc that would collapse well
+                        // inside the newborn ball is skipped: the
+                        // detonation flash stays a clean bright ball
+                        // instead of a soot-choked one (the trail now
+                        // reaches ~3 tiles behind the front).
+                        if axis < 0.0 && r + axis < -0.5 {
+                            continue;
+                        }
                         let rad = (r + axis + (ph - 0.5) * 0.3).max(0.05);
                         let x = (b.x + ox * rad).rem_euclid(MAP_TILES as f32);
                         let z = (b.z + oz * rad).rem_euclid(MAP_TILES as f32);
@@ -1702,15 +1749,17 @@ pub fn crater_particles(
 
         // --- Crater smoke: virtual soot cells, comb-scheduled --------
         // One ring per completed pass, in the driver's real firing
-        // order. Each virtual cell fades in over its first tick (the
-        // wall sweeping over it is its flash), drifts inward, and
+        // order. Each virtual cell fades in once the wall's hot band
+        // has swept over it (the band is its flash), drifts inward, and
         // dissolves over a radius-dependent lifetime: inner ≈ 3 ticks
         // (the crater centre clears while the blast still burns), rim
         // ≈ 14 (its smoke lingers ~8 ticks past the driver's death).
         for p in 1..=(t.floor().clamp(0.0, b.passes) as u32) {
             let r = (2 * (p - 1)) % 11; // the cyclic ring table
             let vlife = (3 + r).min(14) as f32;
-            let elapsed = t - p as f32;
+            // The cell's clock starts once the hot band has swept past
+            // it (SMOKE_DELAY_T after its ring fired).
+            let elapsed = t - p as f32 - SMOKE_DELAY_T;
             if elapsed > 14.0 {
                 continue; // long past dissolve (long drivers: old cycles)
             }
