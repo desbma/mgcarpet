@@ -1128,6 +1128,18 @@ pub struct GameplayPatches {
     /// range to hide it wakes every creature on the map instead.
     /// `patched` (default): segments trail properly at any range.
     pub mc1_fix_dragon_tail: PatchArm,
+    /// MC1 creatures stop speeding up for good. Retail's pack logic
+    /// makes a follower fly one acceleration step faster than its
+    /// leader, and a follower that loses its leader keeps that speed
+    /// when it goes back to wandering; the next pack it joins is led
+    /// at the inflated speed, so every generation adds a step and
+    /// vultures, wyverns and worms end up crossing the map in
+    /// seconds (player report 2026-10-10; retail shows it too, the
+    /// port's long sessions and `awake_range 0` just get there much
+    /// sooner). `patched` (default): a creature leaving a pack goes
+    /// back to its own top speed. Packs still fly a step faster than
+    /// their leader while they hold together.
+    pub mc1_pack_speed_restore: PatchArm,
     /// No phantom castle at the map origin (MC2). Retail re-paints
     /// every wizard, corpse and balloon overlapping a building that
     /// just finished as if it were a castle; a dead rival lying on a
@@ -1326,6 +1338,7 @@ impl Default for GameplayPatches {
             castle_latch_bug: PatchArm::Patched,
             no_spell_loss: PatchArm::Patched,
             mc1_fix_dragon_tail: PatchArm::Patched,
+            mc1_pack_speed_restore: PatchArm::Patched,
             mc2_phantom_castle: PatchArm::Patched,
             dual_wield_muzzle: PatchArm::Patched,
             one_castle_per_wizard: PatchArm::Patched,
@@ -1364,6 +1377,7 @@ impl GameplayPatches {
             castle_latch_bug: PatchArm::Retail,
             no_spell_loss: PatchArm::Retail,
             mc1_fix_dragon_tail: PatchArm::Retail,
+            mc1_pack_speed_restore: PatchArm::Retail,
             mc2_phantom_castle: PatchArm::Retail,
             dual_wield_muzzle: PatchArm::Retail,
             one_castle_per_wizard: PatchArm::Retail,
@@ -1424,6 +1438,7 @@ impl GameplayPatches {
             ball_owner_recolor: PatchArm::Retail,
             no_spell_loss: PatchArm::Retail,
             mc1_fix_dragon_tail: PatchArm::Retail,
+            mc1_pack_speed_restore: PatchArm::Retail,
             mc2_phantom_castle: PatchArm::Retail,
             dual_wield_muzzle: PatchArm::Retail,
             one_castle_per_wizard: PatchArm::Retail,

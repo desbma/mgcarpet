@@ -10925,6 +10925,7 @@ fn world_patches(cfg: &config::Config) -> mgc_sim::WorldPatches {
         castle_latch_bug: p.castle_latch_bug.on(),
         no_spell_loss: p.no_spell_loss.on(),
         mc1_fix_dragon_tail: p.mc1_fix_dragon_tail.on(),
+        mc1_pack_speed_restore: p.mc1_pack_speed_restore.on(),
         mc2_phantom_castle: p.mc2_phantom_castle.on(),
         dual_wield_muzzle: p.dual_wield_muzzle.on(),
         one_castle_per_wizard: p.one_castle_per_wizard.on(),

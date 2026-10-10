@@ -2523,6 +2523,35 @@ pub fn registry() -> Vec<Spec> {
         Spec {
             domain: Gameplay,
             group: "gameplay · patches",
+            label: "mc1_pack_speed_restore",
+            class: Patch,
+            key: None,
+            cli: None,
+            cfg_path: "gameplay.patches.mc1_pack_speed_restore",
+            read: |c| Val::Toggle {
+                on: c.gameplay.patches.mc1_pack_speed_restore.on(),
+                faithful: false,
+            },
+            desc: "MC1 creatures no longer speed up for good. Retail's pack \
+                   logic flies a follower one acceleration step faster than \
+                   its leader and never slows it back down when the pack \
+                   breaks up; the next pack it leads starts from that speed, \
+                   so over a long level vultures, wyverns and worms end up \
+                   crossing the map in seconds. With this on, a creature \
+                   leaving a pack returns to its own top speed.",
+            ctl: Ctl::Toggle {
+                set: |c, v| {
+                    c.gameplay.patches.mc1_pack_speed_restore = crate::config::PatchArm::from_on(v)
+                },
+                descs: [
+                    "Pack speed carries over and compounds, as retail.",
+                    "Leaving a pack restores the creature's own top speed (default).",
+                ],
+            },
+        },
+        Spec {
+            domain: Gameplay,
+            group: "gameplay · patches",
             label: "mc2_phantom_castle",
             class: Patch,
             key: None,
@@ -3292,9 +3321,10 @@ mod tests {
         // (presentation-only; retired 2026-10-06 into a bake-time
         // asset correction), mc2_leviathan_high_lunge the same day
         // (a balance deviation riding the class for its pin), and
-        // mc2_flyers_clear_terrain 2026-10-03, and
+        // mc2_flyers_clear_terrain 2026-10-03,
+        // mc1_pack_speed_restore 2026-10-10 (the pack-speed ratchet), and
         // skeletons_convert_traders 2026-10-05.
-        assert_eq!(patches, 28, "all twenty-eight patches ship on");
+        assert_eq!(patches, 29, "all twenty-nine patches ship on");
     }
 
     #[test]

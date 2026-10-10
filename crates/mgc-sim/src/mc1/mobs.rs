@@ -3582,9 +3582,15 @@ impl Gen {
     /// PACK sub_1A390 (:21677): mirror the leader — follow its
     /// heading, join its hunts, chain to its leader — with same-model
     /// separation and a per-v_26 speed bump of the leader's accel.
-    fn mob_pack(&mut self, i: usize, base: u8) {
+    /// `restore` = the `mc1_pack_speed_restore` patch arm: a follower
+    /// leaving the pack (leader lost, leader joined a chase) puts its
+    /// own `+128` back first — see [`crate::patches::WorldPatches`].
+    fn mob_pack(&mut self, i: usize, base: u8, restore: bool) {
         let l = self.ent[i].f52 as usize;
         if l == 0 {
+            if restore {
+                self.ent[i].f126 = self.ent[i].f128;
+            }
             self.ent[i].tick70 = base + 1;
             return;
         }
@@ -3605,6 +3611,9 @@ impl Gen {
                 self.ent[i].f34 = Self::angle_between(ex, ey, lx, ly);
             }
             2 => {
+                if restore {
+                    self.ent[i].f126 = self.ent[i].f128;
+                }
                 self.ent[i].f146 = self.ent[l].f146;
                 self.ent[i].f52 = 0;
                 self.ent[i].tick70 = base + 2;
@@ -3621,6 +3630,12 @@ impl Gen {
                 }
             }
             _ => {
+                // Retail (:21793): link cleared, speed kept — the
+                // orphan wanders one catch-up step hot and seeds the
+                // next generation of the ratchet. The patch restores.
+                if restore {
+                    self.ent[i].f126 = self.ent[i].f128;
+                }
                 self.ent[i].f52 = 0;
                 self.ent[i].tick70 = base + 1;
                 return;
@@ -4913,6 +4928,13 @@ impl Gen {
                             self.ent[i].f146 = src;
                             self.ent[i].f52 = 0;
                             self.ent[i].tick70 = base + 2;
+                            // `mc1_pack_speed_restore`: the hit takes
+                            // the follower out of the pack too — own
+                            // max back BEFORE the entry trailer, so
+                            // m4's arm (speed 0) still wins.
+                            if ctx.patches.mc1_pack_speed_restore && !ctx.strict {
+                                self.ent[i].f126 = self.ent[i].f128;
+                            }
                             // The per-model PACK wrappers trail the
                             // shared sub_1A390 the same way (m4
                             // :22724-25, m7 :23362-64, m9 :24219-20).
@@ -5040,7 +5062,7 @@ impl Gen {
             (4, 1) => self.militia_idle(i, base, ctx),
             (4, 2) => self.militia_chase(i, base, ctx),
             (4, 3) => {
-                self.mob_pack(i, base);
+                self.mob_pack(i, base, ctx.patches.mc1_pack_speed_restore && !ctx.strict);
                 if self.ent[i].tick70 == base + 2 {
                     self.militia_arm(i); // sub_1BBE0 :22724-25
                 }
@@ -5173,7 +5195,7 @@ impl Gen {
 
             // -- packs --
             (0, 3) => {
-                self.mob_pack(i, base);
+                self.mob_pack(i, base, ctx.patches.mc1_pack_speed_restore && !ctx.strict);
                 self.flyer_bob(i);
             }
             // m12's pack slot 75 = the house SEEK; m13/m14's pack
@@ -5182,22 +5204,22 @@ impl Gen {
             (13, 3) | (14, 3) => {}
             // m2's pack wrapper sub_1B4C0 (:22371-76): silent arm.
             (2, 3) => {
-                self.mob_pack(i, base);
+                self.mob_pack(i, base, ctx.patches.mc1_pack_speed_restore && !ctx.strict);
                 self.m2_lunge_arm(i, base, false);
             }
             // m7's pack wrapper sub_1CA00 (:23359).
             (7, 3) => {
-                self.mob_pack(i, base);
+                self.mob_pack(i, base, ctx.patches.mc1_pack_speed_restore && !ctx.strict);
                 self.m7_arm(i, base);
             }
             // m9's pack wrapper sub_1DC80 (:24216).
             (9, 3) => {
-                self.mob_pack(i, base);
+                self.mob_pack(i, base, ctx.patches.mc1_pack_speed_restore && !ctx.strict);
                 if self.ent[i].tick70 == base + 2 {
                     self.m9_enter_chase(i);
                 }
             }
-            (_, 3) => self.mob_pack(i, base),
+            (_, 3) => self.mob_pack(i, base, ctx.patches.mc1_pack_speed_restore && !ctx.strict),
 
             _ => unreachable!(),
         }

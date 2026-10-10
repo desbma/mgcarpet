@@ -53,6 +53,7 @@
       "mc1_castle_transform_watchdog": "patched",
       "mc1_crushed_site_collapse": "patched",
       "mc1_fix_dragon_tail": "patched",
+      "mc1_pack_speed_restore": "patched",
       "mc1_recycle_victim_revalidate": "patched",
       "mc1_segment_chain_revalidate": "patched",
       "mc2_building_pad_saturate": "patched",

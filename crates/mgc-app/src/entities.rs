@@ -1580,7 +1580,7 @@ fn flame_style(class: u8, model: u8) -> FlameStyle {
 /// at half-disc steps three layers deep, overlapping into one unbroken
 /// wall before the soot trail — terrain-draped like the shockwave,
 /// sub-tick smooth, with total time = the driver's real pass schedule.
-/// The per-blast angular sample set is FIXED (sized for the 
+/// The per-blast angular sample set is FIXED (sized for the
 /// final radius), so each sample behaves like a tiny outward-flying
 /// projectile — stable identity, no re-sampling shimmer; they bunch
 /// into one bright ball at detonation and fan out with the front.

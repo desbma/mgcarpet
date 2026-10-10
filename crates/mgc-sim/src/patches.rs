@@ -124,6 +124,27 @@ pub struct WorldPatches {
     /// whole ecology (player-ruled 2026-09-07, DEFAULT ON). The
     /// damage intake stays awake-gated.
     pub mc1_fix_dragon_tail: bool,
+    /// **THE MC1 PACK-SPEED RATCHET** (player-reported 2026-10-10:
+    /// vultures "at mach speed" late in a level, worms shooting off
+    /// cliffs on map 48 under `awake_range 0`). The pack catch-up
+    /// (`sub_1A390` :21814) writes a follower's `+126` = the LEADER's
+    /// `+126` + the leader's `+130`, and retail's leader-lost default
+    /// (:21793) drops the follower to WANDER with its link cleared and
+    /// its speed UNTOUCHED — so an orphaned follower wanders one accel
+    /// step hot, the next pack scan makes it a leader, and its followers
+    /// take that plus another step. Every generation adds `+130`; only
+    /// the models with a retail chase-exit trailer (m2/m4/m7/m9/m15)
+    /// ever restore. Measured headless on map 48 (65 wyverns, parked
+    /// ghost human, always-awake): 60 → 640 in 35k ticks, in exact
+    /// steps of 60, every write from the pack handler; at the retail
+    /// 24-tile gate the same flock still climbed 60 → 120 asleep.
+    /// Retail's own listing has no restore, so this is retail's
+    /// behaviour taken to the extreme the port's long sessions reach.
+    /// Patched: a follower leaving the pack state by ANY path (leader
+    /// lost, leader joined a chase, promoted by a hit) restores its own
+    /// `+128` first; the catch-up itself is untouched, so a pack still
+    /// flies one step faster than its leader while it is a pack.
+    pub mc1_pack_speed_restore: bool,
     /// **MC2's PHANTOM CASTLE AT THE MAP ORIGIN** (player-reported
     /// 2026-09-10, DEFAULT ON). Retail's building-completion tail
     /// `sub_377A0` castle-re-paints EVERY class-3 record overlapping
@@ -593,6 +614,7 @@ impl WorldPatches {
         castle_latch_bug: false,
         no_spell_loss: false,
         mc1_fix_dragon_tail: false,
+        mc1_pack_speed_restore: false,
         mc2_phantom_castle: false,
         dual_wield_muzzle: false,
         one_castle_per_wizard: false,
@@ -632,6 +654,7 @@ impl WorldPatches {
         castle_latch_bug: true,
         no_spell_loss: false,
         mc1_fix_dragon_tail: false,
+        mc1_pack_speed_restore: false,
         mc2_phantom_castle: false,
         dual_wield_muzzle: false,
         one_castle_per_wizard: false,

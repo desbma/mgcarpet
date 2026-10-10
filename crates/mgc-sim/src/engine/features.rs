@@ -15637,6 +15637,66 @@ mod tests {
         );
     }
 
+    /// `mc1_pack_speed_restore` (player 2026-10-10, the pack-speed
+    /// RATCHET): retail's leader-lost default (:21793) and
+    /// leader-joined-a-chase arm (:21781) take a follower out of the
+    /// pack with its catch-up speed intact, so the orphan leads the
+    /// next pack one accel step hot and every generation compounds.
+    /// The patched arm writes the follower's own +128 back on both
+    /// exits; the retail arm keeps the inflated speed (the ratchet's
+    /// seed). Vultures (m1) have no trailer of their own, so the
+    /// shared pack handler is the only writer in play.
+    #[test]
+    fn pack_follower_restores_its_own_speed_when_the_pack_breaks() {
+        let run = |patched: bool, leader_state: u8| -> (i16, i16, u8) {
+            let mut g = mob_gen();
+            let leader = g.spawn_creature(1, 0x4000, 0x4000, 0).unwrap();
+            let follower = g.spawn_creature(1, 0x4010, 0x4000, 0).unwrap();
+            let (max, accel) = (g.ent[follower].f128, g.ent[follower].f130);
+            assert!(accel > 0 && max > 0, "a vulture has a real speed triple");
+            let mut ctx = ctx_at(0x7F00, 0x7F00, 0);
+            ctx.patches.mc1_pack_speed_restore = patched;
+            // Following a wandering leader already at its own max
+            // (a vulture spawns below it): the catch-up write puts
+            // the follower one accel step ABOVE its max.
+            g.ent[leader].tick70 = 7; // m1 WANDER
+            g.ent[leader].f126 = max;
+            g.ent[follower].tick70 = 9; // m1 PACK
+            g.ent[follower].f52 = leader as u16;
+            g.ent[follower].f63 = 0;
+            g.creature_tick(follower, &ctx);
+            assert_eq!(
+                g.ent[follower].f126,
+                g.ent[leader].f126 + accel,
+                "the catch-up is untouched under either arm"
+            );
+            assert!(g.ent[follower].f126 > max);
+            // The leader leaves the follow states.
+            g.ent[leader].tick70 = leader_state;
+            g.ent[follower].f63 = 0;
+            g.creature_tick(follower, &ctx);
+            (g.ent[follower].f126, max, g.ent[follower].tick70)
+        };
+        // Leader lost (a non-follow state): retail keeps the speed and
+        // wanders; the patch wanders at its own max.
+        let (speed, max, state) = run(false, 11);
+        assert_eq!(state, 7, "back to WANDER");
+        assert!(
+            speed > max,
+            "retail: the orphan wanders hot ({speed} > {max})"
+        );
+        let (speed, max, state) = run(true, 11);
+        assert_eq!(state, 7, "back to WANDER");
+        assert_eq!(speed, max, "patched: the orphan wanders at its own max");
+        // Leader joined a chase: the follower joins too.
+        let (speed, max, state) = run(false, 8);
+        assert_eq!(state, 8, "joins the CHASE");
+        assert!(speed > max, "retail: into the chase hot");
+        let (speed, max, state) = run(true, 8);
+        assert_eq!(state, 8, "joins the CHASE");
+        assert_eq!(speed, max, "patched: into the chase at its own max");
+    }
+
     /// m4's militia trailers: `sub_1BC50` (:22744) arms him on the
     /// PROMOTION tick — one LCG draw, speed 0, the target's own
     /// class/model as his bolt filter — and `sub_1BCE0` (:22766) puts
