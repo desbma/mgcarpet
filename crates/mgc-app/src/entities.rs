@@ -2388,8 +2388,12 @@ fn nearest_palette_index(palette: &[[u8; 4]; 256], rgb: [u8; 3]) -> u8 {
 /// at engine yaw 0 = our north); altitude re-derives at spawn from
 /// ground height (MC2 places at terrain alt exactly — hover is flight
 /// physics, not spawn state).
-pub fn player_start(_game: GameId, things: &[Thing]) -> Option<(f32, f32)> {
-    let is_start = |t: &&Thing| t.kind == ThingKind::Entity && t.class == 3 && t.model == 4;
+///
+/// `seat` is the human's wizard seat (`--seat`, 0 everywhere else):
+/// the class-3 model `4 + seat` marker.
+pub fn player_start_seat(_game: GameId, things: &[Thing], seat: u8) -> Option<(f32, f32)> {
+    let model = 4 + u16::from(seat);
+    let is_start = |t: &&Thing| t.kind == ThingKind::Entity && t.class == 3 && t.model == model;
     things
         .iter()
         .filter(is_start)
@@ -3457,7 +3461,7 @@ mod tests {
         };
         let pkg: mgc_formats::LevelPackage = mgc_formats::mgcl::read(f).unwrap();
         assert_eq!(
-            player_start(GameId::Mc1, &pkg.things.things),
+            player_start_seat(GameId::Mc1, &pkg.things.things, 0),
             Some((134.5, 119.5)),
             "the LAST (3,4) row, not row 0's (248,247)"
         );
@@ -3595,7 +3599,7 @@ mod tests {
         };
         let pkg: mgc_formats::LevelPackage = mgc_formats::mgcl::read(f).unwrap();
         assert_eq!(
-            player_start(GameId::Mc2, &pkg.things.things),
+            player_start_seat(GameId::Mc2, &pkg.things.things, 0),
             Some((77.5, 222.5)),
             "the (3,4) fallback start marker"
         );

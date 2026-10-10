@@ -4363,6 +4363,31 @@ impl World {
         game: GameId,
         mc2_night: bool,
     ) -> Self {
+        Self::new_full_env_seated(planes, things, seed, assets, chassis, game, mc2_night, 0)
+    }
+
+    /// [`World::new_full_env`] with the human flying wizard seat
+    /// `human_seat` ([`Gen::human_seat`]) — retail's local index set
+    /// to a seat other than 0, which its own level init answers by
+    /// making every other seat (seat 0 included) an AI. Seat 0 is
+    /// exactly `new_full_env`. MC1 only for now: an MC2 world always
+    /// seats the human at 0.
+    ///
+    /// A nonzero seat does NOT pop the human's carpet record here:
+    /// retail pops the wizards in SEAT order (the consume loop runs
+    /// `sub_44D30` for wizard 0..7, :48633), so the caller seats the
+    /// whole roster through [`World::seat_mc1_wizards`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_full_env_seated(
+        planes: Planes,
+        things: &[Thing],
+        seed: u32,
+        assets: FeatureAssets,
+        chassis: ChassisParams,
+        game: GameId,
+        mc2_night: bool,
+        human_seat: u8,
+    ) -> Self {
         let mut start_markers: [Option<(u16, u16)>; 8] = Default::default();
         // MC2's wizard start markers are an ARRAY OF SLOTS WRITTEN
         // UNCONDITIONALLY, not a first-one-wins registry — see
@@ -4559,7 +4584,12 @@ impl World {
             // The book follows through `grant_level_book`, the
             // rivals through `set_wizards`, in that order — the
             // caller's duty, exactly as retail's consume loop.
-            w.mc1_spawn_human_record();
+            // A nonzero seat pops in its seat's turn instead
+            // (`seat_mc1_wizards`).
+            w.g.human_seat = features::HumanSeat(human_seat.min(7));
+            if human_seat == 0 {
+                w.mc1_spawn_human_record();
+            }
         }
         // NO free starting spells: the retail human grant is
         // (availability mask) AND (campaign collected flags)
@@ -6924,8 +6954,8 @@ impl World {
         // the regen apply exactly like retail. MC2's cast sites bank
         // and zero it (`mc2_launch`, `cast_castle`) the same way MC1's
         // do.
-        if self.wiz_charge[0] < 200 {
-            self.wiz_charge[0] += 1;
+        if self.wiz_charge[self.g.human_seat.0 as usize] < 200 {
+            self.wiz_charge[self.g.human_seat.0 as usize] += 1;
         }
     }
 
@@ -12392,12 +12422,11 @@ impl World {
                     self.player.lost = true;
                     self.pending_restart = true;
                 }
-                let (sx, sy) = self
-                    .start_markers
-                    .iter()
-                    .flatten()
-                    .next()
-                    .copied()
+                // The human's own seat marker first (`--seat`; at
+                // seat 0 this is the old first-marker pick whenever
+                // colour 0 is authored).
+                let (sx, sy) = self.start_markers[self.g.human_seat() as usize]
+                    .or_else(|| self.start_markers.iter().flatten().next().copied())
                     .unwrap_or((0, 0));
                 let (x, y) = ((sx << 8) | 128, (sy << 8) | 128);
                 (x, y, (self.g.ground_z(x, y) as i16).saturating_add(256))
@@ -12574,11 +12603,11 @@ impl World {
         if crate::mc1::rivals::no_mc1_truce_roster() {
             for r in 0..self.rivals.len() {
                 if self.rivals[r].ent != 0 && !self.rivals[r].eliminated {
-                    self.rivals[r].hate[0] = 40927;
+                    self.rivals[r].hate[self.g.human_seat() as usize] = 40927;
                 }
             }
         } else {
-            self.mc1_truce_roster(0, u16::MAX);
+            self.mc1_truce_roster(self.g.human_seat() as usize, u16::MAX);
         }
     }
 
@@ -12901,7 +12930,7 @@ impl World {
             .is_some_and(|k| k.class64 == 3 && matches!(k.model65, 0 | 1))
             && let Some(slot) = self.owner_slot_of_source(killer)
         {
-            self.kill_tally[slot as usize][0] += 1;
+            self.kill_tally[slot as usize][self.g.human_seat() as usize] += 1;
         }
         self.g.player_mail = [(0, 0); 6];
         // ⭐ `dword_0x10_16 = 1200` (EF:60170) — the flat respawn timer,
@@ -14725,8 +14754,8 @@ impl World {
         e.f140 = (def.possess_mana / def.count.max(1) as u32) as i32;
         // The charge move (:65072-73): the spawner banks the caster's
         // accumulated meter in the bolt's +26 and zeroes it.
-        e.f26 = self.wiz_charge[0] as i16;
-        self.wiz_charge[0] = 0;
+        e.f26 = self.wiz_charge[self.g.human_seat.0 as usize] as i16;
+        self.wiz_charge[self.g.human_seat.0 as usize] = 0;
         // :65074-76 — the dest triple: the CARPET's raw axis projected
         // 0x4000 along the live aim (`Gen::mc1_stamp_bolt_dest`).
         self.g
@@ -14946,10 +14975,10 @@ impl World {
         // — 1,151 pairs on this take alone.
         match id {
             6 | 7 | 8 | 9 | 13 | 15 | 17 | 19 => {
-                self.g.ent[pr].f26 = self.wiz_charge[0] as i16;
-                self.wiz_charge[0] = 0;
+                self.g.ent[pr].f26 = self.wiz_charge[self.g.human_seat.0 as usize] as i16;
+                self.wiz_charge[self.g.human_seat.0 as usize] = 0;
             }
-            3 => self.wiz_charge[0] = 0,
+            3 => self.wiz_charge[self.g.human_seat.0 as usize] = 0,
             _ => {}
         }
         // The lightning arm's dest triple (:65849-51): the CASTER's
@@ -15489,7 +15518,7 @@ impl World {
         if crate::mc1::combat::no_castle_bind_register() {
             return self.player_castle();
         }
-        let reg = self.g.castle_reg[0] as usize;
+        let reg = self.g.castle_reg[self.g.human_seat() as usize] as usize;
         (reg != 0 && reg < self.g.ent.len()).then_some(reg)
     }
 
@@ -16452,8 +16481,8 @@ impl World {
         // the fireball/quake family (a consumer the first +326 sweep
         // missed; the corpus (9,10) f26 rows, and the mc2l3 t=241
         // ball's scratch10 = 200).
-        self.g.ent[pr].f26 = self.wiz_charge[0] as i16;
-        self.wiz_charge[0] = 0;
+        self.g.ent[pr].f26 = self.wiz_charge[self.g.human_seat.0 as usize] as i16;
+        self.wiz_charge[self.g.human_seat.0 as usize] = 0;
         // MC2: stamp the castle research for the stage this cast
         // builds (the A.5 shortcut — retail's research child
         // `sub_69AB0` writes `array_0x24E_590` for castleLevel+1
@@ -16491,8 +16520,8 @@ impl World {
         // t=27215 is its witness in this family (bolt +26 = 16, the
         // wizard's meter back at 1 after the carpet tick's ++). Read
         // and cleared before the borrow below.
-        let charge = self.wiz_charge[0] as i16;
-        self.wiz_charge[0] = 0;
+        let charge = self.wiz_charge[self.g.human_seat.0 as usize] as i16;
+        self.wiz_charge[self.g.human_seat.0 as usize] = 0;
         // The emit copies the MANIFESTATION's +140 (:66029) — the
         // ctor's cost-per-shot a4/count, not the row's total; the
         // same live-vs-computed identity `cast_firewall` documents.
@@ -16582,8 +16611,8 @@ impl World {
         e.f69 = 53;
         // :66146-47 — the charge meter banks into the bolt's +26 and
         // zeroes (every manifestation bolt spawner's shared law).
-        e.f26 = self.wiz_charge[0] as i16;
-        self.wiz_charge[0] = 0;
+        e.f26 = self.wiz_charge[self.g.human_seat.0 as usize] as i16;
+        self.wiz_charge[self.g.human_seat.0 as usize] = 0;
         // :66148-50 — the dest triple: the CARPET's raw axis (+72/+76,
         // not the muzzle) projected along the live aim (sub_41EC0).
         // Pair imports carry it and masked the missing stamp; the
@@ -16657,8 +16686,8 @@ impl World {
         // The +26 it banks has no reader in the reconstruction, but
         // the ZERO is what the graded `wizard0.charge` lane measures,
         // and leaving it out lets the meter run past every cast.
-        e.f26 = self.wiz_charge[0] as i16;
-        self.wiz_charge[0] = 0;
+        e.f26 = self.wiz_charge[self.g.human_seat.0 as usize] as i16;
+        self.wiz_charge[self.g.human_seat.0 as usize] = 0;
         // :66280-82 — the dest triple, the carrier's own (the relay
         // never reads it; `Gen::mc1_stamp_bolt_dest`).
         self.g
@@ -18933,7 +18962,7 @@ impl World {
 
     /// The human's kill row of the tally (Type_160+30 on the human).
     pub fn player_kill_row(&self) -> [u16; 8] {
-        self.kill_tally[0]
+        self.kill_tally[self.g.human_seat() as usize]
     }
 
     /// Rival deaths since the last drain (player slots) — the death

@@ -88,6 +88,10 @@ struct WorldInit {
     /// the NumberOfPlayers bound (header unk09) on MC2.
     mc2_wizards: [Option<mgc_sim::mc2::rivals::Mc2RivalConfig>; 8],
     player_count: u16,
+    /// The wizard seat the human flies (`--seat`, 0-based; retail's
+    /// local index) — 0 everywhere but a `--seat` launch, which makes
+    /// seat 0 a rival (`World::new_full_env_seated`). MC1 column only.
+    human_seat: u8,
     /// MC2 stage checkpoints (`(index, stage, x, y)` rows) — the
     /// single-stage objective engine's board. Empty for MC1/HW.
     stages: Vec<(i8, i16, i16, i16)>,
@@ -119,7 +123,7 @@ struct WorldInit {
 
 impl WorldInit {
     fn build(&self) -> mgc_sim::engine::world::World {
-        let mut w = mgc_sim::engine::world::World::new_full_env(
+        let mut w = mgc_sim::engine::world::World::new_full_env_seated(
             self.planes.clone(),
             &self.things,
             self.seed,
@@ -127,6 +131,7 @@ impl WorldInit {
             self.chassis.clone(),
             self.game,
             self.night_shade,
+            self.human_seat,
         );
         if matches!(self.game, mgc_sim::ids::GameId::Mc2) {
             w.set_placeholders(self.placeholders);
@@ -145,13 +150,10 @@ impl WorldInit {
             if self.win_pct > 0 {
                 w.set_win_pct(self.win_pct);
             }
-            // The constructor seated the carpet record; the book's
-            // tokens next, in book order, the rivals last — retail's
-            // consume-loop order (:48633), see `grant_level_book`.
-            if !self.human_book.is_empty() {
-                w.grant_level_book(&self.human_book);
-            }
-            w.set_wizards(&self.wizards, self.player_count);
+            // Retail's consume-loop order (:48633): wizard 0..count,
+            // the human's record + book at his seat, a rival at every
+            // other — see `seat_mc1_wizards`.
+            w.seat_mc1_wizards(&self.human_book, &self.wizards, self.player_count);
         }
         w
     }
@@ -635,7 +637,9 @@ fn rival_configs(
     let mut out: [Option<mgc_sim::mc1::rivals::RivalConfig>; 8] = Default::default();
     let Some(w) = wizards else { return (out, 1) };
     let count = w.player_count.unwrap_or(1).min(8);
-    for (slot, cfg) in w.wizards.iter().enumerate().take(8).skip(1) {
+    // Seat 0 too: it is a rival whenever the human flies another seat
+    // (`--seat`); `set_wizards` skips the human's own.
+    for (slot, cfg) in w.wizards.iter().enumerate().take(8) {
         let (Some(acc), Some(tempo), Some(allowed_mask)) =
             (cfg.accuracy, cfg.tempo, cfg.allowed_spells.as_ref())
         else {
@@ -1072,6 +1076,7 @@ fn load_level(
     pool_slots: Option<usize>,
     awake_range: Option<u32>,
     mc2_replayed: bool,
+    human_seat: u8,
 ) -> Result<LoadedLevel, String> {
     let file =
         std::fs::File::open(level_path).map_err(|e| format!("{}: {e}", level_path.display()))?;
@@ -1205,15 +1210,44 @@ fn load_level(
         Vec::new()
     };
 
+    // `--seat`: MC1/HW only for now, and the level must seat it.
+    if human_seat != 0 {
+        if !mc1_family {
+            return Err("--seat: MC1/HW levels only for now".into());
+        }
+        let count = package
+            .wizards
+            .as_ref()
+            .and_then(|w| w.player_count)
+            .unwrap_or(1)
+            .min(8);
+        if u16::from(human_seat) >= count {
+            return Err(format!(
+                "--seat {}: this level seats {count} wizard(s)",
+                human_seat + 1
+            ));
+        }
+        // …and must AUTHOR the seat: its class-3 `4 + seat` start
+        // marker. Retail would seat a marker-less wizard at the memset
+        // origin (the round-154 law), which no player wants to fly from.
+        let game = mgc_sim::ids::GameId::from(package.meta.game);
+        if entities::player_start_seat(game, &package.things.things, human_seat).is_none() {
+            return Err(format!(
+                "--seat {}: this level authors no start marker for that seat",
+                human_seat + 1
+            ));
+        }
+    }
     // The human's level-start book: the campaign carry ∩ the level's
     // availability mask (retail's grant law, :49226-33 — the mask is
-    // wizards slot 0's `allowed_spells`, 0/1 per spell) ∪ the
+    // the HUMAN's seat row's `allowed_spells`, 0/1 per spell; retail
+    // single-player indexes the table by the wizard, :49201-55) ∪ the
     // plausible instrument's set. Order is the sim's
     // (`grant_level_book` walks the book order).
     let allowed_spells: Option<Vec<u8>> = package
         .wizards
         .as_ref()
-        .and_then(|w| w.wizards.first())
+        .and_then(|w| w.wizards.get(human_seat as usize))
         .and_then(|h| h.allowed_spells.clone());
     let human_book: Vec<u8> = match set_book.filter(|_| mc1_family) {
         // `--set-spellbook`: EXACTLY the given set — it replaces the
@@ -1403,6 +1437,7 @@ fn load_level(
                     wizards,
                     mc2_wizards,
                     player_count,
+                    human_seat,
                     stages,
                     stage_vars,
                     placeholders: is_mc2,
@@ -1517,7 +1552,7 @@ fn load_level(
     // The original's spawn: the class-3 m4 start marker's position
     // (both games), hovering over the (post-feature) terrain, facing
     // north.
-    let start = entities::player_start(game_id, &package.things.things).map(|(x, z)| Flyer {
+    let start = entities::player_start_seat(game_id, &package.things.things, human_seat).map(|(x, z)| Flyer {
         x,
         y: entities::ground_at(&height, x, z) + entities::START_HOVER,
         z,
@@ -4263,6 +4298,7 @@ impl App {
             self.launch.pool_slots,
             self.launch.awake_range,
             false,
+            0, // campaign: the human is wizard 0
         )?;
 
         // The rejection keys, checked BEFORE the level is installed so
@@ -4390,6 +4426,7 @@ impl App {
             self.launch.pool_slots,
             self.launch.awake_range,
             replayed,
+            0, // campaign: the human is wizard 0
         ) {
             Ok(l) => l,
             Err(e) => {
@@ -9749,6 +9786,11 @@ struct Args {
     /// None = the game's pristine chassis value (1000).
     pool_slots: Option<usize>,
     awake_range: Option<u32>,
+    /// `--seat N` (1-based): fly wizard seat N of a `--level` launch
+    /// instead of seat 1 — retail's local index; every other seat,
+    /// seat 1 included, is a rival. Stored 0-based. MC1/HW only for
+    /// now; not with `--campaign`, `--record` or `--replay`.
+    seat: u8,
     /// `--replay <take.mgcr>`: play a recording as the session's only
     /// input source — SOURCE-AGNOSTIC (retail takes via inline input
     /// recovery, port recordings via the exact input channel);
@@ -9844,6 +9886,7 @@ fn parse_args() -> Result<Args, String> {
     let mut anim_turn = 0.0f32;
     let mut terrain_features = true;
     let mut awake_range = None;
+    let mut seat = 0u8;
     let mut pool_slots = None;
     let mut replay = None;
     let mut third_person = false;
@@ -10206,10 +10249,22 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|e| format!("--awake-range: {e}"))?;
                 awake_range = Some(n);
             }
+            "--seat" => {
+                let n: u8 = it
+                    .next()
+                    .ok_or("--seat needs a wizard seat (1-8)")?
+                    .parse()
+                    .map_err(|e| format!("--seat: {e}"))?;
+                if !(1..=8).contains(&n) {
+                    return Err("--seat: seats are 1-8".into());
+                }
+                seat = n - 1;
+            }
             "--help" | "-h" => {
                 return Err(format!(
                     "usage: mgcarpet [--level <game:index> | <baked/.../level-NNN.mgcl>] \
                      [--campaign mc1|mc1hw|mc2 [--slot N] [--new-game]] \
+                     [--seat 1-8 (fly that wizard seat; MC1/HW --level only)] \
                      (slot 0 = default: a fresh run, saved only from the in-game menu) \
                      [--tileset 0|1] [--config <path>] \
                      [--smooth-shading|--no-smooth-shading] \
@@ -10275,6 +10330,18 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown argument {other} (try --help)")),
         }
     }
+    // A seat is a property of the level BUILD, and neither the
+    // campaign nor a recording carries one yet.
+    if seat != 0
+        && (campaign_id.is_some()
+            || record.is_some()
+            || replay.is_some()
+            || replay_check.is_some())
+    {
+        return Err("--seat: a plain --level launch only (not with --campaign, \
+                    --record, --replay or --replay-check)"
+            .into());
+    }
     Ok(Args {
         level,
         level_explicit,
@@ -10329,6 +10396,7 @@ fn parse_args() -> Result<Args, String> {
         terrain_features,
         pool_slots,
         awake_range,
+        seat,
         replay,
         third_person,
         film,
@@ -10555,6 +10623,7 @@ fn run_flock_probe(
             wizards: Default::default(),
             mc2_wizards: Default::default(),
             player_count: 1,
+            human_seat: 0,
             stages: Vec::new(),
             stage_vars: Vec::new(),
             night_shade: init.night_shade,
@@ -12048,6 +12117,7 @@ pub fn game_main(event_loop: Option<EventLoop<()>>) -> std::process::ExitCode {
             pool_slots,
             awake_range,
             false,
+            args.seat,
         ) {
             Ok(l) => Some(l),
             Err(e) => {

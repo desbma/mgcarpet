@@ -1498,11 +1498,50 @@ impl World {
     /// Slot 0 (the human) is ignored here — the human's book comes
     /// from the campaign/jar machinery.
     pub fn set_wizards(&mut self, configs: &[Option<RivalConfig>; 8], player_count: u16) {
-        for slot in 1..player_count.min(8) as u8 {
+        let hs = self.g.human_seat();
+        for slot in 0..player_count.min(8) as u8 {
+            if slot == hs {
+                continue;
+            }
             let Some(cfg) = &configs[slot as usize] else {
                 continue;
             };
             self.spawn_rival(slot, cfg.clone());
+        }
+    }
+
+    /// Seat the whole MC1 roster in retail's consume-loop order
+    /// (`sub_44D30` for wizard 0..count, :48633): at the human's seat
+    /// his carpet record ([`World::mc1_spawn_human_record`]) and then
+    /// his level book's tokens ([`World::grant_level_book`]); at every
+    /// other seat a rival. At seat 0 this is exactly the classic
+    /// sequence — the constructor's record, the book, `set_wizards` —
+    /// because the human IS wizard 0. A world built by
+    /// [`World::new_full_env_seated`] with a nonzero seat must be
+    /// seated through here (its constructor left the record unpopped).
+    pub fn seat_mc1_wizards(
+        &mut self,
+        human_book: &[u8],
+        configs: &[Option<RivalConfig>; 8],
+        player_count: u16,
+    ) {
+        let hs = self.g.human_seat();
+        if hs == 0 {
+            if !human_book.is_empty() {
+                self.grant_level_book(human_book);
+            }
+            self.set_wizards(configs, player_count);
+            return;
+        }
+        for slot in 0..player_count.min(8) as u8 {
+            if slot == hs {
+                self.mc1_spawn_human_record();
+                if !human_book.is_empty() {
+                    self.grant_level_book(human_book);
+                }
+            } else if let Some(cfg) = &configs[slot as usize] {
+                self.spawn_rival(slot, cfg.clone());
+            }
         }
     }
 
@@ -1560,7 +1599,7 @@ impl World {
         // with no `(3,4)` THING row is seated at (0, 0, ground+0x100)
         // exactly like a marker-less rival. See
         // [`no_mc1_markerless_human_seat`].
-        let (x, y) = match self.start_markers[0] {
+        let (x, y) = match self.start_markers[self.g.human_seat() as usize] {
             // `sub_44D30`'s pose: the marker's tile centre, ground +
             // 0x100 (:54838-42, the same snap `spawn_rival` uses).
             Some((mx, my)) => ((mx << 8).wrapping_add(128), (my << 8).wrapping_add(128)),
@@ -1616,9 +1655,10 @@ impl World {
         let Some(i) = self.g.spawn_class3(1, x, y, z) else {
             return;
         };
-        // Per-slot rival art (:54927-55): sprite-stats rows 273-279
-        // (slot 0 keeps 44). Draw type 0x11: 16 views by mirror.
-        self.g.set_sprite(i, 272 + slot as u16);
+        // Per-slot rival art (:54927-55): sprite-stats rows 273-279,
+        // and seat 0 keeps 44 — reached only when the human flies
+        // another seat. Draw type 0x11: 16 views by mirror.
+        self.g.set_sprite(i, if slot == 0 { 44 } else { 272 + slot as u16 });
         self.g.refill_life(i);
         // Retail keeps a wizard's mana ON the entity (+140); the
         // port's authority is `Rival::mana`, with the entity as the
@@ -1897,7 +1937,7 @@ impl World {
     /// entity slot = its player slot. Consults both rival columns.
     pub(crate) fn owner_slot(&self, owner: u16) -> Option<u8> {
         if owner == PLAYER_TARGET {
-            return Some(0);
+            return Some(self.g.human_seat());
         }
         self.rivals
             .iter()
@@ -2266,7 +2306,7 @@ impl World {
         if grip_src != 0 {
             self.rivals[ri].regen_stall = 16;
             self.g.ent[i].mail[4] = (grip_amt, 0);
-            if self.owner_slot_of_source(grip_src) == Some(0) {
+            if self.owner_slot_of_source(grip_src) == Some(self.g.human_seat()) {
                 // u16_314/316/318 on the human: victim, counter,
                 // clamp(dist, 1024, 3072) (:55671-77). ⚠ THE HOLD IS
                 // 3-D — :55673 measures with `sub_42340_42680`, the
@@ -2377,7 +2417,7 @@ impl World {
     /// pass id24 through).
     pub(crate) fn owner_slot_of_source(&self, src: u16) -> Option<u8> {
         if src == PLAYER_TARGET {
-            return Some(0);
+            return Some(self.g.human_seat());
         }
         // A pool slot: use its owner tag; a wizard entity is its own.
         let e = self.g.ent.get(src as usize)?;
@@ -4609,6 +4649,7 @@ impl World {
         // selector runs, and retail still picks the corpse) — AND the
         // human rides the chain's VISIBLE PREFIX like every pooled
         // carpet: see [`mc1_human_on_wiz_roster`].
+        let hs = self.g.human_seat();
         let human_seen = self.human_bucket_alive && {
             if mc1_human_on_wiz_roster() {
                 let hs = self.mc1_carpet_slot;
@@ -4628,9 +4669,9 @@ impl World {
                 purse(self.player.mana),
                 // :18570-72 — the target's raw +50 register + owned
                 // m16 token (sub_14E60), not the establishment latch.
-                self.wiz_castle_reg(0) == 0 && self.player.owned[16] != 0,
-                self.rivals[ri].hate[0] as i64,
-                self.rivals[ri].war[0],
+                self.wiz_castle_reg(hs) == 0 && self.player.owned[16] != 0,
+                self.rivals[ri].hate[hs as usize] as i64,
+                self.rivals[ri].war[hs as usize],
                 &mut best,
             )
         {
@@ -4896,7 +4937,7 @@ impl World {
                 (self.human_bucket_alive && !self.ghost && self.g.mc1_human_on_wiz_chain())
                     .then_some(self.human_pose)
             } else {
-                self.wizard_pos(0)
+                self.wizard_pos(self.g.human_seat())
             };
             let mut guard: Option<u32> =
                 human_guard.map(|(hx, hy, _)| Gen::dist2_sq(bx, by, hx, hy) as u32);
@@ -4990,9 +5031,10 @@ impl World {
         }
     }
 
-    /// A wizard's live position by slot (0 = the human).
+    /// A wizard's live position by slot (the human's seat = the human,
+    /// [`crate::engine::features::Gen::human_seat`]).
     pub(crate) fn wizard_pos(&self, slot: u8) -> Option<(u16, u16, i16)> {
-        if slot == 0 {
+        if slot == self.g.human_seat() {
             return (self.player.state == LifeState::Alive).then_some(self.human_pose);
         }
         let ent = self
@@ -5012,7 +5054,7 @@ impl World {
 
     /// A wizard's mana ceiling (the wealth term in the hate gates).
     pub(crate) fn wizard_wealth(&self, slot: u8) -> u32 {
-        if slot == 0 {
+        if slot == self.g.human_seat() {
             return self.player.mana_max;
         }
         self.rivals
@@ -10717,5 +10759,217 @@ mod tests {
             "+24 takes sub_42150's return verbatim, 2048 included"
         );
         assert_eq!(w.rivals[ri].knock_mag, 10, "+22 = amount / 10");
+    }
+}
+
+/// The human at a wizard seat other than 0 (`Gen::human_seat`, the
+/// multiplayer track's first step): retail's own single-player answer
+/// to a nonzero local index — every other seat, seat 0 included, is
+/// an AI. Played on baked MC1 arena level 50 (eight authored seats).
+/// Self-skips without baked data.
+#[cfg(test)]
+mod human_seat_tests {
+    use super::{PLAYER_TARGET, RivalConfig};
+    use crate::engine::features::{FeatureAssets, Planes};
+    use crate::engine::world::World;
+    use crate::ids::GameId;
+    use crate::{FlightInput, Simulation, ThrustModel};
+
+    struct Arena {
+        planes: Planes,
+        things: Vec<mgc_formats::Thing>,
+        seed: u32,
+        assets: FeatureAssets,
+        configs: [Option<RivalConfig>; 8],
+        count: u16,
+    }
+
+    fn arena() -> Option<Arena> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../baked");
+        let lp = root.join("mc1/level-050.mgcl");
+        if !lp.exists() {
+            eprintln!("skip: baked mc1 level 50 not present");
+            return None;
+        }
+        let pkg: mgc_formats::LevelPackage =
+            mgc_formats::mgcl::read(std::fs::File::open(lp).ok()?).ok()?;
+        let bundle = mgc_formats::bundle::Bundle::load(&root.join("assets/mc1-temperate")).ok()?;
+        let terrain = pkg.terrain.as_ref()?;
+        let planes = Planes {
+            height: terrain.height.clone(),
+            tile_type: terrain.tile_type.clone(),
+            shading: terrain.shading.clone()?,
+            angle: terrain.angle.clone()?,
+            ceiling: Vec::new(),
+        };
+        let assets = FeatureAssets::parse(
+            bundle.search.as_ref()?,
+            bundle.build_tab.as_ref()?,
+            bundle.build_dat.as_ref()?,
+        )
+        .ok()?;
+        // The app's `rival_configs`, every seat.
+        let wiz = pkg.wizards.as_ref()?;
+        let mut configs: [Option<RivalConfig>; 8] = Default::default();
+        for (slot, c) in wiz.wizards.iter().enumerate().take(8) {
+            let (Some(acc), Some(tempo), Some(mask)) =
+                (c.accuracy, c.tempo, c.allowed_spells.as_ref())
+            else {
+                continue;
+            };
+            let mut book = [false; 24];
+            let mut allowed = [false; 24];
+            for s in 0..24 {
+                allowed[s] = mask.get(s).copied().unwrap_or(0) != 0;
+                book[s] = allowed[s] && c.starting_spells.get(s).copied().unwrap_or(0) != 0;
+            }
+            configs[slot] = Some(RivalConfig {
+                aggression: c.aggression.clamp(0, 255) as u8,
+                accuracy: acc.clamp(0, 255) as u8,
+                tempo: tempo.clamp(0, 255) as u8,
+                castle_level: c.castle_level.unwrap_or(0),
+                book,
+                allowed,
+            });
+        }
+        Some(Arena {
+            planes,
+            things: pkg.things.things.clone(),
+            seed: pkg.gen_params.as_ref().map_or(0, |g| g.seed),
+            assets,
+            configs,
+            count: wiz.player_count.unwrap_or(1).min(8),
+        })
+    }
+
+    fn build(a: &Arena, seat: u8) -> World {
+        let mut w = World::new_full_env_seated(
+            a.planes.clone(),
+            &a.things,
+            a.seed,
+            a.assets.clone(),
+            GameId::Mc1.chassis(),
+            GameId::Mc1,
+            false,
+            seat,
+        );
+        w.seat_mc1_wizards(&[], &a.configs, a.count);
+        w
+    }
+
+    fn sim(w: World) -> Simulation {
+        let mut s = Simulation::with_world(w);
+        s.thrust_model = ThrustModel::Mc1;
+        s.sync_carpet_from_flyer();
+        s
+    }
+
+    /// Seat 0 through the new entry points IS the classic build — the
+    /// constructor's record, `set_wizards` — tick for tick.
+    #[test]
+    fn seat_zero_is_the_classic_build() {
+        let Some(a) = arena() else { return };
+        let mut classic = World::new_full_env(
+            a.planes.clone(),
+            &a.things,
+            a.seed,
+            a.assets.clone(),
+            GameId::Mc1.chassis(),
+            GameId::Mc1,
+            false,
+        );
+        classic.set_wizards(&a.configs, a.count);
+        let (mut c, mut s) = (sim(classic), sim(build(&a, 0)));
+        assert_eq!(c.state_hash(), s.state_hash(), "fresh build");
+        let fly = FlightInput {
+            thrust: 1.0,
+            stick_x: 40,
+            ..Default::default()
+        };
+        for t in 1..=300 {
+            c.step(&fly);
+            s.step(&fly);
+            assert_eq!(c.state_hash(), s.state_hash(), "tick {t}");
+        }
+    }
+
+    #[test]
+    fn human_flies_seat_four_and_seat_zero_is_a_rival() {
+        let Some(a) = arena() else { return };
+        assert!(a.count >= 5, "level 50 seats eight wizards");
+        let w = build(&a, 4);
+        assert_eq!(w.g.human_seat(), 4);
+
+        // The human sits on colour 4's marker, the rivals on every
+        // other seat — 0 included, 4 excluded.
+        let (mx, my) = w.start_markers[4].expect("level 50 authors colour 4");
+        assert_eq!(
+            (w.human_pose.0, w.human_pose.1),
+            ((mx << 8) | 128, (my << 8) | 128)
+        );
+        let mut seats: Vec<u8> = w.rivals.iter().map(|r| r.slot).collect();
+        seats.sort_unstable();
+        let expect: Vec<u8> = (0..a.count as u8).filter(|&s| s != 4).collect();
+        assert_eq!(seats, expect);
+
+        // Retail's pop order: wizard 0..7 in seat order, the human's
+        // carpet record between seats 3 and 5.
+        let ent_of = |s: u8| w.rivals.iter().find(|r| r.slot == s).unwrap().ent;
+        let hs = w.mc1_carpet_slot;
+        assert!(ent_of(3) < hs && hs < ent_of(5), "{} < {hs} < {}", ent_of(3), ent_of(5));
+
+        // Every seat resolver answers the human's seat for his tag,
+        // and seat 0 for the rival flying it.
+        assert_eq!(w.g.owner_team(PLAYER_TARGET), Some(4));
+        assert_eq!(w.owner_slot(PLAYER_TARGET), Some(4));
+        assert_eq!(w.owner_slot(ent_of(0)), Some(0));
+        assert_eq!(w.g.owner_team(ent_of(0)), Some(0));
+        assert_eq!(
+            w.wizard_pos(4).map(|p| (p.0, p.1)),
+            Some((w.human_pose.0, w.human_pose.1))
+        );
+        let r0 = &w.g.ent[ent_of(0) as usize];
+        assert_eq!(w.wizard_pos(0), Some((r0.x, r0.y, r0.z)));
+    }
+
+    /// The seat survives the save codec, and a seat-4 world plays and
+    /// round-trips like any other.
+    #[test]
+    fn seat_four_plays_and_round_trips() {
+        let Some(a) = arena() else { return };
+        let mut live = sim(build(&a, 4));
+        let fly = FlightInput {
+            thrust: 1.0,
+            stick_x: -30,
+            fire_left: true,
+            ..Default::default()
+        };
+        for _ in 0..600 {
+            live.step(&fly);
+        }
+        // The seat-0 AI is alive and flying its own brain.
+        let w = live.world.as_ref().unwrap();
+        let r0 = w.rivals.iter().find(|r| r.slot == 0).unwrap();
+        assert!(!r0.eliminated);
+
+        let bytes = live.snapshot();
+        // The stream carries the seat itself…
+        let mut other = sim(build(&a, 0));
+        other.restore(&bytes).expect("restore");
+        assert_eq!(other.world.as_ref().unwrap().g.human_seat(), 4);
+        // …but, like every save, it restores onto a world BUILT the
+        // same way: the load-static pins (`ImportPin` — the carpet
+        // slot, the castle register) come from the build, and a
+        // seat moves the human's carpet record.
+        let mut restored = sim(build(&a, 4));
+        restored.restore(&bytes).expect("restore");
+        assert_eq!(live.state_hash(), restored.state_hash());
+        for t in 1..=300 {
+            live.step(&fly);
+            restored.step(&fly);
+            assert_eq!(live.state_hash(), restored.state_hash(), "tick {t}");
+        }
+        // A seated world hashes apart from the seat-0 one.
+        assert_ne!(sim(build(&a, 4)).state_hash(), sim(build(&a, 0)).state_hash());
     }
 }

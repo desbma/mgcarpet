@@ -248,11 +248,10 @@ impl super::features::Gen {
                 return Some(Killer::Player);
             }
             let s = self.rival_ents.iter().position(|&e| e != 0 && e == t)?;
-            Some(if s == 0 {
-                Killer::Player
-            } else {
-                Killer::Rival(s as u8)
-            })
+            // `rival_ents` never holds the human (it is out of pool,
+            // tagged PLAYER_TAG above), so every hit is a rival — seat
+            // 0 included when the human flies another seat.
+            Some(Killer::Rival(s as u8))
         };
         let mut t = tag;
         for _ in 0..8 {

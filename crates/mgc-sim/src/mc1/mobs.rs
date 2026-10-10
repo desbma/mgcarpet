@@ -1455,7 +1455,7 @@ impl Gen {
     /// no live wizard.
     fn wizard_slot_of(&self, id: u16) -> Option<usize> {
         if id == PLAYER_TARGET {
-            return Some(0);
+            return Some(self.human_seat() as usize);
         }
         self.rival_ents.iter().position(|&e| e != 0 && e == id)
     }
@@ -1465,7 +1465,7 @@ impl Gen {
     /// 0 for a non-wizard tag.
     pub(crate) fn village_wanted(&self, id: u16) -> i16 {
         match self.wizard_slot_of(id) {
-            Some(0) => self.player_aggro,
+            Some(s) if s == self.human_seat() as usize => self.player_aggro,
             Some(s) => self.rival_wanted[s],
             None => 0,
         }
@@ -1483,7 +1483,7 @@ impl Gen {
             );
         }
         match self.wizard_slot_of(id) {
-            Some(0) => self.player_aggro = 200,
+            Some(s) if s == self.human_seat() as usize => self.player_aggro = 200,
             Some(s) => self.rival_wanted[s] = 200,
             None => {}
         }

@@ -1226,6 +1226,16 @@ pub(crate) struct Gen {
     /// highest pool slot". Like the guard register it lives on the
     /// WIZARD and outlives the castle.
     pub(crate) mc1_balloon_reg: Mc1BalloonReg,
+    /// The wizard seat (player colour, retail's wizext `+48`) the
+    /// human flies — retail's LOCAL index (MC1 `var_u16_8`, MC2
+    /// `LevelIndex_0xc`): 0 in every retail single-player game, the
+    /// NetBIOS node index in a network one. Retail's `sub_3DD50` /
+    /// `sub_53160` make every OTHER seat an AI in single-player, so a
+    /// nonzero seat puts a rival in seat 0. The out-of-pool human
+    /// keeps its [`crate::mc1::mobs::PLAYER_TARGET`] owner tag; the
+    /// tag resolves to THIS seat. Set once at level build
+    /// ([`crate::engine::world::World::set_human_seat`]).
+    pub(crate) human_seat: HumanSeat,
     /// Global LCG (`rand_4`), = the level seed at scan time.
     pub(crate) rand: u32,
     /// Terrain-retile LCG (`pseudoRand`), u16 stream.
@@ -2023,6 +2033,21 @@ impl std::hash::Hash for Mc2Recycle {
         // telemetry — hash-silent.
         if !self.stack.is_empty() {
             self.stack.hash(state);
+        }
+    }
+}
+
+/// The human's wizard seat ([`Gen::human_seat`]). Hashes to NOTHING
+/// at seat 0 — every retail single-player world — so no golden moves;
+/// a nonzero seat writes a tag and the seat.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct HumanSeat(pub u8);
+
+impl std::hash::Hash for HumanSeat {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        if self.0 != 0 {
+            state.write_u8(0xE7);
+            state.write_u8(self.0);
         }
     }
 }
@@ -5879,6 +5904,7 @@ impl Gen {
             mc1_pinned: Mc1Pinned(0),
             mc1_guard_reg: Mc1GuardReg::default(),
             mc1_balloon_reg: Mc1BalloonReg::default(),
+            human_seat: HumanSeat::default(),
             rand: seed,
             pseudo,
             crt_rand: CrtRand(1),
@@ -9755,11 +9781,17 @@ impl Gen {
         }
     }
 
-    /// A wizard owner tag's team slot: PLAYER_TARGET = 0, a rival's
+    /// The human's wizard seat — see [`Gen::human_seat`].
+    pub(crate) fn human_seat(&self) -> u8 {
+        self.human_seat.0
+    }
+
+    /// A wizard owner tag's team slot: PLAYER_TARGET = the human's
+    /// seat ([`Gen::human_seat`], 0 in retail single-player), a rival's
     /// entity slot = its player slot (wizext var_48 in the original).
     pub(crate) fn owner_team(&self, owner: u16) -> Option<u8> {
         if owner == crate::mc1::mobs::PLAYER_TARGET {
-            return Some(0);
+            return Some(self.human_seat.0);
         }
         (owner != 0)
             .then(|| self.rival_ents.iter().position(|&e| e == owner))
@@ -9778,7 +9810,7 @@ impl Gen {
             return self.banked_houses;
         }
         match self.owner_team(owner) {
-            Some(0) => self.banked_houses,
+            Some(t) if t == self.human_seat.0 => self.banked_houses,
             Some(t) => self.rival_banked_houses[t as usize],
             None => 0,
         }
@@ -12729,6 +12761,7 @@ impl Gen {
             mc1_pinned: _,
             mc1_guard_reg,
             mc1_balloon_reg,
+            human_seat,
             // Rebuilt at every tick top — never saved.
             ball_chain: _,
             wiz_chain: _,
@@ -12791,6 +12824,7 @@ impl Gen {
         w.put(mc2_castle_research);
         w.put(&mc1_guard_reg.0);
         w.put(&mc1_balloon_reg.0);
+        w.put(&human_seat.0);
     }
 
     pub(crate) fn snap_apply(&mut self, r: &mut Reader) -> Result<(), SnapshotError> {
@@ -12844,6 +12878,7 @@ impl Gen {
         self.mc2_castle_research = r.get()?;
         self.mc1_guard_reg.0 = r.get()?;
         self.mc1_balloon_reg.0 = r.get()?;
+        self.human_seat.0 = r.get()?;
         // Presentation feed — never saved, never inherited across a
         // load.
         self.bolt_fx.0.clear();

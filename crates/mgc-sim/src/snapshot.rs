@@ -158,7 +158,10 @@ const MAGIC: u32 = 0x5343_474D;
 ///     toast stack, `World::notifications`) — toasts are presentation,
 ///     and a resume starts with none on screen (player ruling
 ///     2026-09-26).
-pub const SNAPSHOT_VERSION: u32 = 28;
+/// 29: `Gen::human_seat` — the wizard seat the human flies (0 in
+///     every retail single-player world; a nonzero seat makes seat 0
+///     a rival). Joins the Gen stream after `mc1_balloon_reg`.
+pub const SNAPSHOT_VERSION: u32 = 29;
 
 /// Why a snapshot could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
