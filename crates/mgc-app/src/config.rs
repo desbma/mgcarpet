@@ -529,14 +529,16 @@ pub struct RenderEnhancement {
     /// segment_depth_keys`). Presentation only. DEFAULTS ON with the
     /// Visuals preset (player design 2026-10-05); Classic = off.
     pub segment_order: bool,
-    /// Entities render interpolated between the last two sim ticks —
-    /// the camera's one-tick lerp timeline extended to the world —
-    /// so movement is frame-smooth at any fps instead of stepping at
-    /// tick rate (rapid-fire streams stop looking stationary).
-    /// Presentation only: the sim is untouched, poses pair across
-    /// snapshots by (slot, generation), teleports snap. DEFAULTS ON
-    /// (deliberate default-on deviation) — toggle off in the menu for
-    /// the tick-stepped retail look.
+    /// The view and the entities render interpolated between the last
+    /// two sim ticks, so movement is frame-smooth at any fps instead
+    /// of stepping at tick rate (rapid-fire streams stop looking
+    /// stationary). OFF pins the frame's lerp fraction to the current
+    /// tick for the camera AND the world together (since 2026-10-10;
+    /// before that only the entities snapped while the camera kept
+    /// gliding). Presentation only: the sim is untouched, poses pair
+    /// across snapshots by (slot, generation), teleports snap.
+    /// DEFAULTS ON (deliberate default-on deviation) — toggle off in
+    /// the menu for the tick-stepped retail look.
     pub smooth_motion: bool,
     /// HUD transparency (the top-strip panels + radar blend over the
     /// sky). MC1 always draws the HUD translucent; MC2 adds a toggle

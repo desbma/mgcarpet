@@ -7223,7 +7223,19 @@ impl App {
             }
         }
 
-        let alpha = self.accumulator / TICK_DT;
+        // The frame's sub-tick lerp fraction — EVERY frame-time lerp
+        // below (camera position/yaw/aim/roll, rival tags, crosshair
+        // blink, entity poses) reads this one value. With smooth
+        // motion OFF it is pinned to the CURRENT tick, so the view
+        // steps at tick rate together with the world, as retail drew
+        // it. (Until 2026-10-10 only the entity poses were gated and
+        // the camera kept gliding: a stepped world under a smooth,
+        // half-a-tick-behind camera — the disparity the player saw.)
+        let alpha = if self.cfg.render.enhancement.smooth_motion {
+            self.accumulator / TICK_DT
+        } else {
+            1.0
+        };
         // Stale snapshots die with the toggle; the pass below
         // re-sets the renderer's drawables at this frame's
         // lerp fraction (sync_world set the tick-rate ones).

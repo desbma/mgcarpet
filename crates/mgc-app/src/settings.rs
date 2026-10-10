@@ -1122,16 +1122,17 @@ pub fn registry() -> Vec<Spec> {
                 on: c.render.enhancement.smooth_motion,
                 faithful: false,
             },
-            desc: "Entities move frame-smooth: rendered interpolated between \
-                   the last two sim ticks (the camera always has been), so \
-                   movement glides at any fps instead of stepping at tick \
-                   rate. Presentation only — the simulation is untouched; \
-                   the displayed world runs one tick (~40 ms) behind.",
+            desc: "The view and the world move frame-smooth: rendered \
+                   interpolated between the last two sim ticks, so movement \
+                   glides at any fps instead of stepping at tick rate. Off, \
+                   camera and entities alike step at tick rate. Presentation \
+                   only — the simulation is untouched; the displayed world \
+                   runs one tick (~40 ms) behind.",
             ctl: Ctl::Toggle {
                 set: |c, v| c.render.enhancement.smooth_motion = v,
                 descs: [
-                    "Entities step at sim tick rate, as retail drew them.",
-                    "Entities glide — per-frame interpolation (default).",
+                    "View and entities step at sim tick rate, as retail drew them.",
+                    "View and entities glide — per-frame interpolation (default).",
                 ],
             },
         },
