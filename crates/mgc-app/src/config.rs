@@ -606,13 +606,13 @@ pub struct RenderEnhancement {
     /// Nothing is drawn in the world view. Presentation only.
     pub map_beyond_sight_areas: bool,
     /// Procedural fire (fireball flame/trail, meteor crater walls +
-    /// smoke, shockwave) vs the retail sprites. Defaults to classic
-    /// for now. Needs smooth_motion for the frame-rate flame; with
-    /// smooth_motion off the classic sprites draw regardless.
+    /// smoke, shockwave) vs the retail sprites. Independent of
+    /// smooth_motion (since 2026-10-10): with smooth motion off the
+    /// flame anchors to tick poses and steps with the world.
     pub fire: FireEffects,
     /// Procedural lightning (fractal branched bolt with a strike
-    /// envelope) vs the retail zigzag flash sprites. Defaults to
-    /// classic. Needs smooth_motion like fire.
+    /// envelope) vs the retail zigzag flash sprites. Independent of
+    /// smooth_motion like fire.
     pub lightning: LightningEffects,
     /// MC2's level exit, filmed (deliberate deviation, player design
     /// 2026-09-24): when the ending sequence seizes the carpet, the

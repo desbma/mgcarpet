@@ -2072,8 +2072,9 @@ struct Session {
     /// The last two sim-tick pose snapshots (smooth_motion): the
     /// renderer draws entities lerped prev→cur at the frame's
     /// accumulator fraction — the same one-tick-behind timeline the
-    /// camera has always run (`prev_flyer`). Empty while the toggle
-    /// is off or fewer than two ticks have run.
+    /// camera has always run (`prev_flyer`) — and the enhanced
+    /// fire/lightning emitters read them whatever the toggle says.
+    /// Empty until two ticks have run.
     pose_prev: Vec<mgc_sim::engine::world::LivePose>,
     pose_cur: Vec<mgc_sim::engine::world::LivePose>,
     /// PROTOTYPE fire effect: the render-side blast ledger — tracks
@@ -4809,9 +4810,9 @@ impl App {
     /// live lerp window) or until two ticks have run since the
     /// toggle/level armed it.
     /// Is the procedural fire active? The `render.enhancement.fire`
-    /// option, but it also needs smooth_motion (the flame is built on
-    /// the interpolated pose timeline) — with smooth_motion off the
-    /// classic sprites draw regardless of the option.
+    /// option. Independent of smooth_motion since 2026-10-10: with the
+    /// toggle off the flame anchors to tick poses (alpha pinned to 1)
+    /// and steps with the world, its flicker still on the frame clock.
     /// The filmed MC2 exit's view of the ending sequence
     /// (`render.enhancement.mc2_fancy_exit`): Some while the sequence
     /// runs AND the option is on.
@@ -4846,15 +4847,12 @@ impl App {
 
     fn enhanced_fire(&self) -> bool {
         self.cfg.render.enhancement.fire == config::FireEffects::Enhanced
-            && self.cfg.render.enhancement.smooth_motion
     }
 
     /// Is the procedural lightning active? Same law as
-    /// [`App::enhanced_fire`]: the option, gated on smooth_motion
-    /// (the strike envelope runs on the interpolated timeline).
+    /// [`App::enhanced_fire`]: the option alone.
     fn enhanced_lightning(&self) -> bool {
         self.cfg.render.enhancement.lightning == config::LightningEffects::Enhanced
-            && self.cfg.render.enhancement.smooth_motion
     }
 
     fn apply_smooth_motion(&mut self, alpha: f32) {
@@ -4925,6 +4923,39 @@ impl App {
             shrink_portal(&mut billboards, portal, k);
         }
         r.set_billboards(billboards);
+        if self.cfg.render.debug.health_bars {
+            r.set_health_bars(entities::health_bars_from_poses(
+                sess.level.game,
+                &poses,
+                dims,
+            ));
+        }
+        if self.cfg.render.preference.light_sources
+            && sess.level.mc2_env != entities::Mc2MapEnv::Day
+        {
+            r.set_lights(&entities::lights_from_poses(&poses));
+        }
+    }
+
+    /// The enhanced-effects pass: the procedural fire particles and
+    /// lightning bolts, rebuilt every frame from the pose pair and the
+    /// ledgers at this frame's lerp fraction. Runs whatever the
+    /// smooth-motion toggle says (with it off, alpha is pinned to 1 by
+    /// the caller, so flame and bolt geometry step with the world while
+    /// flicker and dapple keep the frame clock). Skipped while paused —
+    /// the fire freezes under the pause menu, as before — and until two
+    /// ticks have run (the paused option flip in `sync_world` covers
+    /// the in-menu swap).
+    fn apply_effects(&mut self, alpha: f32) {
+        let Some(sess) = self.session.as_deref() else {
+            return;
+        };
+        if self.paused || sess.pose_prev.is_empty() || sess.pose_cur.is_empty() {
+            return;
+        }
+        let enhanced_fire = self.enhanced_fire();
+        let enhanced_lightning = self.enhanced_lightning();
+        let Some(r) = &mut self.renderer else { return };
         // Enhanced fire: the procedural crater (walls + smoke) goes
         // FIRST so it wins density-cap slots; then the velocity-aware
         // projectile/impact particles, then the shockwave ring (all
@@ -4968,18 +4999,6 @@ impl App {
             ));
         } else {
             r.set_bolt_segments(Vec::new());
-        }
-        if self.cfg.render.debug.health_bars {
-            r.set_health_bars(entities::health_bars_from_poses(
-                sess.level.game,
-                &poses,
-                dims,
-            ));
-        }
-        if self.cfg.render.preference.light_sources
-            && sess.level.mc2_env != entities::Mc2MapEnv::Day
-        {
-            r.set_lights(&entities::lights_from_poses(&poses));
         }
     }
 
@@ -7108,7 +7127,12 @@ impl App {
                     .unwrap_or_default();
                 sess.bolts.update(strikes, 1.0);
             }
-            if self.cfg.render.enhancement.smooth_motion {
+            // Taken EVERY tick, whatever the smooth-motion toggle:
+            // the pose pair feeds the smooth pass AND the enhanced
+            // fire/lightning emitters (`apply_effects`), which run
+            // with smooth motion off too (player 2026-10-10 — the
+            // effects were needlessly tied to the toggle).
+            {
                 let sess = sess!(self);
                 if let Some(w) = &sess.sim.world {
                     sess.pose_prev = std::mem::take(&mut sess.pose_cur);
@@ -7236,17 +7260,12 @@ impl App {
         } else {
             1.0
         };
-        // Stale snapshots die with the toggle; the pass below
-        // re-sets the renderer's drawables at this frame's
-        // lerp fraction (sync_world set the tick-rate ones).
-        if !self.cfg.render.enhancement.smooth_motion {
-            let sess = sess!(self);
-            if !sess.pose_cur.is_empty() {
-                sess.pose_prev = Vec::new();
-                sess.pose_cur = Vec::new();
-            }
-        }
+        // The smooth pass re-sets the renderer's world drawables at
+        // this frame's lerp fraction (sync_world set the tick-rate
+        // ones; with the toggle off those stand). The effects pass
+        // runs either way.
         self.apply_smooth_motion(alpha);
+        self.apply_effects(alpha);
         let sess = sess_ref!(self);
         let (a, b) = (&sess.prev_flyer, &sess.sim.flyer);
         // Positions may wrap across the 256-tile seam; take the
