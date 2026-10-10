@@ -3,6 +3,7 @@
 //! release every disposition, tick with the player parked near the
 //! m27 tree, and report chain populations, class-9 launches, sounds
 //! and the misfit ledger.
+use mgc_sim::Hx;
 use mgc_sim::engine::features::FeatureAssets;
 use mgc_sim::engine::features::Planes;
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
@@ -86,12 +87,12 @@ fn main() {
 
     // Park near the m27 body (the most complex chain).
     let anchor = w
-        .live_poses()
+        .live_poses(Hx::FIRST)
         .iter()
         .find(|p| p.class == 5 && p.model == 27)
         .map(|p| (p.x, p.z));
     let anchor = anchor.or_else(|| {
-        w.live_poses()
+        w.live_poses(Hx::FIRST)
             .iter()
             .find(|p| p.class == 5 && p.model == 22)
             .map(|p| (p.x, p.z))
@@ -108,10 +109,10 @@ fn main() {
         let yaw = (t as f32 * 0.01) % std::f32::consts::TAU;
         let pose = PlayerPose::from_tiles(x, alt, z, yaw, 0.0, 0.0);
         w.tick(pose, idle);
-        for s in &w.take_audio(pose).events {
+        for s in &w.take_audio(Hx::FIRST, pose).events {
             *sounds.entry(s.id).or_insert(0u32) += 1;
         }
-        for p in w.live_poses() {
+        for p in w.live_poses(Hx::FIRST) {
             if p.class == 9 {
                 *c9.entry(p.model).or_insert(0u32) += 1;
             }
@@ -122,7 +123,7 @@ fn main() {
         if t % 300 == 299 {
             let mut counts: std::collections::BTreeMap<(u8, u8), usize> =
                 std::collections::BTreeMap::new();
-            for p in w.live_poses() {
+            for p in w.live_poses(Hx::FIRST) {
                 if p.class == 5 && matches!(p.model, 0 | 3 | 22 | 27) {
                     *counts.entry((p.model, 0)).or_insert(0) += 1;
                 }

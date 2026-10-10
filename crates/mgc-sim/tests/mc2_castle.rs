@@ -10,6 +10,7 @@
 //!
 //! Self-skips without baked mc2 data (game data is optional).
 
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
 use mgc_sim::ids::GameId;
@@ -103,7 +104,7 @@ fn mc2_castle_tier1_cast_grows_fire_turrets() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = clear_spot(&w);
     let px = cx as f32 + 0.5;
     let pz = cy as f32 + 16.5;
@@ -111,7 +112,7 @@ fn mc2_castle_tier1_cast_grows_fire_turrets() {
     let pose = PlayerPose::from_tiles(px, alt, pz, 0.0, 0.0, 0.0);
 
     // Bind the castle spell at TIER 1 (fire) and build.
-    w.mc2_select_spell(2, 1, 0);
+    w.mc2_select_spell(Hx::FIRST, 2, 1, 0);
     w.tick(
         pose,
         PlayerCommand {
@@ -122,7 +123,7 @@ fn mc2_castle_tier1_cast_grows_fire_turrets() {
     for _ in 0..120 {
         w.tick(pose, PlayerCommand::default());
     }
-    let (_, _, lvl) = w.loadout().castle.expect("castle stands");
+    let (_, _, lvl) = w.loadout(Hx::FIRST).castle.expect("castle stands");
     assert_eq!(lvl, 1, "level-1 castle built");
     assert_eq!(
         count(&w, 10, 79),
@@ -142,7 +143,7 @@ fn mc2_castle_tier1_cast_grows_fire_turrets() {
     for _ in 0..220 {
         w.tick(pose, PlayerCommand::default());
     }
-    let (_, _, lvl2) = w.loadout().castle.expect("castle survives");
+    let (_, _, lvl2) = w.loadout(Hx::FIRST).castle.expect("castle survives");
     assert_eq!(lvl2, 2, "upgraded to level 2");
     assert_eq!(count(&w, 10, 79), 4, "level 2 grows the 4-turret ring");
 
@@ -201,7 +202,9 @@ fn mc2_level000_ending_end_to_end() {
         .find(|e| e.class == 14 && e.model == 3 && e.life >= 0)
         .expect("dis 4 spawns the (14,3) fly-to marker");
     assert!(
-        !w.live_poses().iter().any(|p| p.class == 14 && p.model == 3),
+        !w.live_poses(Hx::FIRST)
+            .iter()
+            .any(|p| p.class == 14 && p.model == 3),
         "the ending marker spawns HIDDEN (not drawable) until the trip"
     );
     eprintln!(
@@ -215,7 +218,7 @@ fn mc2_level000_ending_end_to_end() {
     let mut seized_at = None;
     for t in 0..40 {
         w.tick(pose, PlayerCommand::default());
-        if w.mc2_end_pose().is_some() {
+        if w.mc2_end_pose(Hx::FIRST).is_some() {
             seized_at = Some(t);
             break;
         }
@@ -225,7 +228,9 @@ fn mc2_level000_ending_end_to_end() {
         "the trigger trip seizes the flyer (endGameSeq installs)"
     );
     assert!(
-        w.live_poses().iter().any(|p| p.class == 14 && p.model == 3),
+        w.live_poses(Hx::FIRST)
+            .iter()
+            .any(|p| p.class == 14 && p.model == 3),
         "the trip REVEALS the fly-to marker"
     );
     assert!(!w.won(), "the trip alone must not end the level");
@@ -238,7 +243,9 @@ fn mc2_level000_ending_end_to_end() {
         }
     }
     assert!(won_at.is_some(), "the fly-in ends the level (won)");
-    let (ex, _, ez, _) = w.mc2_end_pose().expect("pose holds through the end");
+    let (ex, _, ez, _) = w
+        .mc2_end_pose(Hx::FIRST)
+        .expect("pose holds through the end");
     let d = ((ex - (marker.tx as f32)).powi(2) + (ez - (marker.ty as f32)).powi(2)).sqrt();
     assert!(
         d < 4.0,
@@ -256,7 +263,7 @@ fn mc2_castle_builds_upgrades_and_demolishes() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
 
     let (cx, cy) = clear_spot(&w);
     let px = cx as f32 + 0.5;
@@ -286,7 +293,7 @@ fn mc2_castle_builds_upgrades_and_demolishes() {
     // The NATIVE castle cast: bind the MC2 castle spell (index 2,
     // dev-granted above) — the MC1 equip bridge does NOT cast on the
     // MC2 column (else ghost fireballs).
-    w.mc2_select_spell(2, 0, 0);
+    w.mc2_select_spell(Hx::FIRST, 2, 0, 0);
     w.tick(
         pose,
         PlayerCommand {
@@ -315,7 +322,7 @@ fn mc2_castle_builds_upgrades_and_demolishes() {
     // THE LADDER DISCRIMINATOR: MC2 level-1 capacity = 8500
     // (sub_60810 EF:61710) — MC1's rung is 10000. A bridge castle
     // still running the MC1 column would report 10000 here.
-    let (_, cap1, lvl1) = w.loadout().castle.expect("castle panel data");
+    let (_, cap1, lvl1) = w.loadout(Hx::FIRST).castle.expect("castle panel data");
     assert_eq!(
         (lvl1, cap1),
         (1, 8_500),
@@ -342,7 +349,10 @@ fn mc2_castle_builds_upgrades_and_demolishes() {
     for _ in 0..200 {
         w.tick(pose, PlayerCommand::default());
     }
-    let (_, cap2, lvl2) = w.loadout().castle.expect("castle survives the upgrade");
+    let (_, cap2, lvl2) = w
+        .loadout(Hx::FIRST)
+        .castle
+        .expect("castle survives the upgrade");
     assert_eq!(
         (lvl2, cap2),
         (2, 18_000),
@@ -367,16 +377,19 @@ fn mc2_castle_builds_upgrades_and_demolishes() {
         for _ in 0..220 {
             w.tick(pose, PlayerCommand::default());
         }
-        let (_, _, lvl) = w.loadout().castle.expect("castle survives the upgrade");
+        let (_, _, lvl) = w
+            .loadout(Hx::FIRST)
+            .castle
+            .expect("castle survives the upgrade");
         assert_eq!(lvl, expect as u8, "recast raised level {expect}");
     }
-    let (_, cap6, _) = w.loadout().castle.expect("castle at level 6");
+    let (_, cap6, _) = w.loadout(Hx::FIRST).castle.expect("castle at level 6");
     assert_eq!(cap6, 317_400, "the MC2 level-6 capacity rung");
     // Each upgrade awards +1 castle XP (`sub_6D8B0(owner,2,1)`
     // EF:61596) — five upgrades landed above (2..=6), so the ladder
     // that unlocks Fire/Lightning Tower tiers has climbed, and the XP
     // drain's spell-2 branch keeps the pane cost synced.
-    let book = w.mc2_book_view();
+    let book = w.mc2_book_view(Hx::FIRST);
     assert!(
         book.xp[2] >= 5,
         "castle upgrades awarded spell-2 XP (got {})",
@@ -414,7 +427,10 @@ fn mc2_castle_builds_upgrades_and_demolishes() {
     for _ in 0..60 {
         w.tick(pose, PlayerCommand::default());
     }
-    let (_, cap_d, lvl_d) = w.loadout().castle.expect("castle survives one demolish");
+    let (_, cap_d, lvl_d) = w
+        .loadout(Hx::FIRST)
+        .castle
+        .expect("castle survives one demolish");
     assert_eq!(
         (lvl_d, cap_d),
         (5, 158_200),
@@ -472,8 +488,8 @@ fn mc2_castle_cost_refreshes_on_downgrade() {
     };
     // Earned, not lent: the dev cheat is an OVERLAY and its
     // toggle-off below takes back every spell it minted.
-    w.mc2_grant_start_book(&[2]);
-    w.set_dev_spells(true);
+    w.mc2_grant_start_book(Hx::FIRST, &[2]);
+    w.set_dev_spells(Hx::FIRST, true);
 
     let (cx, cy) = clear_spot(&w);
     let px = cx as f32 + 0.5;
@@ -482,7 +498,7 @@ fn mc2_castle_cost_refreshes_on_downgrade() {
     let pose = PlayerPose::from_tiles(px, alt, pz, 0.0, 0.0, 0.0);
 
     // Build to level 2 under the dev instrument (gate bypassed).
-    w.mc2_select_spell(2, 0, 0);
+    w.mc2_select_spell(Hx::FIRST, 2, 0, 0);
     w.tick(
         pose,
         PlayerCommand {
@@ -504,15 +520,15 @@ fn mc2_castle_cost_refreshes_on_downgrade() {
     for _ in 0..220 {
         w.tick(pose, PlayerCommand::default());
     }
-    let (_, _, lvl) = w.loadout().castle.expect("castle stands");
+    let (_, _, lvl) = w.loadout(Hx::FIRST).castle.expect("castle stands");
     assert_eq!(lvl, 2, "harness built to level 2");
 
     // Real-mana mode; the re-select recomputes the honest level-2
     // cache: the NEXT build (level 3) = ladder rung 20000.
-    w.set_dev_spells(false);
-    w.mc2_select_spell(2, 0, 0);
+    w.set_dev_spells(Hx::FIRST, false);
+    w.mc2_select_spell(Hx::FIRST, 2, 0, 0);
     assert_eq!(
-        w.debug_spell_gate_cost(2),
+        w.debug_spell_gate_cost(Hx::FIRST, 2),
         Some(20_000),
         "at level 2 the cached gate cost is the level-3 rung"
     );
@@ -542,19 +558,22 @@ fn mc2_castle_cost_refreshes_on_downgrade() {
     for _ in 0..90 {
         w.tick(pose, PlayerCommand::default());
     }
-    let (_, _, lvl) = w.loadout().castle.expect("castle survives the demolish");
+    let (_, _, lvl) = w
+        .loadout(Hx::FIRST)
+        .castle
+        .expect("castle survives the demolish");
     assert_eq!(lvl, 1, "one demolish = one level down");
 
     // The cache must track the live law back DOWN to the level-2 rung
     // with NO re-select in between (a stale higher rung would ding an
     // affordable rebuild).
     assert_eq!(
-        w.mc2_book_view().cost[2],
+        w.mc2_book_view(Hx::FIRST).cost[2],
         10_000,
         "the live law prices the level-2 rebuild at the level-1 rung"
     );
     assert_eq!(
-        w.debug_spell_gate_cost(2),
+        w.debug_spell_gate_cost(Hx::FIRST, 2),
         Some(10_000),
         "the cached gate cost re-synced on the downgrade (no re-select)"
     );
@@ -580,8 +599,8 @@ fn mc2_castle_death_cost() {
     };
     // Earned, not lent: the dev cheat is an OVERLAY and its
     // toggle-off below takes back every spell it minted.
-    w.mc2_grant_start_book(&[2]);
-    w.set_dev_spells(true);
+    w.mc2_grant_start_book(Hx::FIRST, &[2]);
+    w.set_dev_spells(Hx::FIRST, true);
 
     let (cx, cy) = clear_spot(&w);
     let px = cx as f32 + 0.5;
@@ -590,7 +609,7 @@ fn mc2_castle_death_cost() {
     let pose = PlayerPose::from_tiles(px, alt, pz, 0.0, 0.0, 0.0);
 
     // Build to level 1 under the dev instrument.
-    w.mc2_select_spell(2, 0, 0);
+    w.mc2_select_spell(Hx::FIRST, 2, 0, 0);
     w.tick(
         pose,
         PlayerCommand {
@@ -601,14 +620,14 @@ fn mc2_castle_death_cost() {
     for _ in 0..160 {
         w.tick(pose, PlayerCommand::default());
     }
-    let (_, _, lvl) = w.loadout().castle.expect("castle stands");
+    let (_, _, lvl) = w.loadout(Hx::FIRST).castle.expect("castle stands");
     assert_eq!(lvl, 1, "harness built to level 1");
 
     // Real-mana mode; the re-select recomputes the honest level-1
     // cache: the NEXT build (level 2) = ladder rung 10000.
-    w.set_dev_spells(false);
-    w.mc2_select_spell(2, 0, 0);
-    assert_eq!(w.debug_spell_gate_cost(2), Some(10_000));
+    w.set_dev_spells(Hx::FIRST, false);
+    w.mc2_select_spell(Hx::FIRST, 2, 0, 0);
+    assert_eq!(w.debug_spell_gate_cost(Hx::FIRST, 2), Some(10_000));
 
     // Demolish level 1 -> total destruction, castle-less.
     w.tick(
@@ -621,7 +640,10 @@ fn mc2_castle_death_cost() {
     for _ in 0..90 {
         w.tick(pose, PlayerCommand::default());
     }
-    assert!(w.loadout().castle.is_none(), "the demolish razed it");
+    assert!(
+        w.loadout(Hx::FIRST).castle.is_none(),
+        "the demolish razed it"
+    );
 
     // THE +3000 RE-CAST SURCHARGE. This harness
     // demolishes at LEVEL 1 EXACTLY, the one gate that latches
@@ -634,7 +656,7 @@ fn mc2_castle_death_cost() {
     // MC1 lockout's (now retired) patch.
     let want = 4_000;
     assert_eq!(
-        w.mc2_book_view().cost[2],
+        w.mc2_book_view(Hx::FIRST).cost[2],
         want,
         "the castle-less rebuild price"
     );
@@ -644,7 +666,7 @@ fn mc2_castle_death_cost() {
     // against the MAILING castle, so the deferral to the post-walk
     // drain no longer changes the rung.
     assert_eq!(
-        w.debug_spell_gate_cost(2),
+        w.debug_spell_gate_cost(Hx::FIRST, 2),
         Some(want),
         "the death's downgrade ladder re-priced the token at the level-0 rung"
     );
@@ -669,7 +691,7 @@ fn mc2_pane_castable_reflects_castle_gate() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    let bv = w.mc2_book_view();
+    let bv = w.mc2_book_view(Hx::FIRST);
     // The CD table's own shape: the BASE fireball is requirement-free,
     // but its tier 2 carries a nonzero `maxManaLimit_A` — even
     // fireball's top tier greys castle-less.
@@ -753,7 +775,7 @@ fn a_castle_on_a_slope_leaves_no_mesa_behind() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     // A clear site whose row-1 footprint genuinely SLOPES — the whole
     // point is that mean != min there. `clear_spot` happily returns
     // dead-flat ground, where the old mean datum equalled the min and
@@ -779,7 +801,7 @@ fn a_castle_on_a_slope_leaves_no_mesa_behind() {
     let pose = PlayerPose::from_tiles(px, alt, pz, 0.0, 0.0, 0.0);
     let before: Vec<u8> = w.planes().height.to_vec();
 
-    w.mc2_select_spell(2, 0, 0);
+    w.mc2_select_spell(Hx::FIRST, 2, 0, 0);
     w.tick(
         pose,
         PlayerCommand {
@@ -856,7 +878,7 @@ fn a_rising_castle_executes_what_stands_under_it() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = clear_spot(&w);
     let px = cx as f32 + 0.5;
     let pz = cy as f32 + 16.5;
@@ -878,7 +900,7 @@ fn a_rising_castle_executes_what_stands_under_it() {
         .unwrap()
         .id24;
     assert_eq!(own_id, 900, "the victim is owned by the stranger");
-    let friend = w.debug_mc2_spawn_creature(19, cx, cy, 0xFFFF /* PLAYER_TARGET */);
+    let friend = w.debug_mc2_spawn_creature(19, cx, cy, w.human_tag(Hx::FIRST));
     assert!(friend != 0, "the friendly creature spawned");
 
     let alive = |w: &World, slot: usize| {
@@ -889,7 +911,7 @@ fn a_rising_castle_executes_what_stands_under_it() {
     };
     assert!(alive(&w, victim) && alive(&w, immune) && alive(&w, friend));
 
-    w.mc2_select_spell(2, 0, 0);
+    w.mc2_select_spell(Hx::FIRST, 2, 0, 0);
     w.tick(
         pose,
         PlayerCommand {
@@ -956,13 +978,13 @@ fn the_mc2_castle_ball_mints_on_mc2s_own_creator_unarmed_and_banks_the_charge() 
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = clear_spot(&w);
     let px = cx as f32 + 0.5;
     let pz = cy as f32 + 16.5;
     let alt = w.ground_height_tiles(px, pz) + 2.0;
     let pose = PlayerPose::from_tiles(px, alt, pz, 0.0, 0.0, 0.0);
-    w.mc2_select_spell(2, 0, 0);
+    w.mc2_select_spell(Hx::FIRST, 2, 0, 0);
 
     // Idle well past the meter's 200 cap so the bank is unambiguous.
     for _ in 0..240 {

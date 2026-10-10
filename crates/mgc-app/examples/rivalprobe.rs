@@ -1,4 +1,5 @@
 //! Headless rival smoke probe: real baked level, 6000 ticks.
+use mgc_sim::Hx;
 use std::path::Path;
 
 fn main() {
@@ -82,7 +83,7 @@ fn main() {
                     castle
                 );
             }
-            let poses = w.live_poses();
+            let poses = w.live_poses(Hx::FIRST);
             let castles = poses
                 .iter()
                 .filter(|p| p.class == 3 && p.model == 2)

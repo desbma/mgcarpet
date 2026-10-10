@@ -28,7 +28,7 @@ use super::behavior::BEHAVIOR;
 use super::sprite_params::SPRITE_PARAMS;
 use crate::engine::features::Gen;
 use crate::mc1::combat::MailTarget;
-use crate::mc1::mobs::{MobCtx, PLAYER_TARGET};
+use crate::mc1::mobs::MobCtx;
 
 /// The whirlwind's victim GRAB latch (retail byte[3] & 0x10, dword
 /// 0x1000_0000) — a free high bit next to the mobs.rs MC2 band.
@@ -426,6 +426,24 @@ pub(crate) fn note_whirl_cranks(n: u8) {
     }
 }
 
+/// One human seat's state across a whirlwind's ring walk
+/// ([`Gen::mc2_whirlwind_lift`]).
+#[derive(Clone, Copy)]
+struct WwSeat {
+    hx: crate::engine::world::Hx,
+    cs: usize,
+    human_law: bool,
+    hp: (u16, u16, i16),
+    hyaw: u16,
+    hgrab: bool,
+    hstop: bool,
+    hseized: bool,
+    hmid: Option<u16>,
+    hact80: bool,
+    hvisited: bool,
+    hcrank: u8,
+}
+
 impl Gen {
     // ---- ctors ---------------------------------------------------------------
 
@@ -782,7 +800,7 @@ impl Gen {
         // The scorch-ring batch XP (sub_31FB0 EF:23521-25): f40 (the
         // retail word_0x26_38 stamp) discriminates the owning spell —
         // 15 = Earthquake (17), 11 = Crater (16). Human only (F3).
-        if hits != 0 && self.ent[i].id24 == crate::mc1::mobs::PLAYER_TARGET {
+        if hits != 0 && self.is_human_tag(self.ent[i].id24) {
             let spell = match self.ent[i].f40 {
                 15 => Some(17u16),
                 11 => Some(16u16),
@@ -1415,7 +1433,7 @@ impl Gen {
             let leader = self.ent[i].f146;
             let pitch = match leader {
                 0 => None,
-                PLAYER_TARGET => Some(self.mc2_params_ext(44).0 / 2),
+                ht if self.is_human_tag(ht) => Some(self.mc2_params_ext(44).0 / 2),
                 v => ((v as usize) < self.ent.len()).then(|| self.ent[v as usize].f80),
             };
             if let Some(p) = pitch {
@@ -1461,10 +1479,15 @@ impl Gen {
         let leader = self.ent[i].f146;
         let mut leader_dead = false;
         if leader != 0 {
-            if leader == PLAYER_TARGET {
+            if let Some(hx) = self.hx_of_tag(leader) {
                 let off = (self.mc2_params_ext(44).1 / 2) as i16;
-                self.move_relink(i, ctx.px, ctx.py, ctx.pz.wrapping_add(off));
-                leader_dead = ctx.pdead;
+                self.move_relink(
+                    i,
+                    self.seat_at(ctx, hx).0,
+                    self.seat_at(ctx, hx).1,
+                    self.seat_at(ctx, hx).2.wrapping_add(off),
+                );
+                leader_dead = self.seat_dead(ctx, hx);
             } else if (leader as usize) < self.ent.len() {
                 let v = leader as usize;
                 let (vx, vy, vz, dead) = {
@@ -1653,7 +1676,7 @@ impl Gen {
                     let amt = self.ent[i].f140 as u32;
                     let hits = self.area_write(i, 0, amt, ctx, false, false);
                     // Tremor batch XP (sub_3A2D0 EF:29580).
-                    if hits != 0 && self.ent[i].id24 == crate::mc1::mobs::PLAYER_TARGET {
+                    if hits != 0 && self.is_human_tag(self.ent[i].id24) {
                         self.mc2_cast_xp.0.push((self.ent[i].id24, 15, hits as i32));
                     }
                 }
@@ -1853,39 +1876,55 @@ impl Gen {
         // 6946` = one 9377/9439 step). ONLY the pose rides a channel —
         // `Gen::player_whirl` — because the carpet's x/y/z/yaw live in
         // `flight::Mc1State`, not in the pool record.
-        let cs = self.mc2_pinned.0 as usize;
-        // `sub_33810` case 1 (EF:24473): your OWN funnel never grabs
-        // you. `id24` on a whirlwind head is the caster's id.
-        // ⚠ `MGC_NO_MC2_WW_MIDRING` is dig W4's older A/B and it takes
-        // the WHOLE human column back to the pre-W4 knock spiral, so
-        // this arm stands down under it too — the two switches are a
-        // ladder, not independent axes.
-        let human_law = !no_mc2_ww_human_grab()
-            && !no_mc2_ww_midring()
-            && cs != 0
-            && cs < self.ent.len()
-            && id != PLAYER_TARGET;
+        // Every human seat's own state for this funnel (`WwSeat`): his
+        // pinned record `cs` (the grab latch, mover veto, swirl and rand
+        // homes), whether the grab law applies to him, and his visits.
         let hrow = if self.is_cave() {
             crate::flight::Mc2Row::CAVE
         } else {
             crate::flight::Mc2Row::OPEN
         };
-        let mut hp = (ctx.px, ctx.py, ctx.pz);
-        let mut hyaw = ctx.pyaw & 0x7FF;
-        let mut hgrab = human_law && self.ent[cs].flags & F_GRABBED != 0;
-        let mut hstop = false;
-        // Any GRAB-FAMILY visit this tick (inner lift / near-grab /
-        // far-grab). The mid ring keeps dig W4's heading+step channel.
-        let mut hseized = false;
-        let mut hmid: Option<u16> = None;
-        let mut hact80 = false;
-        // ⭐ ANY visit that survived `sub_33810` — the tail runs on all
-        // four arms, so even a far-band visit that seizes nothing is a
-        // POSITION WRITE (`CopyEntityPosition_57CF0`).
-        let mut hvisited = false;
-        // Dig Q6 — one `roll_0x155_341 += 28` per visit that reaches
-        // the `v40` block, i.e. exactly where `hact80` is raised.
-        let mut hcrank: u8 = 0;
+        let mut ws: Vec<WwSeat> = self
+            .human_tag
+            .ixs()
+            .map(|hx| {
+                let cs = self.mc2_pinned[hx].0 as usize;
+                // `sub_33810` case 1 (EF:24473): your OWN funnel never grabs
+                // you. `id24` on a whirlwind head is the caster's id.
+                // ⚠ `MGC_NO_MC2_WW_MIDRING` is dig W4's older A/B and it takes
+                // the WHOLE human column back to the pre-W4 knock spiral, so
+                // this arm stands down under it too — the two switches are a
+                // ladder, not independent axes.
+                let human_law = !no_mc2_ww_human_grab()
+                    && !no_mc2_ww_midring()
+                    && cs != 0
+                    && cs < self.ent.len()
+                    && id != self.human_tag[hx].0;
+                WwSeat {
+                    hx,
+                    cs,
+                    human_law,
+                    hp: self.seat_at(ctx, hx),
+                    hyaw: self.seat_yaw(ctx, hx) & 0x7FF,
+                    hgrab: human_law && self.ent[cs].flags & F_GRABBED != 0,
+                    // Any GRAB-FAMILY visit this tick (inner lift /
+                    // near-grab / far-grab). The mid ring keeps dig W4's
+                    // heading+step channel.
+                    hstop: false,
+                    hseized: false,
+                    hmid: None,
+                    hact80: false,
+                    // ⭐ ANY visit that survived `sub_33810` — the tail runs
+                    // on all four arms, so even a far-band visit that seizes
+                    // nothing is a POSITION WRITE (`CopyEntityPosition_57CF0`).
+                    hvisited: false,
+                    // Dig Q6 — one `roll_0x155_341 += 28` per visit that
+                    // reaches the `v40` block, i.e. exactly where `hact80`
+                    // is raised.
+                    hcrank: 0,
+                }
+            })
+            .collect();
         for (dx, dy) in self.ring_cells(0, 12) {
             let tx = (cx.wrapping_add((dx as i8) as i16)) as u8;
             let ty = (cy.wrapping_add((dy as i8) as i16)) as u8;
@@ -1909,6 +1948,8 @@ impl Gen {
             // `next == 0` is the chain TAIL, which is the old
             // after-the-chain placement and still correct.
             let mut seat_matched = false;
+            // The seat the walk met (index into `ws`).
+            let mut seat_k = 0usize;
             let mut seat_block = usize::MAX;
             let mut resume = 0usize;
             // ⚠ THE PRE-DIG (`MGC_NO_MC2_WW_HUMAN_MOVE_TEST`) ARM HAS NO
@@ -1930,13 +1971,22 @@ impl Gen {
             let mut off_arm_phantom_restart = false;
             'cell: loop {
                 while j != 0 {
-                    if human_law
-                        && !no_mc2_ww_human_chain_order()
-                        && seat_block != j
-                        && self.player_chain.next as usize == j
-                        && self.player_chain.cell
-                            == crate::engine::features::tile((hp.0 >> 8) as u8, (hp.1 >> 8) as u8)
-                    {
+                    let met = (!no_mc2_ww_human_chain_order() && seat_block != j)
+                        .then(|| {
+                            (0..ws.len()).find(|&k| {
+                                let s = &ws[k];
+                                s.human_law
+                                    && self.human_seat_at_for(s.hx, j)
+                                    && self.player_chain[s.hx].cell
+                                        == crate::engine::features::tile(
+                                            (s.hp.0 >> 8) as u8,
+                                            (s.hp.1 >> 8) as u8,
+                                        )
+                            })
+                        })
+                        .flatten();
+                    if let Some(k) = met {
+                        seat_k = k;
                         // His seat: he precedes this record. Break out,
                         // run the arm below, and come back here. ⚠ NOT a
                         // one-per-cell latch — a victim relinked in FRONT
@@ -1952,7 +2002,8 @@ impl Gen {
                     let c = &self.ent[j];
                     let victim = match c.class64 {
                         2 => matches!(c.model65, 7 | 8),
-                        3 => c.id24 != id && c.model65 != 2,
+                        // (the human's linked (3,0) record: his own arm handles him at the seat)
+                        3 => c.id24 != id && c.model65 != 2 && !self.chain_human(j),
                         5 => {
                             !matches!(c.tick70, 232 | 180)
                                 && !matches!(c.model65, 10 | 15 | 18 | 27 | 28)
@@ -2175,17 +2226,46 @@ impl Gen {
                 // 55826, `pose.z` 1270 -> 1554, `pose.yaw` 923 -> 979.
                 // `MGC_NO_MC2_WW_HUMAN_SEAT_REACHED=1` restores the
                 // unconditional tail fallback.
-                let seat_in_this_chain = self.player_chain.next != 0
-                    && self.player_chain.cell
-                        == crate::engine::features::tile((hp.0 >> 8) as u8, (hp.1 >> 8) as u8);
-                if human_law
-                    && (resume != 0
-                        || (!seat_matched
-                            && (hp.0 >> 8) as u8 == tx
-                            && (hp.1 >> 8) as u8 == ty
-                            && (no_mc2_ww_human_seat_reached() || !seat_in_this_chain)))
-                {
-                    hvisited = true;
+                // The seat met (`resume`), else every seat whose own seat
+                // is not in this chain while he stands in this ring cell.
+                let visits: Vec<usize> = if resume != 0 {
+                    vec![seat_k]
+                } else if seat_matched {
+                    Vec::new()
+                } else {
+                    (0..ws.len())
+                        .filter(|&k| {
+                            let s = &ws[k];
+                            let seat_in_this_chain = !self.human_seat_is_tail(s.hx)
+                                && self.player_chain[s.hx].cell
+                                    == crate::engine::features::tile(
+                                        (s.hp.0 >> 8) as u8,
+                                        (s.hp.1 >> 8) as u8,
+                                    );
+                            s.human_law
+                                && (s.hp.0 >> 8) as u8 == tx
+                                && (s.hp.1 >> 8) as u8 == ty
+                                && (no_mc2_ww_human_seat_reached() || !seat_in_this_chain)
+                        })
+                        .collect()
+                };
+                for k in visits {
+                    let WwSeat {
+                        hx,
+                        cs,
+                        human_law,
+                        mut hp,
+                        mut hyaw,
+                        mut hgrab,
+                        mut hstop,
+                        mut hseized,
+                        mut hmid,
+                        mut hact80,
+                        hvisited: _,
+                        mut hcrank,
+                    } = ws[k];
+
+                    let hvisited = true;
                     // ⭐⭐⭐ HIS OWN TILE AT THE HEAD OF THE ARM — the only
                     // thing `CopyEntityPosition_57CF0` compares
                     // (EF:40584, `NETHERW.EXE` 0x7c4fe/0x7c505). See the
@@ -2345,7 +2425,7 @@ impl Gen {
                     // (30182, 25792) -> (30240, 25906) — its own
                     // `sqrt(58² + 114²) = 127.9`.
                     if !no_mc2_ww_human_seat_relink() {
-                        self.player_relink(hp.0, hp.1);
+                        self.player_relink(hx, hp.0, hp.1);
                     }
                     if bill {
                         // `v39 = 1` ⇒ `v31++` and `sub_11900(a1x, ix, 0,
@@ -2358,9 +2438,9 @@ impl Gen {
                         // 10000 → 8000 across the hold.
                         hits += 1;
                         if no_whirlwind_single_bill() {
-                            self.mail_write(MailTarget::Player, 0, amt, id);
+                            self.mail_write(self.human_target(hx), 0, amt, id);
                         } else {
-                            self.mail_write_single(MailTarget::Player, 0, amt, id);
+                            self.mail_write_single(self.human_target(hx), 0, amt, id);
                         }
                     }
                     // ⭐⭐⭐ THE HUMAN IS ON THE TILE CHAIN, SO HIS RELINK
@@ -2452,6 +2532,11 @@ impl Gen {
                             // so the seat we broke out of is abandoned.
                             resume = 0;
                             j = self.map_entity[crate::engine::features::tile(ntx, nty)] as usize;
+                            // (His linked record heads that chain now: the
+                            // cursor reads HIS `+20`, the head he displaced.)
+                            if self.chain_human(j) {
+                                j = self.ent[j].next20 as usize;
+                            }
                             // ⚠ AND HE IS NOT RE-VISITED ON ARRIVAL.
                             // `AddEventToMap` puts him at the HEAD of the
                             // new chain, so retail's walker reads HIS
@@ -2463,9 +2548,38 @@ impl Gen {
                             // and hand him an extra visit: mc2l1 t=283 and
                             // mc2l30 t=2986 both break exactly that way.
                             seat_block = j;
+                            ws[k] = WwSeat {
+                                hx,
+                                cs,
+                                human_law,
+                                hp,
+                                hyaw,
+                                hgrab,
+                                hstop,
+                                hseized,
+                                hmid,
+                                hact80,
+                                hvisited,
+                                hcrank,
+                            };
                             continue 'cell;
                         }
                     }
+
+                    ws[k] = WwSeat {
+                        hx,
+                        cs,
+                        human_law,
+                        hp,
+                        hyaw,
+                        hgrab,
+                        hstop,
+                        hseized,
+                        hmid,
+                        hact80,
+                        hvisited,
+                        hcrank,
+                    };
                 }
                 // He stayed in the cell: pick the chain back up at the
                 // record his seat sits in front of.
@@ -2498,117 +2612,136 @@ impl Gen {
         // ground under (31723, 29697) is 1590 and the band lifts z
         // 1818 -> **1846**, which is retail's recorded z to the unit.
         // The port published nothing and held 1818.
-        let hpublish = hseized || hmid.is_some() || (hvisited && !no_mc2_ww_tail_publish());
-        if human_law && hpublish {
-            if hstop {
-                // `byte[1] |= 8` — consumed (and cleared) by the veto
-                // at the head of `sub_5D530` (`NETHERW.EXE` 0x81d39
-                // `mov ah,[ebx+0xd]` / `test ah,0x8` / `and dl,0xf7`),
-                // the human carpet mover. Same one-shot the rival
-                // carpet, the corpse mover, the creature core and the
-                // ball already read.
-                self.ent[cs].flags |= super::mobs::F_STOP;
-            }
-            if hgrab {
-                self.ent[cs].flags |= F_GRABBED;
-            } else {
-                self.ent[cs].flags &= !F_GRABBED;
-            }
-            // ⭐⭐⭐ THE MID RING PUBLISHES THE RESOLVED ABSOLUTE POSE.
-            // Retail's four arms all fall through to the SAME tail —
-            // `MoveEntity_57FA0(&pred, word_0x30_48, 0, v30)`, the cave
-            // clamp, `sub_580E0` and `CopyEntityPosition_57CF0`
-            // (EF:24375-95) — so the mid ring writes an absolute
-            // position with a banded z, and a ring walk that reaches
-            // the victim twice writes it twice. The heading+step
-            // channel could carry one visit and no z at all; the ring
-            // column above has already resolved every visit into
-            // `hp`/`hyaw`, so hand that over instead. (This is the
-            // `min` the Q7 note said would "come straight back out".)
-            let abs = hseized
-                || (hmid.is_some() && !no_mc2_ww_midring_abs())
-                || (hvisited && !no_mc2_ww_tail_publish());
-            // ⭐⭐⭐ THE MAILBOX IS SHARED BY EVERY FUNNEL IN THE TICK.
-            // `sub_33340` runs once per (10,22) head (ONE caller,
-            // `NETHERW.EXE` file 0x5792c) and cranks on its own slot,
-            // so the counts ADD; the assignment below used to keep the
-            // last funnel's alone. See `mc2_ww_crank_accum_law`.
-            let prior = self.player_whirl;
-            // ⚠ THE MAILBOX CAN OUTLIVE A TICK, SO `armed` IS NOT THE
-            // TEST. The above-seat drain is hooked to the next LIVE
-            // slot above the publisher; a funnel that is the highest
-            // live slot has no such walker, and its publication sits
-            // in the mailbox until the carpet's drain NEXT tick. Only
-            // `ww_walk_published` says "a lower funnel of THIS walk
-            // put that there".
-            let same_walk = prior.armed && self.ww_walk_published.0;
-            let carried = if same_walk && mc2_ww_crank_accum_law() {
-                prior.bumps
-            } else {
-                0
-            };
-            self.ww_walk_published.0 = true;
-            self.player_whirl = crate::engine::features::PlayerWhirl {
-                armed: true,
-                heading: hmid.unwrap_or(0),
-                step: if abs { 0 } else { 96 },
-                grab: if abs {
-                    Some((hp.0, hp.1, hp.2, hyaw))
-                } else {
-                    None
-                },
-                // The pose the FIRST funnel of the tick found him at —
-                // the enhanced mover applies `grab − from` as one
-                // delta, so a chain of funnels must span the whole
-                // chain, not just its last link.
-                from: if same_walk && mc2_ww_crank_accum_law() {
-                    prior.from
-                } else {
-                    (ctx.px, ctx.py, ctx.pz, ctx.pyaw & 0x7FF)
-                },
-                act80: hact80 || (same_walk && mc2_ww_crank_accum_law() && prior.act80),
-                // ⚠ ONE CRANK PER *PUBLISHED* SEIZURE, WHICH IS THE
-                // CHANNEL'S ARITY, NOT A CAP ON RETAIL. The grab
-                // family resolves every repeat visit into `hp`/`hyaw`
-                // and publishes an ABSOLUTE pose, so a double
-                // inner-lift tick carries both cranks. The MID RING
-                // still publishes one heading+step pair (dig W4's
-                // pinned arithmetic), so a double mid-ring visit is
-                // only half-representable: the second 96-step is
-                // dropped, and carrying its crank alone would be a
-                // two-visit bank on a one-visit position. mc2l1 t=272
-                // is exactly that tick — retail seized TWICE (two
-                // 96-steps: y lands on 49844, one step lands 49748;
-                // the recorded `word_0x30_48` 1052 is the SECOND
-                // bearing while the port's single visit yields ~1035)
-                // — and the port's ring walk does reach the block
-                // twice. See the dig note: the fix is to publish the
-                // resolved absolute pose whenever the mid ring is
-                // visited more than once, at which point this `min`
-                // comes straight back out.
-                // ⚠ STILL `min(1)` ON THE MID RING, AND NOT BECAUSE OF
-                // THE CHANNEL: `recover_pair_mc2` un-cranks the
-                // recorded `roll_acc` by exactly ONE 28 before
-                // inverting the stick filter (mgc-formats
-                // `recover.rs`, `let crank = |acc| ... 28`), so a
-                // second crank the port applies is one the recovery
-                // never removed and lands 28 high. The extra visits
-                // are absorbed into the recovered cursor; the POSE is
-                // what the port has to carry, and `abs` now does.
-                bumps: if hseized || mc2_ww_crank_count_law() {
-                    hcrank
-                } else {
-                    hcrank.min(1)
+        for k in 0..ws.len() {
+            let WwSeat {
+                hx,
+                cs,
+                human_law,
+                hp,
+                hyaw,
+                hgrab,
+                hstop,
+                hseized,
+                hmid,
+                hact80,
+                hvisited,
+                hcrank,
+            } = ws[k];
+            let hpublish = hseized || hmid.is_some() || (hvisited && !no_mc2_ww_tail_publish());
+            if human_law && hpublish {
+                if hstop {
+                    // `byte[1] |= 8` — consumed (and cleared) by the veto
+                    // at the head of `sub_5D530` (`NETHERW.EXE` 0x81d39
+                    // `mov ah,[ebx+0xd]` / `test ah,0x8` / `and dl,0xf7`),
+                    // the human carpet mover. Same one-shot the rival
+                    // carpet, the corpse mover, the creature core and the
+                    // ball already read.
+                    self.ent[cs].flags |= super::mobs::F_STOP;
                 }
-                .saturating_add(carried),
-            };
-            if ww_roll_trace() {
-                eprintln!(
-                    "[ww] t={} funnel={i} hcrank={hcrank} carried={carried} seized={hseized} mid={hmid:?} vis={hvisited} grab={hgrab} stop={hstop} prior_armed={} same_walk={same_walk} -> bumps={}",
-                    crate::DEBUG_TICK.load(std::sync::atomic::Ordering::Relaxed),
-                    prior.armed,
-                    self.player_whirl.bumps,
-                );
+                if hgrab {
+                    self.ent[cs].flags |= F_GRABBED;
+                } else {
+                    self.ent[cs].flags &= !F_GRABBED;
+                }
+                // ⭐⭐⭐ THE MID RING PUBLISHES THE RESOLVED ABSOLUTE POSE.
+                // Retail's four arms all fall through to the SAME tail —
+                // `MoveEntity_57FA0(&pred, word_0x30_48, 0, v30)`, the cave
+                // clamp, `sub_580E0` and `CopyEntityPosition_57CF0`
+                // (EF:24375-95) — so the mid ring writes an absolute
+                // position with a banded z, and a ring walk that reaches
+                // the victim twice writes it twice. The heading+step
+                // channel could carry one visit and no z at all; the ring
+                // column above has already resolved every visit into
+                // `hp`/`hyaw`, so hand that over instead. (This is the
+                // `min` the Q7 note said would "come straight back out".)
+                let abs = hseized
+                    || (hmid.is_some() && !no_mc2_ww_midring_abs())
+                    || (hvisited && !no_mc2_ww_tail_publish());
+                // ⭐⭐⭐ THE MAILBOX IS SHARED BY EVERY FUNNEL IN THE TICK.
+                // `sub_33340` runs once per (10,22) head (ONE caller,
+                // `NETHERW.EXE` file 0x5792c) and cranks on its own slot,
+                // so the counts ADD; the assignment below used to keep the
+                // last funnel's alone. See `mc2_ww_crank_accum_law`.
+                let prior = self.player_whirl[hx];
+                // ⚠ THE MAILBOX CAN OUTLIVE A TICK, SO `armed` IS NOT THE
+                // TEST. The above-seat drain is hooked to the next LIVE
+                // slot above the publisher; a funnel that is the highest
+                // live slot has no such walker, and its publication sits
+                // in the mailbox until the carpet's drain NEXT tick. Only
+                // `ww_walk_published` says "a lower funnel of THIS walk
+                // put that there".
+                let same_walk = prior.armed && self.ww_walk_published[hx].0;
+                let carried = if same_walk && mc2_ww_crank_accum_law() {
+                    prior.bumps
+                } else {
+                    0
+                };
+                self.ww_walk_published[hx].0 = true;
+                self.player_whirl[hx] = crate::engine::features::PlayerWhirl {
+                    armed: true,
+                    heading: hmid.unwrap_or(0),
+                    step: if abs { 0 } else { 96 },
+                    grab: if abs {
+                        Some((hp.0, hp.1, hp.2, hyaw))
+                    } else {
+                        None
+                    },
+                    // The pose the FIRST funnel of the tick found him at —
+                    // the enhanced mover applies `grab − from` as one
+                    // delta, so a chain of funnels must span the whole
+                    // chain, not just its last link.
+                    from: if same_walk && mc2_ww_crank_accum_law() {
+                        prior.from
+                    } else {
+                        {
+                            let (px, py, pz) = self.seat_at(ctx, hx);
+                            (px, py, pz, self.seat_yaw(ctx, hx) & 0x7FF)
+                        }
+                    },
+                    act80: hact80 || (same_walk && mc2_ww_crank_accum_law() && prior.act80),
+                    // ⚠ ONE CRANK PER *PUBLISHED* SEIZURE, WHICH IS THE
+                    // CHANNEL'S ARITY, NOT A CAP ON RETAIL. The grab
+                    // family resolves every repeat visit into `hp`/`hyaw`
+                    // and publishes an ABSOLUTE pose, so a double
+                    // inner-lift tick carries both cranks. The MID RING
+                    // still publishes one heading+step pair (dig W4's
+                    // pinned arithmetic), so a double mid-ring visit is
+                    // only half-representable: the second 96-step is
+                    // dropped, and carrying its crank alone would be a
+                    // two-visit bank on a one-visit position. mc2l1 t=272
+                    // is exactly that tick — retail seized TWICE (two
+                    // 96-steps: y lands on 49844, one step lands 49748;
+                    // the recorded `word_0x30_48` 1052 is the SECOND
+                    // bearing while the port's single visit yields ~1035)
+                    // — and the port's ring walk does reach the block
+                    // twice. See the dig note: the fix is to publish the
+                    // resolved absolute pose whenever the mid ring is
+                    // visited more than once, at which point this `min`
+                    // comes straight back out.
+                    // ⚠ STILL `min(1)` ON THE MID RING, AND NOT BECAUSE OF
+                    // THE CHANNEL: `recover_pair_mc2` un-cranks the
+                    // recorded `roll_acc` by exactly ONE 28 before
+                    // inverting the stick filter (mgc-formats
+                    // `recover.rs`, `let crank = |acc| ... 28`), so a
+                    // second crank the port applies is one the recovery
+                    // never removed and lands 28 high. The extra visits
+                    // are absorbed into the recovered cursor; the POSE is
+                    // what the port has to carry, and `abs` now does.
+                    bumps: if hseized || mc2_ww_crank_count_law() {
+                        hcrank
+                    } else {
+                        hcrank.min(1)
+                    }
+                    .saturating_add(carried),
+                };
+                if ww_roll_trace() {
+                    eprintln!(
+                        "[ww] t={} funnel={i} hcrank={hcrank} carried={carried} seized={hseized} mid={hmid:?} vis={hvisited} grab={hgrab} stop={hstop} prior_armed={} same_walk={same_walk} -> bumps={}",
+                        crate::DEBUG_TICK.load(std::sync::atomic::Ordering::Relaxed),
+                        prior.armed,
+                        self.player_whirl[hx].bumps,
+                    );
+                }
             }
         }
         // The player arm — the tornado SWAY (retail `sub_33340`'s
@@ -2622,92 +2755,97 @@ impl Gen {
         // Retail's whirlwind sways the wizard, it does not chip HP.
         // Same-owner gate (`sub_33810` case 1, EF:24473: `a2x->id ==
         // a1x->id → return 0`) — your OWN whirlwind never sways you.
-        let pd = Self::isqrt(Self::dist2_sq(ex, ey, ctx.px, ctx.py) as u32) as i32;
-        // RETAIL'S FAR BAND. `sub_33340`'s victim body (EF:24306,
-        // `NETHERW.EXE` 0x57c41 `cmp $0x310000,%eax`) splits on
-        // `EuclideanDistXY(eye, victim) >= 3211264` (d >= 1792) and in
-        // that arm does NOTHING to an UNGRABBED victim: `v30` stays 0,
-        // so the closing `MoveEntity_57FA0(..., 0)` is a no-op, and
-        // nothing in the function ever writes `moveBoost_0x1E_30` —
-        // retail's own knock register — at all. The port's human arm
-        // reached 3328 with no band structure, arming `player_knock`
-        // (a RECORDED, GRADED, decaying channel retail holds at 0)
-        // about four ticks early and 1.9x too far out.
-        let far_skip = (Self::dist2_sq(ex, ey, ctx.px, ctx.py) as i64) >= 3_211_264;
-        let pd2 = Self::dist2_sq(ex, ey, ctx.px, ctx.py) as i64;
-        if !human_law
-            && pd < 3328
-            && !far_skip
-            && pd2 >= 0x40000
-            && !no_mc2_ww_midring()
-            && id != crate::mc1::mobs::PLAYER_TARGET
-        {
-            // ⭐⭐⭐ THE MID RING IS A POSE SEIZURE, NOT A KNOCK.
-            // `v33 >= 0x40000 && !(byte[3] & 0x10)` (EF:24350-56) is
-            // four writes on the victim and nothing else: `v14 =
-            // (tan2(eye, victim) + 591) & 0x7FF` into BOTH
-            // `word_0x30_48` and `yaw_0x1C_28`, `v30 = 96`, and — for
-            // the HUMAN alone (`v40 = class == 3 && !model`,
-            // EF:24345-49) — `roll_0x155_341 += 28` while it is under
-            // 256 plus `actSpeed_0x82_130 = 80`. The move that
-            // follows is `MoveEntity_57FA0(&pred, word_0x30_48, 0,
-            // v30)` + `CopyEntityPosition_57CF0`, a direct POSITION
-            // write; `moveBoost_0x1E_30` is never touched anywhere in
-            // `sub_33340`, so the old `player_knock` shove (with its
-            // invented +45° bias and its distance-ramped magnitude)
-            // was writing a recorded, graded, decaying lane retail
-            // holds at 0. The seizure rides
-            // [`crate::engine::features::PlayerWhirl`] instead, and
-            // the carpet's own walk slot applies it — see
-            // `World::step_player_flight_mc2` for the mc2l1 t=269
-            // arithmetic.
-            self.player_whirl = crate::engine::features::PlayerWhirl {
-                armed: true,
-                heading: Self::angle_between(ex, ey, ctx.px, ctx.py).wrapping_add(591) & 0x7FF,
-                step: 96,
-                grab: None,
-                from: (ctx.px, ctx.py, ctx.pz, ctx.pyaw & 0x7FF),
-                act80: true,
-                // Dig Q6's crank is the OTHER half of the same `v40`
-                // block, so it rides this ladder rung too — under
-                // `MGC_NO_MC2_WW_HUMAN_GRAB=1` the mid ring still
-                // cranks.
-                bumps: 1,
-            };
-        } else if !human_law && pd < 3328 && !far_skip && id != crate::mc1::mobs::PLAYER_TARGET {
-            let toward = Self::angle_between(ctx.px, ctx.py, ex, ey);
-            let dir = (toward as i32 + 256) as u16 & 0x7FF; // +45° spiral bias
-            // Stronger closer (0..128 across the funnel), clamped to
-            // the knock channel's band and never overshooting the eye.
-            let mag = ((((3328 - pd) << 8) / 3328) << 7 >> 8).clamp(8, 80).min(pd);
-            self.player_knock = (dir, mag as i16);
-            // THE HEADING. Retail's victim block writes `yaw_0x1C_28`
-            // on EVERY arm, and the wizard's step is `v38` = 56 —
-            // `v40 = (class == 3 && !model)` picks 56 over the 204
-            // creatures get (EF:24294-99), and the same 56 lands in
-            // the far-grab, near-grab and inner-lift arms alike. Only
-            // the MID RING (`d2 >= 0x40000`, not yet grabbed) sets an
-            // absolute heading instead: the tangent `bearing + 591`
-            // (EF:24350-56), which is what turns a straight fall
-            // toward the eye into the spiral. The port shoved the
-            // flyer and never touched its facing, so a tornado threw
-            // you around while you kept staring the way you came in.
-            //
-            // The grab/lift/camera-roll takeover is still the
-            // deferred FlightVerb seam — the spin rides the pose
-            // channel on its own, which is what the report is about.
-            let d2 = Self::dist2_sq(ex, ey, ctx.px, ctx.py) as i64;
-            self.player_spin.0 = if d2 >= 0x40000 {
-                let tangent = Self::angle_between(ex, ey, ctx.px, ctx.py).wrapping_add(591) & 0x7FF;
-                // Absolute in retail; delivered as the delta that
-                // reaches it, since the pose channel carries turns.
-                (tangent as i16 - (ctx.pyaw & 0x7FF) as i16).rem_euclid(2048)
-            } else {
-                56
-            };
+        for s in ws.iter().copied() {
+            let (hx, human_law) = (s.hx, s.human_law);
+            let (spx, spy, spz) = self.seat_at(ctx, hx);
+            let syaw = self.seat_yaw(ctx, hx);
+            let pd = Self::isqrt(Self::dist2_sq(ex, ey, spx, spy) as u32) as i32;
+            // RETAIL'S FAR BAND. `sub_33340`'s victim body (EF:24306,
+            // `NETHERW.EXE` 0x57c41 `cmp $0x310000,%eax`) splits on
+            // `EuclideanDistXY(eye, victim) >= 3211264` (d >= 1792) and in
+            // that arm does NOTHING to an UNGRABBED victim: `v30` stays 0,
+            // so the closing `MoveEntity_57FA0(..., 0)` is a no-op, and
+            // nothing in the function ever writes `moveBoost_0x1E_30` —
+            // retail's own knock register — at all. The port's human arm
+            // reached 3328 with no band structure, arming `player_knock`
+            // (a RECORDED, GRADED, decaying channel retail holds at 0)
+            // about four ticks early and 1.9x too far out.
+            let far_skip = (Self::dist2_sq(ex, ey, spx, spy) as i64) >= 3_211_264;
+            let pd2 = Self::dist2_sq(ex, ey, spx, spy) as i64;
+            if !human_law
+                && pd < 3328
+                && !far_skip
+                && pd2 >= 0x40000
+                && !no_mc2_ww_midring()
+                && id != self.human_tag[hx].0
+            {
+                // ⭐⭐⭐ THE MID RING IS A POSE SEIZURE, NOT A KNOCK.
+                // `v33 >= 0x40000 && !(byte[3] & 0x10)` (EF:24350-56) is
+                // four writes on the victim and nothing else: `v14 =
+                // (tan2(eye, victim) + 591) & 0x7FF` into BOTH
+                // `word_0x30_48` and `yaw_0x1C_28`, `v30 = 96`, and — for
+                // the HUMAN alone (`v40 = class == 3 && !model`,
+                // EF:24345-49) — `roll_0x155_341 += 28` while it is under
+                // 256 plus `actSpeed_0x82_130 = 80`. The move that
+                // follows is `MoveEntity_57FA0(&pred, word_0x30_48, 0,
+                // v30)` + `CopyEntityPosition_57CF0`, a direct POSITION
+                // write; `moveBoost_0x1E_30` is never touched anywhere in
+                // `sub_33340`, so the old `player_knock` shove (with its
+                // invented +45° bias and its distance-ramped magnitude)
+                // was writing a recorded, graded, decaying lane retail
+                // holds at 0. The seizure rides
+                // [`crate::engine::features::PlayerWhirl`] instead, and
+                // the carpet's own walk slot applies it — see
+                // `World::step_player_flight_mc2` for the mc2l1 t=269
+                // arithmetic.
+                self.player_whirl[hx] = crate::engine::features::PlayerWhirl {
+                    armed: true,
+                    heading: Self::angle_between(ex, ey, spx, spy).wrapping_add(591) & 0x7FF,
+                    step: 96,
+                    grab: None,
+                    from: (spx, spy, spz, syaw & 0x7FF),
+                    act80: true,
+                    // Dig Q6's crank is the OTHER half of the same `v40`
+                    // block, so it rides this ladder rung too — under
+                    // `MGC_NO_MC2_WW_HUMAN_GRAB=1` the mid ring still
+                    // cranks.
+                    bumps: 1,
+                };
+            } else if !human_law && pd < 3328 && !far_skip && id != self.human_tag[hx].0 {
+                let toward = Self::angle_between(spx, spy, ex, ey);
+                let dir = (toward as i32 + 256) as u16 & 0x7FF; // +45° spiral bias
+                // Stronger closer (0..128 across the funnel), clamped to
+                // the knock channel's band and never overshooting the eye.
+                let mag = ((((3328 - pd) << 8) / 3328) << 7 >> 8).clamp(8, 80).min(pd);
+                self.player_knock[hx] = (dir, mag as i16);
+                // THE HEADING. Retail's victim block writes `yaw_0x1C_28`
+                // on EVERY arm, and the wizard's step is `v38` = 56 —
+                // `v40 = (class == 3 && !model)` picks 56 over the 204
+                // creatures get (EF:24294-99), and the same 56 lands in
+                // the far-grab, near-grab and inner-lift arms alike. Only
+                // the MID RING (`d2 >= 0x40000`, not yet grabbed) sets an
+                // absolute heading instead: the tangent `bearing + 591`
+                // (EF:24350-56), which is what turns a straight fall
+                // toward the eye into the spiral. The port shoved the
+                // flyer and never touched its facing, so a tornado threw
+                // you around while you kept staring the way you came in.
+                //
+                // The grab/lift/camera-roll takeover is still the
+                // deferred FlightVerb seam — the spin rides the pose
+                // channel on its own, which is what the report is about.
+                let d2 = Self::dist2_sq(ex, ey, spx, spy) as i64;
+                self.player_spin[hx].0 = if d2 >= 0x40000 {
+                    let tangent = Self::angle_between(ex, ey, spx, spy).wrapping_add(591) & 0x7FF;
+                    // Absolute in retail; delivered as the delta that
+                    // reaches it, since the pose channel carries turns.
+                    (tangent as i16 - (syaw & 0x7FF) as i16).rem_euclid(2048)
+                } else {
+                    56
+                };
+            }
         }
         // The grab-pass batch XP (sub_33340 EF:24407).
-        if hits != 0 && id == crate::mc1::mobs::PLAYER_TARGET {
+        if hits != 0 && self.is_human_tag(id) {
             self.mc2_cast_xp.0.push((id, 21, hits as i32));
         }
     }
@@ -2771,7 +2909,7 @@ impl Gen {
         }
         // The contact-pass batch XP: +2 per CASTLE struck
         // (sub_33710 EF:24444, `v1 += 2` per castle).
-        if castles_hit != 0 && id == crate::mc1::mobs::PLAYER_TARGET {
+        if castles_hit != 0 && self.is_human_tag(id) {
             self.mc2_cast_xp.0.push((id, 21, 2 * castles_hit));
         }
     }
@@ -2795,14 +2933,14 @@ impl Gen {
         // `byte[1] & 8` — has to be swept by his LIVE pose instead.
         // Without it a funnel that expires while holding him leaves
         // the latch armed forever and the next funnel resumes mid-grab.
-        {
-            let cs = self.mc2_pinned.0 as usize;
+        for hx in self.human_tag.ixs() {
+            let cs = self.mc2_pinned[hx].0 as usize;
             if !no_mc2_ww_human_grab() && cs != 0 && cs < self.ent.len() {
-                let hx = ((ctx.px >> 8) as u8) as i16;
-                let hy = ((ctx.py >> 8) as u8) as i16;
+                let htx = ((self.seat_at(ctx, hx).0 >> 8) as u8) as i16;
+                let hty = ((self.seat_at(ctx, hx).1 >> 8) as u8) as i16;
                 let inside = self.ring_cells(0, 12).into_iter().any(|(dx, dy)| {
-                    (cx.wrapping_add((dx as i8) as i16)) as u8 == hx as u8
-                        && (cy.wrapping_add((dy as i8) as i16)) as u8 == hy as u8
+                    (cx.wrapping_add((dx as i8) as i16)) as u8 == htx as u8
+                        && (cy.wrapping_add((dy as i8) as i16)) as u8 == hty as u8
                 });
                 if inside {
                     self.ent[cs].flags &= !(F_GRABBED | super::mobs::F_STOP);
@@ -2815,7 +2953,10 @@ impl Gen {
             let mut j = self.map_entity[crate::engine::features::tile(tx, ty)] as usize;
             while j != 0 {
                 let next = self.ent[j].next20 as usize;
-                self.ent[j].flags &= !(F_GRABBED | super::mobs::F_STOP);
+                // (the human's linked (3,0) record: his own arm handles him, above)
+                if !self.chain_human(j) {
+                    self.ent[j].flags &= !(F_GRABBED | super::mobs::F_STOP);
+                }
                 j = next;
             }
         }
@@ -2870,7 +3011,7 @@ impl Gen {
                 let amt = self.ent[i].f140 as u32;
                 let hits = self.area_write(i, 0, amt, ctx, false, false);
                 // Lightning burst batch XP (EF:24802).
-                if hits != 0 && self.ent[i].id24 == crate::mc1::mobs::PLAYER_TARGET {
+                if hits != 0 && self.is_human_tag(self.ent[i].id24) {
                     self.mc2_cast_xp.0.push((self.ent[i].id24, 7, hits as i32));
                 }
                 self.snd(24, i);
@@ -2919,7 +3060,7 @@ impl Gen {
         let amt = (self.ent[i].f140 / self.ent[i].max_life as i32) as u32;
         let hits = self.area_write(i, 0, amt, ctx, false, false);
         // Meteor batch XP (sub_32880 EF:23871).
-        if hits != 0 && self.ent[i].id24 == crate::mc1::mobs::PLAYER_TARGET {
+        if hits != 0 && self.is_human_tag(self.ent[i].id24) {
             self.mc2_cast_xp.0.push((self.ent[i].id24, 9, hits as i32));
         }
         let (px, py, pz, id, yaw) = {
@@ -3350,6 +3491,7 @@ mod tests {
     use super::F_GRABBED;
     use crate::chassis::ChassisParams;
     use crate::engine::features::{FeatureAssets, Gen, Planes};
+    use crate::engine::world::Hx;
     use crate::engine::world::conformance::import_ent_mc2;
     use crate::mc1::combat::MailTarget;
     use crate::verbs::VerbSet;
@@ -3614,28 +3756,30 @@ mod tests {
             e.model65 = 0;
             e.id24 = crate::mc1::mobs::PLAYER_TARGET;
         }
-        g.mc2_pinned = crate::engine::features::Mc2Pinned(pinned as u16);
+        g.mc2_pinned[Hx::FIRST] = crate::engine::features::Mc2Pinned(pinned as u16);
 
         // 532 units east of the eye: cell (cx+2, cy), d2 = 283_024,
         // inside 3_211_264 and outside 0x40000 — the mid ring. The z
         // starts BELOW the band's floor so the tail has work to do.
         let (px, py) = (hx + 532, hy);
+        // The walkers read him off his record (slice 5c).
+        (g.ent[pinned].x, g.ent[pinned].y, g.ent[pinned].z) = (px, py, 0);
         let ctx = crate::mc1::mobs::MobCtx {
-            px,
-            py,
-            pz: 0,
-            pyaw: 0,
-            pmana: 1000,
-            pmana_max: 1000,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: crate::patches::WorldPatches::RETAIL,
             mc2_turn: 0,
         };
+        *g.view_mut(ctx.phx) = crate::engine::features::SeatView {
+            x: px,
+            y: py,
+            mana: 1000,
+            mana_max: 1000,
+            ..Default::default()
+        };
         g.mc2_whirlwind_lift(head, &ctx);
 
-        let w = g.player_whirl;
+        let w = g.player_whirl[Hx::FIRST];
         assert!(w.armed, "the mid ring must arm the seizure");
         let (gx, gy, gz, gyaw) = w.grab.expect(
             "the MID RING publishes the RESOLVED ABSOLUTE pose \
@@ -3735,7 +3879,7 @@ mod tests {
             // steps along. 512 = due EAST.
             e.f50 = 512;
         }
-        g.mc2_pinned = crate::engine::features::Mc2Pinned(pinned as u16);
+        g.mc2_pinned[Hx::FIRST] = crate::engine::features::Mc2Pinned(pinned as u16);
 
         // 250 units east of the eye: same tile (40, 40) — the ring
         // cell the disc walk names — and only 6 units short of its
@@ -3747,21 +3891,28 @@ mod tests {
             "rig: his tile"
         );
         // His seat as the carpet's own walk slot would have seeded it.
-        g.player_relink(px, py);
-        assert_eq!(g.player_chain.cell, tile(40, 40), "rig: the seat pre-walk");
+        g.player_relink(Hx::FIRST, px, py);
+        assert_eq!(
+            g.player_chain[Hx::FIRST].cell,
+            tile(40, 40),
+            "rig: the seat pre-walk"
+        );
+        // The walkers read him off his record (slice 5c).
+        (g.ent[pinned].x, g.ent[pinned].y, g.ent[pinned].z) = (px, py, 400);
 
         let ctx = crate::mc1::mobs::MobCtx {
-            px,
-            py,
-            pz: 400,
-            pyaw: 0,
-            pmana: 1000,
-            pmana_max: 1000,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: crate::patches::WorldPatches::RETAIL,
             mc2_turn: 0,
+        };
+        *g.view_mut(ctx.phx) = crate::engine::features::SeatView {
+            x: px,
+            y: py,
+            z: 400,
+            mana: 1000,
+            mana_max: 1000,
+            ..Default::default()
         };
         g.mc2_whirlwind_lift(head, &ctx);
 
@@ -3777,7 +3928,7 @@ mod tests {
         );
         assert_ne!(tile(ntx, nty), tile(40, 40), "rig: a real relink");
         assert_eq!(
-            g.player_chain.cell,
+            g.player_chain[Hx::FIRST].cell,
             tile(ntx, nty),
             "`CopyEntityPosition_57CF0` (0x57e7b -> 0x7c518 AddEventToMap) \
              makes him the NEW tile's chain head inside the walk — a seat \
@@ -3864,7 +4015,7 @@ mod tests {
             e.id24 = crate::mc1::mobs::PLAYER_TARGET;
             e.f50 = 512;
         }
-        g.mc2_pinned = crate::engine::features::Mc2Pinned(pinned as u16);
+        g.mc2_pinned[Hx::FIRST] = crate::engine::features::Mc2Pinned(pinned as u16);
 
         let (px, py) = (hx + 200, hy + 200);
         assert_eq!(
@@ -3873,25 +4024,28 @@ mod tests {
             "rig: his tile"
         );
         // His seat, as the carpet's own walk slot seeds it — then
-        // pushed BEHIND the victim, which is the whole point.
-        g.player_relink(px, py);
-        g.player_chain = crate::engine::features::PlayerChain {
+        // pushed BEHIND the victim, which is the whole point (his
+        // linked record spliced in front of the successor).
+        g.player_relink(Hx::FIRST, px, py);
+        g.player_chain[Hx::FIRST] = crate::engine::features::PlayerChain {
             cell: tile(40, 40),
             next: successor as u16,
         };
+        g.seat_human_link(Hx::FIRST);
 
         let ctx = crate::mc1::mobs::MobCtx {
-            px,
-            py,
-            pz: 400,
-            pyaw: 0,
-            pmana: 1000,
-            pmana_max: 1000,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: crate::patches::WorldPatches::RETAIL,
             mc2_turn: 0,
+        };
+        *g.view_mut(ctx.phx) = crate::engine::features::SeatView {
+            x: px,
+            y: py,
+            z: 400,
+            mana: 1000,
+            mana_max: 1000,
+            ..Default::default()
         };
         g.mc2_whirlwind_lift(head, &ctx);
 
@@ -4056,17 +4210,18 @@ mod tests {
         g.ent[victim].mail[0] = (200, 999);
 
         let ctx = crate::mc1::mobs::MobCtx {
-            px: hx,
-            py: hy,
-            pz: 400,
-            pyaw: 0,
-            pmana: 1000,
-            pmana_max: 1000,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: crate::patches::WorldPatches::RETAIL,
             mc2_turn: 0,
+        };
+        *g.view_mut(ctx.phx) = crate::engine::features::SeatView {
+            x: hx,
+            y: hy,
+            z: 400,
+            mana: 1000,
+            mana_max: 1000,
+            ..Default::default()
         };
         g.mc2_whirlwind_lift(head, &ctx);
 
@@ -4263,17 +4418,15 @@ mod tests {
         use crate::mc1::mobs::MobCtx;
         let mut g = flat_gen();
         let ctx = MobCtx {
-            px: 0,
-            py: 0,
-            pz: 0,
-            pyaw: 0,
-            pmana: 0,
-            pmana_max: 0,
-            pdead: true,
-            pdead_top: true,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: crate::patches::WorldPatches::RETAIL,
             mc2_turn: 0,
+        };
+        *g.view_mut(ctx.phx) = crate::engine::features::SeatView {
+            dead: true,
+            dead_top: true,
+            ..Default::default()
         };
         let (x, y) = (40u16 << 8, 40u16 << 8);
         let z = g.ground_z(x, y) as i16;
@@ -4356,17 +4509,15 @@ mod tests {
         use crate::mc1::mobs::MobCtx;
         let mut g = flat_gen();
         let ctx = MobCtx {
-            px: 0,
-            py: 0,
-            pz: 0,
-            pyaw: 0,
-            pmana: 0,
-            pmana_max: 0,
-            pdead: true,
-            pdead_top: true,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: crate::patches::WorldPatches::RETAIL,
             mc2_turn: 0,
+        };
+        *g.view_mut(ctx.phx) = crate::engine::features::SeatView {
+            dead: true,
+            dead_top: true,
+            ..Default::default()
         };
         let (x, y) = (40u16 << 8, 40u16 << 8);
         let z = g.ground_z(x, y) as i16;

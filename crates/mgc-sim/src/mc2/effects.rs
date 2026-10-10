@@ -14,6 +14,7 @@
 //! ch0 area heat).
 
 use crate::engine::features::{Gen, lcg32};
+use crate::engine::world::Hx;
 use crate::mc1::mobs::MobCtx;
 
 /// A/B toggle for the whole Magic-Mine law cluster (the `sub_67960`
@@ -680,8 +681,8 @@ impl Gen {
         // resolvable owner and the guard sits out.
         if !no_mine_relaunch() {
             let own = self.ent[i].f52;
-            let gone = if own == crate::mc1::mobs::PLAYER_TARGET {
-                ctx.pdead
+            let gone = if let Some(hx) = self.hx_of_tag(own) {
+                self.seat_dead(ctx, hx)
             } else if own == 0 {
                 false
             } else {
@@ -739,7 +740,7 @@ impl Gen {
             // re-sets it on the next. (The enemy arm — the
             // Beyond-Sight reveal — lives in `live_poses_mc2`.)
             if !no_mine_charged_ghost()
-                && self.ent[i].f52 == crate::mc1::mobs::PLAYER_TARGET
+                && self.is_human_tag(self.ent[i].f52)
                 && self.ent[i].f36 != 0
             {
                 self.ent[i].flags |= 1 << 23;
@@ -958,16 +959,37 @@ impl Gen {
         let mut best: Option<(u16, i32)> = None;
         // The out-of-pool human is a class-3 model-0 record on retail's
         // `dword_38519` like any other; the roster's entry test is
-        // `life_0x8 >= 0` (EF:39975), which he takes here as `pdead_top`.
-        if own != crate::mc1::mobs::PLAYER_TARGET && !ctx.pdead_top {
-            let d = d3(ctx.px, ctx.py, ctx.pz);
-            if d < 3584 {
-                best = Some((crate::mc1::mobs::PLAYER_TARGET, d));
+        // `life_0x8 >= 0` (EF:39975), which he takes here as `dead_top`.
+        // (On the roster he is met at his own slot below.)
+        let on_chain = |hx: Hx| self.human_rides_chain(hx);
+        for hx in self
+            .human_tag
+            .ixs()
+            .filter(|&hx| !on_chain(hx) && self.human_tag[hx].0 != own && !self.seat_dead_top(hx))
+        {
+            let d = {
+                let (x, y, z) = self.seat_at(ctx, hx);
+                d3(x, y, z)
+            };
+            if d < 3584 && best.is_none_or(|(_, bd)| d < bd) {
+                best = Some((self.human_tag[hx].0, d));
             }
         }
         for c in 0..self.wiz_chain.visible_len() {
             let j = self.wiz_chain.list[c] as usize;
             let e = &self.ent[j];
+            if let Some(hx) = self.hx_of_rec(j) {
+                if self.human_tag[hx].0 != own {
+                    let d = {
+                        let (x, y, z) = self.seat_at(ctx, hx);
+                        d3(x, y, z)
+                    };
+                    if d < 3584 && best.is_none_or(|(_, bd)| d < bd) {
+                        best = Some((self.human_tag[hx].0, d));
+                    }
+                }
+                continue;
+            }
             // `ix->model_0x40_64 <= 1u && ix != v33x` — the owner is
             // excluded by RECORD IDENTITY, not by owner tag.
             if e.model65 > 1 || j as u16 == own {
@@ -1020,8 +1042,8 @@ impl Gen {
         // un-reaped, or the burst is over.
         let tripper = if v17 == 0 {
             None
-        } else if v17 == crate::mc1::mobs::PLAYER_TARGET {
-            (!ctx.pdead).then_some((ctx.px, ctx.py, ctx.pz))
+        } else if let Some(hx) = self.hx_of_tag(v17) {
+            (!self.seat_dead(ctx, hx)).then_some(self.seat_at(ctx, hx))
         } else {
             self.ent
                 .get(v17 as usize)
@@ -1143,8 +1165,8 @@ impl Gen {
     /// the OWNER wizard `sub_6DCA0` was handed — the cast sound rides
     /// the owner's slot, not the mine's.
     fn mc2_mine_snd(&mut self, id: u8, owner: u16) {
-        if owner == crate::mc1::mobs::PLAYER_TARGET {
-            self.snd_player(id);
+        if let Some(hx) = self.hx_of_tag(owner) {
+            self.snd_player(hx, id);
         } else if (owner as usize) < self.ent.len() {
             self.snd(id, owner as usize);
         }

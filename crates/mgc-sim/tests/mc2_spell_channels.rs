@@ -13,6 +13,7 @@
 //!
 //! Self-skips without baked mc2 data (game data is optional).
 
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
 use mgc_sim::ids::GameId;
@@ -121,12 +122,12 @@ fn mc2_possession_magnet_needs_a_mana_claim() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w);
     let pose = pose_at(&w, cx, cy);
     assert_eq!(count(&w, 10, 54), 0, "no magnet auras at level start");
 
-    w.mc2_select_spell(1, 1, 0); // Possession tier 1 = Mana Magnet
+    w.mc2_select_spell(Hx::FIRST, 1, 1, 0); // Possession tier 1 = Mana Magnet
     w.tick(
         pose,
         PlayerCommand {
@@ -155,15 +156,15 @@ fn mc2_invisibility_break_law_per_tier() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w);
     let pose = pose_at(&w, cx, cy);
 
     // --- Tier 0: any offensive cast BREAKS the cloak. -----------------
     // Bind invis (11) tier 0 to the left hand, fireball (0) to the right
     // (dev_spells self-grants both on select).
-    w.mc2_select_spell(11, 0, 0);
-    w.mc2_select_spell(0, 0, 1);
+    w.mc2_select_spell(Hx::FIRST, 11, 0, 0);
+    w.mc2_select_spell(Hx::FIRST, 0, 0, 1);
     // Cast invis: arms + runs the first effect tick (sets the flag and
     // the break strength). The window is now live.
     w.tick(
@@ -174,7 +175,7 @@ fn mc2_invisibility_break_law_per_tier() {
         },
     );
     assert!(
-        w.mc2_book_view().armed[11],
+        w.mc2_book_view(Hx::FIRST).armed[11],
         "T0 invisibility window is live right after casting"
     );
     // Cast fireball while cloaked at T0 → the arm-path break law fires
@@ -188,15 +189,15 @@ fn mc2_invisibility_break_law_per_tier() {
         },
     );
     assert!(
-        !w.mc2_book_view().armed[11],
+        !w.mc2_book_view(Hx::FIRST).armed[11],
         "T0: casting fireball breaks invisibility (window cleared)"
     );
 
     // --- Tier 2: NOTHING breaks the cloak. ----------------------------
     let (cx, cy) = open_spot(&w);
     let pose = pose_at(&w, cx, cy);
-    w.mc2_select_spell(11, 2, 0); // invis tier 2 (strength 3)
-    w.mc2_select_spell(0, 0, 1);
+    w.mc2_select_spell(Hx::FIRST, 11, 2, 0); // invis tier 2 (strength 3)
+    w.mc2_select_spell(Hx::FIRST, 0, 0, 1);
     w.tick(
         pose,
         PlayerCommand {
@@ -205,7 +206,7 @@ fn mc2_invisibility_break_law_per_tier() {
         },
     );
     assert!(
-        w.mc2_book_view().armed[11],
+        w.mc2_book_view(Hx::FIRST).armed[11],
         "T2 invisibility window is live"
     );
     w.tick(
@@ -216,7 +217,7 @@ fn mc2_invisibility_break_law_per_tier() {
         },
     );
     assert!(
-        w.mc2_book_view().armed[11],
+        w.mc2_book_view(Hx::FIRST).armed[11],
         "T2: casting fireball does NOT break invisibility (window survives)"
     );
 }
@@ -239,8 +240,8 @@ fn mc2_castle_cost_gate_tracks_live_level() {
     };
     // Earned, not lent: the dev cheat is an OVERLAY and its
     // toggle-off below takes back every spell it minted.
-    w.mc2_grant_start_book(&[2]);
-    w.set_dev_spells(true);
+    w.mc2_grant_start_book(Hx::FIRST, &[2]);
+    w.set_dev_spells(Hx::FIRST, true);
 
     // A 19×19 clear footprint (the castle needs room to stamp).
     let p = w.planes();
@@ -267,7 +268,7 @@ fn mc2_castle_cost_gate_tracks_live_level() {
     let pose = PlayerPose::from_tiles(px, alt, pz, 0.0, 0.0, 0.0);
 
     // Build a level-1 castle.
-    w.mc2_select_spell(2, 0, 0);
+    w.mc2_select_spell(Hx::FIRST, 2, 0, 0);
     w.tick(
         pose,
         PlayerCommand {
@@ -278,13 +279,13 @@ fn mc2_castle_cost_gate_tracks_live_level() {
     for _ in 0..120 {
         w.tick(pose, PlayerCommand::default());
     }
-    let (_, _, lvl1) = w.loadout().castle.expect("castle raised");
+    let (_, _, lvl1) = w.loadout(Hx::FIRST).castle.expect("castle raised");
     assert_eq!(lvl1, 1, "castle at level 1");
 
     // The live upgrade cost at level 1 = LADDER[1] = 10000 (tier 0, no
     // multiply). The pane already shows this; the gate must match it.
     assert_eq!(
-        w.mc2_book_view().cost[2],
+        w.mc2_book_view(Hx::FIRST).cost[2],
         10_000,
         "the live castle cost is the level-1 ladder rung"
     );
@@ -292,8 +293,8 @@ fn mc2_castle_cost_gate_tracks_live_level() {
     // Now play for real (dev off). With mana ABOVE the stale base (1000)
     // but BELOW the live cost (10000), the recast must be REFUSED — no
     // new castle ball launches, the castle stays level 1.
-    w.set_dev_spells(false);
-    w.set_player_mana(5_000);
+    w.set_dev_spells(Hx::FIRST, false);
+    w.set_player_mana(Hx::FIRST, 5_000);
     let count_balls = |w: &World| {
         w.debug_pool()
             .1
@@ -314,7 +315,7 @@ fn mc2_castle_cost_gate_tracks_live_level() {
         0,
         "5000 mana < the live 10000 cost → the recast is refused"
     );
-    let (_, _, lvl_after) = w.loadout().castle.expect("castle survives");
+    let (_, _, lvl_after) = w.loadout(Hx::FIRST).castle.expect("castle survives");
     assert_eq!(
         lvl_after, 1,
         "the refused recast left the castle at level 1"
@@ -323,7 +324,7 @@ fn mc2_castle_cost_gate_tracks_live_level() {
     // Sanity: with dev spells back on (the gate is bypassed) the same
     // recast DOES launch — proving the refusal above was the mana gate,
     // not a broken binding.
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     w.tick(pose, PlayerCommand::default());
     w.tick(
         pose,
@@ -355,7 +356,7 @@ fn mc2_castle_spell_lock_tracks_the_build_not_a_fixed_timer() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
 
     // A 19×19 clear footprint (same scan as the cost-gate test).
     let p = w.planes();
@@ -386,10 +387,14 @@ fn mc2_castle_spell_lock_tracks_the_build_not_a_fixed_timer() {
     );
 
     // Idle before casting: the lock is clear.
-    assert_eq!(w.debug_mc2_spell_active(2), 0, "lock clear before casting");
+    assert_eq!(
+        w.debug_mc2_spell_active(Hx::FIRST, 2),
+        0,
+        "lock clear before casting"
+    );
 
     // Cast.
-    w.mc2_select_spell(2, 0, 0);
+    w.mc2_select_spell(Hx::FIRST, 2, 0, 0);
     w.tick(
         pose,
         PlayerCommand {
@@ -402,14 +407,14 @@ fn mc2_castle_spell_lock_tracks_the_build_not_a_fixed_timer() {
     let mut cleared_at = None;
     for t in 0..101 {
         w.tick(pose, PlayerCommand::default());
-        if w.debug_mc2_spell_active(2) > 0 {
+        if w.debug_mc2_spell_active(Hx::FIRST, 2) > 0 {
             active_ticks += 1;
         } else if active_ticks > 0 && cleared_at.is_none() {
             cleared_at = Some(t);
             break;
         }
     }
-    let (_, _, lvl) = w.loadout().castle.expect("castle raised");
+    let (_, _, lvl) = w.loadout(Hx::FIRST).castle.expect("castle raised");
     assert_eq!(lvl, 1, "the build finished");
     // The lock was engaged during the build...
     assert!(active_ticks > 0, "the castle spell locked during the build");
@@ -432,7 +437,7 @@ fn mc2_castle_spell_lock_tracks_the_build_not_a_fixed_timer() {
         w.tick(pose, PlayerCommand::default());
     }
     assert_eq!(
-        w.debug_mc2_spell_active(2),
+        w.debug_mc2_spell_active(Hx::FIRST, 2),
         0,
         "the lock stays clear once the castle is standing idle"
     );
@@ -452,11 +457,11 @@ fn mc2_lightning_l0_is_a_one_tick_beam() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w);
     let pose = pose_at(&w, cx, cy);
 
-    w.mc2_select_spell(7, 0, 0); // Lightning tier 0
+    w.mc2_select_spell(Hx::FIRST, 7, 0, 0); // Lightning tier 0
     w.tick(
         pose,
         PlayerCommand {
@@ -508,7 +513,7 @@ fn mc2_lightning_storm_rains_beams() {
     let Some(mut w0) = build_world(&root) else {
         return;
     };
-    w0.set_dev_spells(true);
+    w0.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w0);
     let pose = pose_at(&w0, cx, cy);
     let mut ambient_peak = live(&w0);
@@ -519,8 +524,8 @@ fn mc2_lightning_storm_rains_beams() {
 
     for tier in 1u8..=2 {
         let mut w = build_world(&root).unwrap();
-        w.set_dev_spells(true);
-        w.mc2_select_spell(7, tier, 0);
+        w.set_dev_spells(Hx::FIRST, true);
+        w.mc2_select_spell(Hx::FIRST, 7, tier, 0);
         w.tick(
             pose,
             PlayerCommand {
@@ -563,11 +568,11 @@ fn mc2_lightning_t3_fans_two_bolts() {
     let Some(mut w) = build_world(&root) else {
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w);
     let pose = pose_at(&w, cx, cy);
 
-    w.mc2_select_spell(7, 1, 0); // T2 first: a single bolt
+    w.mc2_select_spell(Hx::FIRST, 7, 1, 0); // T2 first: a single bolt
     w.tick(
         pose,
         PlayerCommand {
@@ -578,8 +583,8 @@ fn mc2_lightning_t3_fans_two_bolts() {
     assert_eq!(count(&w, 9, 12), 1, "tier 2 launches a single bolt");
 
     let mut w = build_world(&root).unwrap();
-    w.set_dev_spells(true);
-    w.mc2_select_spell(7, 2, 0); // T3: the ±113 pair
+    w.set_dev_spells(Hx::FIRST, true);
+    w.mc2_select_spell(Hx::FIRST, 7, 2, 0); // T3: the ±113 pair
     w.tick(
         pose,
         PlayerCommand {
@@ -628,7 +633,7 @@ fn mc2_alliance_charms_instead_of_burning() {
     let Some(mut w) = build_world(&root) else {
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
 
     // A grounded, charm-eligible species (the sub_3A7F0 bar excludes
     // 12-15/22/23/25/26/27; skip the known flyers — the (9,25) bolt
@@ -661,7 +666,7 @@ fn mc2_alliance_charms_instead_of_burning() {
     // (heading 0 flies -y) at its own height — the bolt's ≤128-unit
     // sub-step victim probe crosses the creature's map cell on the
     // first flight tick, no autoaim geometry to get lucky with.
-    w.mc2_select_spell(24, 2, 0);
+    w.mc2_select_spell(Hx::FIRST, 24, 2, 0);
     let mut charmed = false;
     'volley: for _ in 0..10 {
         let Some(c) = w
@@ -710,12 +715,12 @@ fn mc2_volcano_boulders_are_not_cyclones() {
     let Some(mut w) = build_world(&root) else {
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w);
     let pose = pose_at(&w, cx, cy);
-    let xp21 = w.mc2_book_view().xp[21];
+    let xp21 = w.mc2_book_view(Hx::FIRST).xp[21];
 
-    w.mc2_select_spell(18, 2, 0); // Volcano T3
+    w.mc2_select_spell(Hx::FIRST, 18, 2, 0); // Volcano T3
     w.tick(
         pose,
         PlayerCommand {
@@ -737,7 +742,7 @@ fn mc2_volcano_boulders_are_not_cyclones() {
                 .any(|e| e.class == 10 && e.model == 6 && e.life > 0 && e.life <= 30);
         }
         assert_eq!(count(&w, 10, 22), 0, "no whirlwind head exists here");
-        let frame = w.take_audio(pose);
+        let frame = w.take_audio(Hx::FIRST, pose);
         assert!(
             !frame.events.iter().any(|e| e.id == 49),
             "a boulder must not run the cyclone loop (sound 49)"
@@ -752,7 +757,7 @@ fn mc2_volcano_boulders_are_not_cyclones() {
         "a landing boulder lights a 30-tick (10,6) fire"
     );
     assert_eq!(
-        w.mc2_book_view().xp[21] - xp21,
+        w.mc2_book_view(Hx::FIRST).xp[21] - xp21,
         0,
         "volcano rocks award no Whirlwind XP"
     );
@@ -772,10 +777,10 @@ fn mc2_meteor_flight_does_not_drag_the_fire_loop() {
     let Some(mut w) = build_world(&root) else {
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w);
     let pose = pose_at(&w, cx, cy);
-    w.mc2_select_spell(9, 0, 0); // Meteor T1
+    w.mc2_select_spell(Hx::FIRST, 9, 0, 0); // Meteor T1
     w.tick(
         pose,
         PlayerCommand {
@@ -787,7 +792,7 @@ fn mc2_meteor_flight_does_not_drag_the_fire_loop() {
     for _ in 0..30 {
         w.tick(pose, PlayerCommand::default());
         saw_spark |= count(&w, 10, 0) > 0;
-        let frame = w.take_audio(pose);
+        let frame = w.take_audio(Hx::FIRST, pose);
         assert!(
             !frame.fire_near,
             "the meteor's (10,0) spark trail must not arm the fire-ambient loop"
@@ -806,13 +811,13 @@ fn mc2_speed_window_interrupts_on_brake() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w);
     let pose = pose_at(&w, cx, cy);
 
     // Cast Speed (3) tier 0 → arms the fixed-duration window and drives
     // the travel-speed override.
-    w.mc2_select_spell(3, 0, 0);
+    w.mc2_select_spell(Hx::FIRST, 3, 0, 0);
     w.tick(
         pose,
         PlayerCommand {
@@ -820,9 +825,12 @@ fn mc2_speed_window_interrupts_on_brake() {
             ..Default::default()
         },
     );
-    assert!(w.mc2_book_view().armed[3], "the Speed window is live");
     assert!(
-        w.accel_override().is_some(),
+        w.mc2_book_view(Hx::FIRST).armed[3],
+        "the Speed window is live"
+    );
+    assert!(
+        w.accel_override(Hx::FIRST).is_some(),
         "the Speed boost overrides travel speed"
     );
 
@@ -835,24 +843,24 @@ fn mc2_speed_window_interrupts_on_brake() {
     // where it lives, in `flight::mc2_move`. What this exercises is the
     // ALTERNATE-mover entry point, which keeps the immediate form for
     // exactly the movers that never run a carpet dispatch.
-    w.accel_brake_immediate(1.0);
+    w.accel_brake_immediate(Hx::FIRST, 1.0);
     w.tick(pose, PlayerCommand::default());
     assert!(
-        w.mc2_book_view().armed[3],
+        w.mc2_book_view(Hx::FIRST).armed[3],
         "a forward thrust leaves the Speed window running"
     );
 
     // Braking INTERRUPTS the window. The window clears, the boost
     // drops, and because the burst timer `f26` is zeroed the mana-regen
     // suppression lifts with it (armed==false ⇒ f26==0).
-    w.accel_brake_immediate(-1.0);
+    w.accel_brake_immediate(Hx::FIRST, -1.0);
     w.tick(pose, PlayerCommand::default());
     assert!(
-        !w.mc2_book_view().armed[3],
+        !w.mc2_book_view(Hx::FIRST).armed[3],
         "braking cancels the MC2 Speed window"
     );
     assert!(
-        w.accel_override().is_none(),
+        w.accel_override(Hx::FIRST).is_none(),
         "braking stops the MC2 Speed boost"
     );
 }
@@ -896,14 +904,14 @@ fn mc2_a_refused_commit_gate_kills_the_speed_window_with_no_restore() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w);
     let pose = PlayerPose {
         speed: 80,
         ..pose_at(&w, cx, cy)
     };
 
-    w.mc2_select_spell(3, 0, 0);
+    w.mc2_select_spell(Hx::FIRST, 3, 0, 0);
     w.tick(
         pose,
         PlayerCommand {
@@ -911,16 +919,19 @@ fn mc2_a_refused_commit_gate_kills_the_speed_window_with_no_restore() {
             ..Default::default()
         },
     );
-    assert!(w.mc2_book_view().armed[3], "the Speed window is live");
+    assert!(
+        w.mc2_book_view(Hx::FIRST).armed[3],
+        "the Speed window is live"
+    );
     // The arm tick is one factor hotter: 80 * (subSpellIndex_2 + 1).
     assert_eq!(
-        w.take_speed_base(),
+        w.take_speed_base(Hx::FIRST),
         Some(240),
         "the arm tick mails minSpeed * (sub + 1)"
     );
     w.tick(pose, PlayerCommand::default());
     assert_eq!(
-        w.take_speed_base(),
+        w.take_speed_base(Hx::FIRST),
         Some(160),
         "a sustained tick mails minSpeed * sub"
     );
@@ -929,13 +940,13 @@ fn mc2_a_refused_commit_gate_kills_the_speed_window_with_no_restore() {
     // statement, reached from both the faithful dispatch
     // (`World::step_player_flight_mc2`, on `Mc2Moved::accel_cancel`)
     // and the enhanced mover's copy in `Simulation`.
-    w.mc2_cancel_accel();
+    w.mc2_cancel_accel(Hx::FIRST);
     assert!(
-        !w.mc2_book_view().armed[3],
+        !w.mc2_book_view(Hx::FIRST).armed[3],
         "a refused commit gate kills the Speed window"
     );
     assert!(
-        w.accel_override().is_none(),
+        w.accel_override(Hx::FIRST).is_none(),
         "…and the alternate movers' boost channel with it"
     );
 
@@ -943,12 +954,16 @@ fn mc2_a_refused_commit_gate_kills_the_speed_window_with_no_restore() {
     // would post `sign * 80` here; this one is simply gone.
     w.tick(pose, PlayerCommand::default());
     assert_eq!(
-        w.take_speed_base(),
+        w.take_speed_base(Hx::FIRST),
         None,
         "the kill is not an expiry — no minSpeed restore follows it"
     );
     w.tick(pose, PlayerCommand::default());
-    assert_eq!(w.take_speed_base(), None, "…and none on the tick after");
+    assert_eq!(
+        w.take_speed_base(Hx::FIRST),
+        None,
+        "…and none on the tick after"
+    );
 }
 
 #[test]
@@ -966,7 +981,7 @@ fn mc2_speed_direction_follows_current_velocity() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w);
     let fire = PlayerCommand {
         fire_left: true,
@@ -985,39 +1000,43 @@ fn mc2_speed_direction_follows_current_velocity() {
         speed: -80,
         ..pose_at(&w, cx, cy)
     };
-    w.set_mc2_cmd_speed(-80);
-    w.mc2_select_spell(3, 0, 0);
+    w.set_mc2_cmd_speed(Hx::FIRST, -80);
+    w.mc2_select_spell(Hx::FIRST, 3, 0, 0);
     w.tick(back, fire);
-    let over = w.accel_override().expect("the Speed boost is live");
+    let over = w
+        .accel_override(Hx::FIRST)
+        .expect("the Speed boost is live");
     assert!(
         over < 0.0,
         "backward flight casts a backward boost ({over})"
     );
 
     // A further BACKWARD press does not cancel it...
-    w.accel_brake_immediate(-1.0);
+    w.accel_brake_immediate(Hx::FIRST, -1.0);
     w.tick(back, PlayerCommand::default());
     assert!(
-        w.mc2_book_view().armed[3],
+        w.mc2_book_view(Hx::FIRST).armed[3],
         "backward thrust rides along with a backward boost"
     );
     // ...the resisting (forward) input does.
-    w.accel_brake_immediate(1.0);
+    w.accel_brake_immediate(Hx::FIRST, 1.0);
     w.tick(back, PlayerCommand::default());
     assert!(
-        !w.mc2_book_view().armed[3],
+        !w.mc2_book_view(Hx::FIRST).armed[3],
         "forward thrust brakes a backward boost"
     );
-    assert!(w.accel_override().is_none());
+    assert!(w.accel_override(Hx::FIRST).is_none());
 
     // Standstill counts as FORWARD (retail `>= 0`) — and standstill
     // means the COMMAND word is 0, so the rig drops it back here too.
     let still = pose_at(&w, cx, cy);
     assert_eq!(still.speed, 0, "fixture pose is at standstill");
-    w.set_mc2_cmd_speed(0);
-    w.mc2_select_spell(3, 0, 0);
+    w.set_mc2_cmd_speed(Hx::FIRST, 0);
+    w.mc2_select_spell(Hx::FIRST, 3, 0, 0);
     w.tick(still, fire);
-    let over = w.accel_override().expect("the Speed boost is live");
+    let over = w
+        .accel_override(Hx::FIRST)
+        .expect("the Speed boost is live");
     assert!(over > 0.0, "standstill casts a forward boost ({over})");
 
     // ⭐⭐⭐ THE ARM THAT DISCRIMINATES — mc2l33 t=8,896, and the ONLY
@@ -1040,20 +1059,22 @@ fn mc2_speed_direction_follows_current_velocity() {
     // The three arms above all keep the pose and the command word in
     // agreement, so they pass under EITHER reading; this one fails
     // with `MGC_NO_MC2_SPEED_SIGN_CMD=1`.
-    w.accel_brake_immediate(-1.0);
+    w.accel_brake_immediate(Hx::FIRST, -1.0);
     w.tick(still, PlayerCommand::default());
     assert!(
-        w.accel_override().is_none(),
+        w.accel_override(Hx::FIRST).is_none(),
         "the standstill boost is braked"
     );
     let coasting = PlayerPose {
         speed: -112,
         ..pose_at(&w, cx, cy)
     };
-    w.set_mc2_cmd_speed(0); // the cave wall zeroed the COMMAND word
-    w.mc2_select_spell(3, 0, 0);
+    w.set_mc2_cmd_speed(Hx::FIRST, 0); // the cave wall zeroed the COMMAND word
+    w.mc2_select_spell(Hx::FIRST, 3, 0, 0);
     w.tick(coasting, fire);
-    let over = w.accel_override().expect("the Speed boost is live");
+    let over = w
+        .accel_override(Hx::FIRST)
+        .expect("the Speed boost is live");
     assert!(
         over > 0.0,
         "a carpet COASTING backward with a zeroed command word boosts \
@@ -1080,22 +1101,22 @@ fn mc2_enhanced_backward_flight_casts_a_backward_speed_boost() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w);
-    w.mc2_select_spell(3, 0, 0);
+    w.mc2_select_spell(Hx::FIRST, 3, 0, 0);
 
     let mut sim = mgc_sim::Simulation::with_world(w);
-    sim.thrust_model = mgc_sim::ThrustModel::Enhanced;
-    sim.altitude_model = mgc_sim::AltitudeModel::ExtendedLift;
-    sim.flyer.x = cx as f32 + 0.5;
-    sim.flyer.z = cy as f32 + 0.5;
+    sim.thrust_model[Hx::FIRST] = mgc_sim::ThrustModel::Enhanced;
+    sim.altitude_model[Hx::FIRST] = mgc_sim::AltitudeModel::ExtendedLift;
+    sim.flyer[Hx::FIRST].x = cx as f32 + 0.5;
+    sim.flyer[Hx::FIRST].z = cy as f32 + 0.5;
     let ground = sim
         .world
         .as_ref()
         .unwrap()
-        .ground_height_tiles(sim.flyer.x, sim.flyer.z);
-    sim.flyer.y = ground + 3.0;
-    sim.sync_carpet_from_flyer();
+        .ground_height_tiles(sim.flyer[Hx::FIRST].x, sim.flyer[Hx::FIRST].z);
+    sim.flyer[Hx::FIRST].y = ground + 3.0;
+    sim.sync_carpet_from_flyer(Hx::FIRST);
 
     // Reverse thrust until the flyer genuinely drifts backward.
     let back = mgc_sim::FlightInput {
@@ -1105,8 +1126,8 @@ fn mc2_enhanced_backward_flight_casts_a_backward_speed_boost() {
     for _ in 0..30 {
         sim.step(&back);
     }
-    let (sy, cyaw) = sim.flyer.yaw.sin_cos();
-    let fwd_v = sim.flyer.vx * sy - sim.flyer.vz * cyaw;
+    let (sy, cyaw) = sim.flyer[Hx::FIRST].yaw.sin_cos();
+    let fwd_v = sim.flyer[Hx::FIRST].vx * sy - sim.flyer[Hx::FIRST].vz * cyaw;
     assert!(
         fwd_v < -0.5,
         "reverse thrust moves the flyer backward (forward speed {fwd_v})"
@@ -1122,7 +1143,7 @@ fn mc2_enhanced_backward_flight_casts_a_backward_speed_boost() {
         .world
         .as_ref()
         .unwrap()
-        .accel_override()
+        .accel_override(Hx::FIRST)
         .expect("the Speed boost is live");
     assert!(
         over < 0.0,
@@ -1133,8 +1154,8 @@ fn mc2_enhanced_backward_flight_casts_a_backward_speed_boost() {
     for _ in 0..10 {
         sim.step(&mgc_sim::FlightInput::default());
     }
-    let (sy, cyaw) = sim.flyer.yaw.sin_cos();
-    let fwd_v = sim.flyer.vx * sy - sim.flyer.vz * cyaw;
+    let (sy, cyaw) = sim.flyer[Hx::FIRST].yaw.sin_cos();
+    let fwd_v = sim.flyer[Hx::FIRST].vx * sy - sim.flyer[Hx::FIRST].vz * cyaw;
     assert!(fwd_v < -0.5, "the backward boost self-propels ({fwd_v})");
     // ...until the RESISTING (forward) press brakes it.
     sim.step(&mgc_sim::FlightInput {
@@ -1143,7 +1164,11 @@ fn mc2_enhanced_backward_flight_casts_a_backward_speed_boost() {
     });
     sim.step(&mgc_sim::FlightInput::default());
     assert!(
-        sim.world.as_ref().unwrap().accel_override().is_none(),
+        sim.world
+            .as_ref()
+            .unwrap()
+            .accel_override(Hx::FIRST)
+            .is_none(),
         "forward thrust brakes the backward boost"
     );
 }
@@ -1168,7 +1193,7 @@ fn mc2_earthquake_carves_without_flooding_the_pool() {
     let Some(mut w0) = build_world(&root) else {
         return;
     };
-    w0.set_dev_spells(true);
+    w0.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w0);
     let pose = pose_at(&w0, cx, cy);
     let mut ambient_peak = live(&w0);
@@ -1179,8 +1204,8 @@ fn mc2_earthquake_carves_without_flooding_the_pool() {
 
     // Cast Earthquake tier 2 (the longest trail) and track the peak.
     let mut w = build_world(&root).unwrap();
-    w.set_dev_spells(true);
-    w.mc2_select_spell(17, 2, 0);
+    w.set_dev_spells(Hx::FIRST, true);
+    w.mc2_select_spell(Hx::FIRST, 17, 2, 0);
     w.tick(
         pose,
         PlayerCommand {
@@ -1219,7 +1244,7 @@ fn mc2_fools_mana_throws_six_decoys_that_trap_the_possessor() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w);
     let pose = pose_at(&w, cx, cy);
 
@@ -1228,7 +1253,7 @@ fn mc2_fools_mana_throws_six_decoys_that_trap_the_possessor() {
     // so the cast can be shown not to make any.
     let base = count(&w, 10, 57);
     let real_mana = count(&w, 10, 39);
-    w.mc2_select_spell(22, 0, 0); // Fool's Mana tier 0, left hand
+    w.mc2_select_spell(Hx::FIRST, 22, 0, 0); // Fool's Mana tier 0, left hand
     w.tick(
         pose,
         PlayerCommand {
@@ -1407,11 +1432,11 @@ fn mc2_fools_mana_tier2_retaliates_with_lightning() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w);
     let pose = pose_at(&w, cx, cy);
 
-    w.mc2_select_spell(22, 2, 0); // Fool's Mana tier 2
+    w.mc2_select_spell(Hx::FIRST, 22, 2, 0); // Fool's Mana tier 2
     w.tick(
         pose,
         PlayerCommand {
@@ -1469,7 +1494,7 @@ fn mc2_magic_mine_relaunch_reaches_a_neighbouring_wizard() {
         );
     }
     assert_eq!(
-        w.vitals().grace,
+        w.vitals(Hx::FIRST).grace,
         0,
         "grace must be gone or this proves nothing"
     );
@@ -1478,7 +1503,7 @@ fn mc2_magic_mine_relaunch_reaches_a_neighbouring_wizard() {
     // entry guard (EF:29793-98, owner dead ⇒ the mine goes) holds.
     let owner = w.debug_mc2_spawn_creature(19, cx + 40, cy + 40, 900);
     assert!(owner != 0, "owner spawned");
-    let before = w.player_damage_taken();
+    let before = w.player_damage_taken(Hx::FIRST);
     let (px, pz) = (cx as f32 + 2.5, cy as f32 + 0.5);
     let mut fired = false;
     // A mine's arm countdown is `rand % 0x32 + 16` off its OWN slot-seeded
@@ -1504,8 +1529,8 @@ fn mc2_magic_mine_relaunch_reaches_a_neighbouring_wizard() {
             // The relaunched (9,0) can pop a slot ABOVE the mine's, fly its
             // two tiles and land inside the same walk — the hit itself is
             // the witness then, not a projectile count at the tick's end.
-            fired |= count(&w, 9, 0) > 0 || w.player_damage_taken() > before;
-            if w.player_damage_taken() > before || count(&w, 10, 78) == 0 {
+            fired |= count(&w, 9, 0) > 0 || w.player_damage_taken(Hx::FIRST) > before;
+            if w.player_damage_taken(Hx::FIRST) > before || count(&w, 10, 78) == 0 {
                 break;
             }
         }
@@ -1515,7 +1540,7 @@ fn mc2_magic_mine_relaunch_reaches_a_neighbouring_wizard() {
     }
     assert!(fired, "the mine relaunched the swallowed fireball");
     assert!(
-        w.player_damage_taken() > before,
+        w.player_damage_taken(Hx::FIRST) > before,
         "a wizard two tiles from a tripped mine is hit by its relaunch"
     );
 }
@@ -1534,12 +1559,12 @@ fn mc2_magic_mine_places_a_persistent_mine_not_a_fireball() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w);
     let pose = pose_at(&w, cx, cy);
     assert_eq!(count(&w, 10, 78), 0, "no mines at level start");
 
-    w.mc2_select_spell(23, 0, 0); // Magic Mine tier 0
+    w.mc2_select_spell(Hx::FIRST, 23, 0, 0); // Magic Mine tier 0
     w.tick(
         pose,
         PlayerCommand {
@@ -1570,7 +1595,7 @@ fn mc2_magic_mine_places_a_persistent_mine_not_a_fireball() {
     // draw allowlist, so a cast looked like a carrier that flew off and
     // dissolved. Counting entities cannot see that — only a pose can.
     assert!(
-        w.live_poses().iter().any(|p| p.type_index == 66),
+        w.live_poses(Hx::FIRST).iter().any(|p| p.type_index == 66),
         "the placed mine exports a sprite pose (ctor sprite 66)"
     );
 }
@@ -1683,13 +1708,13 @@ fn mc2_fools_mana_decoys_do_not_count_toward_world_mana() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w);
     let pose = pose_at(&w, cx, cy);
     w.tick(pose, PlayerCommand::default()); // settle the mana census
-    let before = w.loadout().world_mana;
+    let before = w.loadout(Hx::FIRST).world_mana;
 
-    w.mc2_select_spell(22, 0, 0); // Fool's Mana tier 0
+    w.mc2_select_spell(Hx::FIRST, 22, 0, 0); // Fool's Mana tier 0
     w.tick(
         pose,
         PlayerCommand {
@@ -1700,7 +1725,7 @@ fn mc2_fools_mana_decoys_do_not_count_toward_world_mana() {
     w.tick(pose, PlayerCommand::default()); // recompute the census
     let decoys = count(&w, 10, 57);
     assert!(decoys >= 6, "six decoys exist, got {decoys}");
-    let after = w.loadout().world_mana;
+    let after = w.loadout(Hx::FIRST).world_mana;
     // Six decoys carry up to 6×1999 ≈ 12000 fake mana; excluded, the
     // denominator barely moves (a decoy would add thousands each).
     assert!(
@@ -1723,13 +1748,17 @@ fn mc2_metamorph_transforms_and_reverts() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w);
     let pose = pose_at(&w, cx, cy);
     let base = count(&w, 5, 19);
-    assert_eq!(w.mc2_metamorph_model(), 0, "not transformed at start");
+    assert_eq!(
+        w.mc2_metamorph_model(Hx::FIRST),
+        0,
+        "not transformed at start"
+    );
 
-    w.mc2_select_spell(4, 0, 0); // Metamorph tier 0 → model 19 (non-Day)
+    w.mc2_select_spell(Hx::FIRST, 4, 0, 0); // Metamorph tier 0 → model 19 (non-Day)
     w.tick(
         pose,
         PlayerCommand {
@@ -1737,7 +1766,11 @@ fn mc2_metamorph_transforms_and_reverts() {
             ..Default::default()
         },
     );
-    assert_eq!(w.mc2_metamorph_model(), 19, "transformed into model 19");
+    assert_eq!(
+        w.mc2_metamorph_model(Hx::FIRST),
+        19,
+        "transformed into model 19"
+    );
     assert_eq!(
         count(&w, 5, 19),
         base + 1,
@@ -1748,7 +1781,11 @@ fn mc2_metamorph_transforms_and_reverts() {
     for _ in 0..260 {
         w.tick(pose, PlayerCommand::default());
     }
-    assert_eq!(w.mc2_metamorph_model(), 0, "reverted after the window");
+    assert_eq!(
+        w.mc2_metamorph_model(Hx::FIRST),
+        0,
+        "reverted after the window"
+    );
     assert_eq!(count(&w, 5, 19), base, "the pose-puppet despawned");
 }
 
@@ -1765,12 +1802,12 @@ fn mc2_summon_army_spawns_an_allied_ring() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w);
     let pose = pose_at(&w, cx, cy);
     let base = count(&w, 5, 19);
 
-    w.mc2_select_spell(19, 0, 0); // Summon Army tier 0 → firefly (19) ×8
+    w.mc2_select_spell(Hx::FIRST, 19, 0, 0); // Summon Army tier 0 → firefly (19) ×8
     w.tick(
         pose,
         PlayerCommand {
@@ -1806,10 +1843,10 @@ fn mc2_earthquake_travel_scales_with_tier() {
     // water-gate (`f26 > 8`) that can cut travel short in a wet spot.
     let trail_life = |tier: u8| -> i32 {
         let mut w = build_world(&root).unwrap();
-        w.set_dev_spells(true);
+        w.set_dev_spells(Hx::FIRST, true);
         let (cx, cy) = open_spot(&w);
         let pose = pose_at(&w, cx, cy);
-        w.mc2_select_spell(17, tier, 0); // Earthquake
+        w.mc2_select_spell(Hx::FIRST, 17, tier, 0); // Earthquake
         w.tick(
             pose,
             PlayerCommand {
@@ -1868,7 +1905,7 @@ fn mc2_quake_family_lifetimes_scale_with_tier() {
     };
     let effect_life = |spell: u8, tier: u8, model: u8, pitch: f32| -> i32 {
         let mut w = build_world(&root).unwrap();
-        w.set_dev_spells(true);
+        w.set_dev_spells(Hx::FIRST, true);
         let (cx, cy) = dry_lane_spot(&w);
         let (px, pz) = (cx as f32 + 0.5, cy as f32 + 0.5);
         let alt = w.ground_height_tiles(px, pz) + 2.0;
@@ -1876,7 +1913,7 @@ fn mc2_quake_family_lifetimes_scale_with_tier() {
         // gravity-well/tremor carriers FLY — pitch them into the
         // terrain so the impact spawns inside the scan window.
         let pose = PlayerPose::from_tiles(px, alt, pz, 0.0, pitch, 0.0);
-        w.mc2_select_spell(spell, tier, 0);
+        w.mc2_select_spell(Hx::FIRST, spell, tier, 0);
         w.tick(
             pose,
             PlayerCommand {
@@ -1933,11 +1970,11 @@ fn mc2_spell_select_raises_notification_toast() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
 
     assert!(w.notification().is_none(), "no toast at level start");
 
-    w.mc2_select_spell(1, 1, 0); // Possession tier 1
+    w.mc2_select_spell(Hx::FIRST, 1, 1, 0); // Possession tier 1
     let want = w.mc2_spell_name(1, 1).to_string();
     assert!(!want.is_empty(), "the tier-1 name resolves from L1.TXT");
     let (text, color) = w.notification().expect("select raises a toast");
@@ -1971,12 +2008,12 @@ fn mc2_rebound_deflects_and_reowns() {
         let Some(mut w) = build_world(&root) else {
             return;
         };
-        w.set_dev_spells(true);
+        w.set_dev_spells(Hx::FIRST, true);
         let (cx, cy) = open_spot(&w);
         let pose = pose_at(&w, cx, cy);
-        let xp8 = w.mc2_book_view().xp[8];
+        let xp8 = w.mc2_book_view(Hx::FIRST).xp[8];
 
-        w.mc2_select_spell(8, tier, 0);
+        w.mc2_select_spell(Hx::FIRST, 8, tier, 0);
         w.tick(
             pose,
             PlayerCommand {
@@ -1984,7 +2021,10 @@ fn mc2_rebound_deflects_and_reowns() {
                 ..Default::default()
             },
         );
-        assert!(w.mc2_book_view().armed[8], "the Rebound window is live");
+        assert!(
+            w.mc2_book_view(Hx::FIRST).armed[8],
+            "the Rebound window is live"
+        );
 
         // A hostile bolt from 3 tiles north, flying south (0x400)
         // straight at the player.
@@ -1999,9 +2039,9 @@ fn mc2_rebound_deflects_and_reowns() {
 
         let mut row = None;
         for _ in 0..12 {
-            let before = w.debug_player_mana() as i64;
+            let before = w.debug_player_mana(Hx::FIRST) as i64;
             w.tick(pose, PlayerCommand::default());
-            steps.push(w.debug_player_mana() as i64 - before);
+            steps.push(w.debug_player_mana(Hx::FIRST) as i64 - before);
             let Some(r) = w
                 .debug_flock_probe(9, 0)
                 .into_iter()
@@ -2009,7 +2049,7 @@ fn mc2_rebound_deflects_and_reowns() {
             else {
                 break; // detonated/expired — no deflection happened
             };
-            if r.id24 == 0xFFFF {
+            if r.id24 == w.human_tag(Hx::FIRST) {
                 row = Some(r); // re-owned to the player = deflected
                 break;
             }
@@ -2045,7 +2085,7 @@ fn mc2_rebound_deflects_and_reowns() {
         // See [`mgc_sim::mc2::cast::no_mc2_rebound_xp_on_deflect`];
         // `MGC_NO_MC2_REBOUND_XP_ON_DEFLECT=1` restores the 2.
         assert_eq!(
-            w.mc2_book_view().xp[8] - xp8,
+            w.mc2_book_view(Hx::FIRST).xp[8] - xp8,
             1, // the DEFLECT alone (EF:55624) — the cast pays nothing
             "the deflection awards Rebound XP, and it is the only \
              spell-8 award site in the binary"
@@ -2094,10 +2134,10 @@ fn mc2_whirlwind_duration_law_8x_tier_life() {
         let Some(mut w) = build_world(&root) else {
             return;
         };
-        w.set_dev_spells(true);
+        w.set_dev_spells(Hx::FIRST, true);
         let (cx, cy) = open_spot(&w);
         let pose = pose_at(&w, cx, cy);
-        w.mc2_select_spell(21, tier, 0);
+        w.mc2_select_spell(Hx::FIRST, 21, tier, 0);
         w.tick(
             pose,
             PlayerCommand {
@@ -2166,7 +2206,7 @@ fn mc2_speed_window_survives_the_casters_death_fall() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w);
     let fire = PlayerCommand {
         fire_left: true,
@@ -2181,40 +2221,43 @@ fn mc2_speed_window_survives_the_casters_death_fall() {
         z: base.z.saturating_add(8192),
         ..base
     };
-    w.set_mc2_cmd_speed(-80);
-    w.mc2_select_spell(3, 0, 0);
+    w.set_mc2_cmd_speed(Hx::FIRST, -80);
+    w.mc2_select_spell(Hx::FIRST, 3, 0, 0);
     w.tick(flying, fire);
-    assert!(w.mc2_book_view().armed[3], "the Speed window is live");
+    assert!(
+        w.mc2_book_view(Hx::FIRST).armed[3],
+        "the Speed window is live"
+    );
     assert_eq!(
-        w.take_speed_base(),
+        w.take_speed_base(Hx::FIRST),
         Some(-240),
         "the arm tick spikes 3x backward"
     );
     w.tick(flying, PlayerCommand::default());
     assert_eq!(
-        w.take_speed_base(),
+        w.take_speed_base(Hx::FIRST),
         Some(-160),
         "…then sustains 2x backward"
     );
 
     // THE LETHAL HIT. From the next dispatch on, `sub_68D50` answers
     // false on `life_0x8 < 0` and the effect body is skipped.
-    w.debug_kill_player();
+    w.debug_kill_player(Hx::FIRST);
     for tick in 0..6 {
         w.tick(flying, PlayerCommand::default());
-        if !w.player_falling() {
+        if !w.player_falling(Hx::FIRST) {
             // The corpse has landed — the scatter owns the window now.
             assert!(tick > 0, "the fall must last at least one tick");
             return;
         }
         assert_eq!(
-            w.take_speed_base(),
+            w.take_speed_base(Hx::FIRST),
             None,
             "tick {tick} of the death fall mailed a speed base — retail's \
              unaffordable arm writes NOTHING (NETHERW.EXE 0x8E784 `je`)"
         );
         assert!(
-            w.mc2_book_view().armed[3],
+            w.mc2_book_view(Hx::FIRST).armed[3],
             "tick {tick}: the Speed window must keep counting down \
              uncollapsed while its caster falls"
         );

@@ -366,7 +366,7 @@ impl Gen {
             // footprint list, so a site bound to the wrong variant
             // would silently acquire (or lose) that pass.
             let hits = self.area_write(i, 0, amt, ctx, false, true);
-            if hits != 0 && self.ent[i].id24 == crate::mc1::mobs::PLAYER_TARGET {
+            if hits != 0 && self.is_human_tag(self.ent[i].id24) {
                 self.mc2_cast_xp.0.push((self.ent[i].id24, 18, hits as i32));
             }
         }
@@ -881,6 +881,11 @@ impl Gen {
         // `xp_vol` rows, and the `levels[20]` tier-up at t=74066 under
         // them. See [`no_mc2_rain_spell_xp`].
         if !no_mc2_rain_spell_xp() && self.ent[i].f63 & 1 == 0 {
+            // The caster's seat (seat 0 when no human owns the rain —
+            // the pre-seat behaviour).
+            let rain_seat = self
+                .hx_of_tag(self.ent[i].id24)
+                .unwrap_or(crate::engine::world::Hx::FIRST);
             for s in 0..26usize {
                 let Some(row) = self.assets.spells.get(s).copied() else {
                     break;
@@ -893,7 +898,7 @@ impl Gen {
                 // re-applies `sub_6D8B0`'s own class-3/model-0 guard.
                 self.mc2_cast_xp
                     .0
-                    .push((crate::mc1::mobs::PLAYER_TARGET, s as u16, amt));
+                    .push((self.human_tag[rain_seat].0, s as u16, amt));
             }
         }
     }
@@ -1000,7 +1005,8 @@ mod tests {
         // POSITIVE CONTROL: a fresh summit's counter steps at all.
         let fresh = g.mc2_spawn_summit18(p.0, p.1, p.2).expect("summit18");
         assert_eq!(g.arc10(fresh), 0, "the ctor's `movl $0x0,0x10`");
-        g.mc2_summit18_tick(fresh, &test_ctx(false, false));
+        let rig_ctx = test_ctx(&mut g, false, false);
+        g.mc2_summit18_tick(fresh, &rig_ctx);
         assert_eq!(g.arc10(fresh), 1, "the tail `dword_0x10_16++`");
 
         // A LATCHED summit past the restart gate: `erupting` holds its
@@ -1010,7 +1016,8 @@ mod tests {
         g.erupting = i as u16;
         g.set_arc10(i, 32_760);
         for _ in 0..20 {
-            g.mc2_summit18_tick(i, &test_ctx(false, false));
+            let rig_ctx = test_ctx(&mut g, false, false);
+            g.mc2_summit18_tick(i, &rig_ctx);
         }
         assert_eq!(
             g.arc10(i),
@@ -1032,18 +1039,15 @@ mod tests {
         );
     }
 
-    fn test_ctx(patched: bool, strict: bool) -> MobCtx {
+    fn test_ctx(g: &mut crate::engine::features::Gen, patched: bool, strict: bool) -> MobCtx {
+        *g.view_mut(crate::engine::world::Hx::FIRST) = crate::engine::features::SeatView {
+            z: 100,
+            ..Default::default()
+        };
         let mut patches = crate::patches::WorldPatches::RETAIL;
         patches.volcano_register_revalidate = patched;
         MobCtx {
-            px: 0,
-            py: 0,
-            pz: 100,
-            pyaw: 0,
-            pmana: 0,
-            pmana_max: 0,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict,
             patches,
             mc2_turn: 0,
@@ -1080,7 +1084,8 @@ mod tests {
             g.ent[castle].f26 = 3;
             let v = fresh_vortex(&mut g);
             g.erupting = castle as u16;
-            g.mc2_summit18_tick(v, &test_ctx(patched, strict));
+            let rig_ctx = test_ctx(&mut g, patched, strict);
+            g.mc2_summit18_tick(v, &rig_ctx);
             assert_eq!(g.erupting, v as u16, "the start registers the new vortex");
             let want = if patched && !strict { 3 } else { 250 };
             assert_eq!(
@@ -1094,7 +1099,8 @@ mod tests {
             g.set_arc10(old, 60);
             let v = fresh_vortex(&mut g);
             g.erupting = old as u16;
-            g.mc2_summit18_tick(v, &test_ctx(patched, strict));
+            let rig_ctx = test_ctx(&mut g, patched, strict);
+            g.mc2_summit18_tick(v, &rig_ctx);
             assert_eq!(g.arc10(old), 250, "the old vortex is fast-expired");
         }
     }
@@ -1115,7 +1121,8 @@ mod tests {
             g.ent[sphere].model65 = 39;
             let v = fresh_vortex(&mut g);
             g.plume = sphere as u16;
-            g.mc2_summit18_tick(v, &test_ctx(patched, strict));
+            let rig_ctx = test_ctx(&mut g, patched, strict);
+            g.mc2_summit18_tick(v, &rig_ctx);
             assert_ne!(
                 g.plume, sphere as u16,
                 "the register moved on to the new column"
@@ -1133,7 +1140,8 @@ mod tests {
             let col = g.mc2_spawn_fire_spray(40 << 8, 40 << 8, z).expect("column");
             let v = fresh_vortex(&mut g);
             g.plume = col as u16;
-            g.mc2_summit18_tick(v, &test_ctx(patched, strict));
+            let rig_ctx = test_ctx(&mut g, patched, strict);
+            g.mc2_summit18_tick(v, &rig_ctx);
             assert_ne!(g.ent[col].flags & 0x400, 0, "the old column is killed");
         }
     }
@@ -1154,7 +1162,8 @@ mod tests {
             let stale = g.new_event().expect("stale slot");
             g.free_entity(stale);
             g.plume = stale as u16;
-            g.mc2_summit18_tick(v, &test_ctx(patched, strict));
+            let rig_ctx = test_ctx(&mut g, patched, strict);
+            g.mc2_summit18_tick(v, &rig_ctx);
             assert_eq!(
                 g.plume, stale as u16,
                 "the new column was minted into the stale slot"
@@ -1188,7 +1197,8 @@ mod tests {
                     .count()
             };
             let before = bolts(&g);
-            g.mc2_summit18_tick(v, &test_ctx(patched, strict));
+            let rig_ctx = test_ctx(&mut g, patched, strict);
+            g.mc2_summit18_tick(v, &rig_ctx);
             if patched && !strict {
                 assert_eq!(g.arc10(v), 1, "patched: a normal start");
                 assert_eq!(g.ent[v].flags & 0x400, 0);

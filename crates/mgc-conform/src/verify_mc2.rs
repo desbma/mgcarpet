@@ -38,6 +38,7 @@ use crate::verify::{FieldDiff, PairDiff, START_WARMUP, Stats};
 /// ([`mgc_formats::mgcr::mc2_take_replayed`]).
 pub(crate) use mgc_formats::mgcr::mc2_take_replayed;
 use mgc_formats::mgcr::{EntObsMc2, ObsMc2, Recording, RetailEntMc2, RetailMc2, decode_retail_mc2};
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::conformance::{PinnedMc2, ThingTable};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
@@ -1628,7 +1629,7 @@ pub(crate) fn build_world_mc2_with_book(
         }
     }
     if let Some(book) = human_book {
-        w.mc2_grant_start_book(book);
+        w.mc2_grant_start_book(Hx::FIRST, book);
     }
     let (wizards, player_count) = mc2_rival_configs(pkg.wizards.as_ref(), header);
     w.set_mc2_wizards(&wizards, player_count);

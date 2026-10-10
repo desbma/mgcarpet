@@ -15,6 +15,7 @@
 //! turns a skip into a failure.
 
 use mgc_formats::LevelPackage;
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::World;
 use mgc_sim::ids::GameId;
@@ -108,8 +109,8 @@ fn mc2_world(root: &Path) -> Option<World> {
 
 fn sim_of(w: World) -> Simulation {
     let mut s = Simulation::with_world(w);
-    s.thrust_model = ThrustModel::Mc1;
-    s.sync_carpet_from_flyer();
+    s.thrust_model[Hx::FIRST] = ThrustModel::Mc1;
+    s.sync_carpet_from_flyer(Hx::FIRST);
     s
 }
 

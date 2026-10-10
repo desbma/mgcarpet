@@ -41,8 +41,8 @@ use crate::engine::features::{
     Gen, no_mc2_m27_v34_lightning_token_residue, no_mc2_m27_v34_meteor_cast_residue,
     no_mc2_m27_v34_token_transparent,
 };
-use crate::engine::world::{AimLock, LifeState, PlayerPose, World};
-use crate::mc1::mobs::{MobCtx, PLAYER_TARGET};
+use crate::engine::world::{AimLock, Hx, LifeState, PlayerPose, World};
+use crate::mc1::mobs::MobCtx;
 use crate::mc2::spells::Mc2SubSpell;
 use crate::world::PLAYER_LIFE_MAX;
 
@@ -1737,7 +1737,7 @@ pub(crate) fn no_mc2_replay_xp_gate() -> bool {
 
 /// `MGC_NO_MC2_XP_AWARD_WHILE_DEAD=1` restores the INVENTED LIFE GUARD
 /// [`World::mc2_award_xp`] used to open with
-/// (`if self.player.state != LifeState::Alive { return; }`).
+/// (`if self.players[hx].state != LifeState::Alive { return; }`).
 ///
 /// ⭐⭐⭐ `sub_6D8B0` HAS NO LIFE TEST. The whole function is 264
 /// bytes and every branch in it is enumerable; shipped `NETHERW.EXE`
@@ -2022,7 +2022,7 @@ impl Gen {
     /// which is what `sub_6D8B0(0, …)` does.
     fn mc2_fools_award(&mut self, i: usize) {
         let owner = self.ent[i].id24;
-        if owner == PLAYER_TARGET {
+        if self.is_human_tag(owner) {
             self.mc2_cast_xp.0.push((owner, 22, 1));
         }
     }
@@ -2138,8 +2138,12 @@ impl Gen {
         } else {
             (raw_z, crate::mc1::combat::PLAYER_HH as i16)
         };
-        let (yaw, pitch) = if claimer == PLAYER_TARGET {
-            let (tx, ty, tz) = (ctx.px, ctx.py, ctx.pz.wrapping_add(praise));
+        let (yaw, pitch) = if let Some(hx) = self.hx_of_tag(claimer) {
+            let (tx, ty, tz) = (
+                self.seat_at(ctx, hx).0,
+                self.seat_at(ctx, hx).1,
+                self.seat_at(ctx, hx).2.wrapping_add(praise),
+            );
             let yaw = Self::angle_between(x, y, tx, ty);
             let dh = Self::isqrt(Self::dist2_sq(x, y, tx, ty) as u32) as i32;
             (yaw, Self::pitch_toward(asrc, tz, dh))
@@ -2215,7 +2219,7 @@ impl Gen {
         // the claimer's class/model as its xtype/xsubtype filter
         // (sub_36850 EF:26701-20); the fireball stamps none.
         if subtype == 9 {
-            let (tc, tm) = if claimer == PLAYER_TARGET || claimer as usize >= self.ent.len() {
+            let (tc, tm) = if self.is_human_tag(claimer) || claimer as usize >= self.ent.len() {
                 (3, 0)
             } else {
                 (
@@ -2252,18 +2256,19 @@ impl World {
     /// OWN castle's current entity level (L:1729-55 — the verbatim
     /// table, default rung 300M), plus the `byte_0x1BE_446` +3000
     /// RE-CAST SURCHARGE (see [`World::mc2_recast_surcharge`]).
-    pub(crate) fn mc2_spell_mana_cost(&self, spell: usize, tier: usize) -> i32 {
-        self.mc2_spell_mana_cost_at(spell, tier, self.player_castle())
+    pub(crate) fn mc2_spell_mana_cost(&self, hx: Hx, spell: usize, tier: usize) -> i32 {
+        self.mc2_spell_mana_cost_at(hx, spell, tier, self.seat_castle(hx))
     }
 
     /// [`Self::mc2_spell_mana_cost`] against an EXPLICIT castle —
     /// retail's `CastleEntityIndex_0x3A_58` as it stood when the
     /// pricing ran. The ladder-sync drain passes the castle whose
     /// stamp mailed it, because by drain time that castle may already
-    /// carry `0x400` and vanish from `player_castle()` (the DYING
+    /// carry `0x400` and vanish from `seat_castle()` (the DYING
     /// level-0 castle — see the drain's own note in world.rs).
     pub(crate) fn mc2_spell_mana_cost_at(
         &self,
+        hx: Hx,
         spell: usize,
         tier: usize,
         castle: Option<usize>,
@@ -2292,7 +2297,7 @@ impl World {
             // the patched arm LESS faithful for no gameplay reason.
             // `MGC_NO_MC2_RECAST_SURCHARGE=1` remains the A/B arm.
             let surcharge =
-                self.mc2_recast_surcharge && !crate::engine::world::mc2_recast_surcharge_off();
+                self.mc2_recast_surcharge[hx] && !crate::engine::world::mc2_recast_surcharge_off();
             // `GetSpellManaCost_6D710` (L:1714-85): the castle upgrade
             // cost is the OWN castle level's ladder rung times the
             // spell-LEVEL (tier) multiplier — this is why a fire/
@@ -2364,8 +2369,8 @@ impl World {
     /// `SetSpell_6D5E0` (L:1505): wire the tier's SPELLS row into the
     /// manifestation. Mid-cast, the change is deferred (`word_0x2C_44
     /// = tier+1`, applied by `sub_6D880` when the timer expires).
-    pub(crate) fn mc2_set_spell(&mut self, m: usize, tier: u8) {
-        self.mc2_set_spell_at(m, tier, self.mc2_price_castle());
+    pub(crate) fn mc2_set_spell(&mut self, hx: Hx, m: usize, tier: u8) {
+        self.mc2_set_spell_at(hx, m, tier, self.mc2_price_castle(hx));
     }
 
     /// ⭐⭐⭐ THE CASTLE-SPELL PRICE READS THE **REGISTER**, NOT THE POOL.
@@ -2380,7 +2385,7 @@ impl World {
     /// decides, and the LEVEL rung then comes off that record's
     /// `dword_0x10_16`.
     ///
-    /// [`World::player_castle`] is a POOL SCAN and returns the
+    /// [`World::seat_castle`] is a POOL SCAN and returns the
     /// lowest-numbered live (3,2) the human owns. Round 136's law:
     /// A POOL SCAN RETURNS THE LOWEST-NUMBERED MATCH, A REGISTER THE
     /// CHOSEN ONE — ONLY A CASTLE SPLIT MAKES THEM DIFFER. mc2l12 has
@@ -2396,16 +2401,16 @@ impl World {
     /// heads, every one of them a price stamped at a `SetSpell` tick.
     ///
     /// `MGC_NO_MC2_SPELL_PRICE_REGISTER=1` restores the pool scan.
-    pub(crate) fn mc2_price_castle(&self) -> Option<usize> {
+    pub(crate) fn mc2_price_castle(&self, hx: Hx) -> Option<usize> {
         if crate::engine::world::no_mc2_spell_price_register() {
-            return self.player_castle();
+            return self.seat_castle(hx);
         }
-        self.player_castle_bound()
+        self.player_castle_bound(hx)
     }
 
     /// [`Self::mc2_set_spell`] pricing against an EXPLICIT castle —
     /// the ladder-sync drain's entry point (see world.rs's drain).
-    pub(crate) fn mc2_set_spell_at(&mut self, m: usize, tier: u8, castle: Option<usize>) {
+    pub(crate) fn mc2_set_spell_at(&mut self, hx: Hx, m: usize, tier: u8, castle: Option<usize>) {
         let spell = self.g.ent[m].model65 as usize;
         let Some(row) = self.g.assets.spells.get(spell) else {
             return;
@@ -2417,7 +2422,7 @@ impl World {
             return;
         }
         let sub = row.tiers[t];
-        let cost = self.mc2_spell_mana_cost_at(spell, t, castle);
+        let cost = self.mc2_spell_mana_cost_at(hx, spell, t, castle);
         let e = &mut self.g.ent[m];
         e.f71 = t as u8;
         e.f30 = sub.sub_spell.clamp(0, u16::MAX as i32) as u16;
@@ -2454,11 +2459,11 @@ impl World {
     /// tier clamp, the notification (msg 159/160+idx → sound 61,
     /// `sub_6DC40_improve_ability` EF:44007), and the optional bank
     /// commit capped at tier-2's threshold.
-    pub(crate) fn mc2_relevel(&mut self, spell: usize, bank: bool, notify: bool) {
+    pub(crate) fn mc2_relevel(&mut self, hx: Hx, spell: usize, bank: bool, notify: bool) {
         let Some(row) = self.g.assets.spells.get(spell).copied() else {
             return;
         };
-        let owned = self.mc2_book.ent[spell] != 0;
+        let owned = self.mc2_book[hx].ent[spell] != 0;
         // Retail's v5 gate (EF:43876-78): `(array_0x3E9 ||
         // SpellsEnabled) && (isCaveLevel || spell != 25)` — the port
         // unifies grant + manifestation into `ent` (the OR collapses;
@@ -2476,10 +2481,10 @@ impl World {
         // silently break every cheated take's castle ladder.
         // `cheat_mode` is the flag, inferred from a cheat having fired
         // (engine::world::cheats).
-        if !self.cheat_mode && self.mc2_book.xp_vol[2] > 7 {
-            self.mc2_book.xp_vol[2] = 7;
+        if !self.cheat_mode && self.mc2_book[hx].xp_vol[2] > 7 {
+            self.mc2_book[hx].xp_vol[2] = 7;
         }
-        let xp = self.mc2_book.xp_vol[spell] + self.mc2_book.xp_bank[spell];
+        let xp = self.mc2_book[hx].xp_vol[spell] + self.mc2_book[hx].xp_bank[spell];
         let mut v6 = row.byte_0 as i32;
         loop {
             v6 -= 1;
@@ -2488,14 +2493,14 @@ impl World {
             }
         }
         let lvl = v6.max(0) as u8;
-        if lvl != self.mc2_book.levels[spell] {
-            self.mc2_book.levels[spell] = lvl;
+        if lvl != self.mc2_book[hx].levels[spell] {
+            self.mc2_book[hx].levels[spell] = lvl;
             if v5 && notify {
                 // `sub_6DC40_improve_ability`: on-screen message
                 // (string 159 + 160+idx) + sound 61.
                 let msg = self.mc2_relevel_message(spell);
                 self.set_notification(msg, NOTIFY_TICKS_LEVELUP, NOTIFY_RED);
-                self.g.snd_player(61);
+                self.g.snd_player(hx, 61);
             }
         }
         // Under the all-spells instrument the selection cap is the
@@ -2505,14 +2510,14 @@ impl World {
         let sel_cap = if self.dev_spells {
             (row.byte_0 as i16 - 1).clamp(0, 255) as u8
         } else {
-            self.mc2_book.levels[spell]
+            self.mc2_book[hx].levels[spell]
         };
-        if self.mc2_book.sel[spell] > sel_cap {
-            self.mc2_book.sel[spell] = sel_cap;
+        if self.mc2_book[hx].sel[spell] > sel_cap {
+            self.mc2_book[hx].sel[spell] = sel_cap;
         }
         if v5 && bank {
             let cap = row.tiers[2].xpos1;
-            self.mc2_book.xp_bank[spell] = xp.min(cap);
+            self.mc2_book[hx].xp_bank[spell] = xp.min(cap);
         }
     }
 
@@ -2529,9 +2534,9 @@ impl World {
         if spell >= 26 {
             return;
         }
-        if owner != PLAYER_TARGET {
+        let Some(hx) = self.hx_of_tag(owner) else {
             return; // the model-0 guard — rivals never accrue
-        }
+        };
         // THE CASTLE-LEVEL-UP LATCH CLEAR (`sub_60480` EF:61593).
         // Retail's clear and this award sit three lines apart, and the
         // ONLY producer of a `(PLAYER_TARGET, 2, 1)` award is
@@ -2544,7 +2549,7 @@ impl World {
         // unconditional, and a castle finishing its level-up while the
         // wizard is dead must not strand the latch set forever.
         if spell == 2 && amount == 1 {
-            self.mc2_recast_surcharge = false;
+            self.mc2_recast_surcharge[hx] = false;
         }
         // THE CAMPAIGN-REPLAY XP GATE (`setting_38545 & 4`) —
         // `sub_6D8B0`'s own first line (EF:58596; NETHERW.EXE file
@@ -2563,28 +2568,28 @@ impl World {
         // replayed-level bit, `owner != 0`, `class3f == 3` and
         // `model40 == 0`. See [`no_mc2_xp_award_while_dead`] for the
         // disassembly and the mc2l24-crazy t=3209 witness.
-        if no_mc2_xp_award_while_dead() && self.player.state != LifeState::Alive {
+        if no_mc2_xp_award_while_dead() && self.human_state(hx) != LifeState::Alive {
             return;
         }
-        self.mc2_book.xp_vol[spell] += amount;
+        self.mc2_book[hx].xp_vol[spell] += amount;
         if spell == 2 {
-            let m = self.mc2_book.ent[2] as usize;
+            let m = self.mc2_book[hx].ent[2] as usize;
             if m != 0 {
                 // `sub_6D8B0`'s own SetSpell, UNsuppressed — a
                 // short-arm no-op while the cast window is open; the
                 // suppressed mid-transform re-sync is the LADDER
                 // stamp's (`sub_60780` → the mc2_ladder_sync mail,
                 // drained just before this one).
-                self.mc2_set_spell(m, self.mc2_book.sel[2]);
+                self.mc2_set_spell(hx, m, self.mc2_book[hx].sel[2]);
             }
         }
-        self.mc2_relevel(spell, false, true);
+        self.mc2_relevel(hx, spell, false, true);
     }
 
     /// The pane/book view (the CTRL pane + HUD consume this): per
     /// spell — owned, level, selected tier, effective XP; plus the
     /// quick-slot bindings. Read-only snapshot.
-    pub fn mc2_book_view(&self) -> Mc2BookView {
+    pub fn mc2_book_view(&self, hx: Hx) -> Mc2BookView {
         let mut owned = [false; 26];
         let mut xp = [0i32; 26];
         let mut xpos = [[0i32; 3]; 26];
@@ -2595,11 +2600,11 @@ impl World {
         let mut castable = [[false; 3]; 26];
         // Retail's canSummon castle-pool probe (EF:22504-05): the own
         // castle's STORED mana, resolved once for the whole pane.
-        let castle_mana = self.player_castle().map_or(0, |c| self.g.ent[c].f140);
+        let castle_mana = self.seat_castle(hx).map_or(0, |c| self.g.ent[c].f140);
         for s in 0..26 {
-            owned[s] = self.mc2_book.ent[s] != 0;
-            xp[s] = self.mc2_book.xp_vol[s] + self.mc2_book.xp_bank[s];
-            let tier = (self.mc2_book.sel[s] as usize).min(2);
+            owned[s] = self.mc2_book[hx].ent[s] != 0;
+            xp[s] = self.mc2_book[hx].xp_vol[s] + self.mc2_book[hx].xp_bank[s];
+            let tier = (self.mc2_book[hx].sel[s] as usize).min(2);
             if let Some(row) = self.g.assets.spells.get(s) {
                 for t in 0..3 {
                     xpos[s][t] = row.tiers[t].xpos1;
@@ -2613,11 +2618,11 @@ impl World {
                     castable[s][t] = mml <= 0 || castle_mana as i64 >= mml as i64;
                 }
             }
-            cost[s] = self.mc2_spell_mana_cost(s, tier).max(0) as u32;
+            cost[s] = self.mc2_spell_mana_cost(hx, s, tier).max(0) as u32;
             for t in 0..3 {
-                cost_tier[s][t] = self.mc2_spell_mana_cost(s, t).max(0) as u32;
+                cost_tier[s][t] = self.mc2_spell_mana_cost(hx, s, t).max(0) as u32;
             }
-            let m = self.mc2_book.ent[s] as usize;
+            let m = self.mc2_book[hx].ent[s] as usize;
             armed[s] = m != 0 && self.g.ent[m].f26 > 0;
             // The blink set is retail's `isEnabled_1 & 4`, stamped in
             // CODE, not the SPELLS file (SetDefaultSpells_5C0A0
@@ -2629,8 +2634,8 @@ impl World {
         }
         Mc2BookView {
             owned,
-            levels: self.mc2_book.levels,
-            sel: self.mc2_book.sel,
+            levels: self.mc2_book[hx].levels,
+            sel: self.mc2_book[hx].sel,
             xp,
             xpos,
             cost,
@@ -2638,9 +2643,9 @@ impl World {
             armed,
             expiring,
             castable,
-            left: self.mc2_book.left,
-            right: self.mc2_book.right,
-            ring: self.mc2_book.ring,
+            left: self.mc2_book[hx].left,
+            right: self.mc2_book[hx].right,
+            ring: self.mc2_book[hx].ring,
             cave: self.g.is_cave(),
         }
     }
@@ -2661,23 +2666,23 @@ impl World {
     /// was the one the corpus caught next — mc2l0 t=3919, the scroll
     /// at slot 114 binds spell 2 into a left hand whose book says 2
     /// and whose obs still said 0. Route every hand write here.
-    pub(crate) fn mc2_set_hand(&mut self, right: bool, spell: i8) {
+    pub(crate) fn mc2_set_hand(&mut self, hx: Hx, right: bool, spell: i8) {
         let mirror = (spell >= 0).then_some(crate::mc1::spells::SpellId(spell as u8));
         if right {
-            self.mc2_book.right = spell;
-            self.player.right = mirror;
+            self.mc2_book[hx].right = spell;
+            self.players[hx].right = mirror;
         } else {
-            self.mc2_book.left = spell;
-            self.player.left = mirror;
+            self.mc2_book[hx].left = spell;
+            self.players[hx].left = mirror;
         }
     }
 
-    pub fn mc2_select_spell(&mut self, spell: u8, tier: u8, hand: u8) {
+    pub fn mc2_select_spell(&mut self, hx: Hx, spell: u8, tier: u8, hand: u8) {
         let s = spell as usize;
         if s >= 26 {
             // Unbind semantic (spell out of range clears the hand —
             // the pane's empty-slot commit).
-            self.mc2_set_hand(hand != 0, -1);
+            self.mc2_set_hand(hx, hand != 0, -1);
             return;
         }
         // Cave-In is refused off-cave before anything else
@@ -2689,14 +2694,14 @@ impl World {
         }
         // Dev instrument: selecting an unowned spell under the
         // all-spells toggle self-grants the manifestation.
-        if self.mc2_book.ent[s] == 0 && self.dev_spells {
-            self.mc2_dev_grant(s);
+        if self.mc2_book[hx].ent[s] == 0 && self.dev_spells {
+            self.mc2_dev_grant(hx, s);
             // Marked for the toggle-off release (`set_dev_spells`).
-            if self.mc2_book.ent[s] != 0 {
+            if self.mc2_book[hx].ent[s] != 0 {
                 self.dev_minted |= 1 << s;
             }
         }
-        if self.mc2_book.ent[s] == 0 {
+        if self.mc2_book[hx].ent[s] == 0 {
             return;
         }
         // Normally the selectable tier is capped at the XP-earned
@@ -2711,17 +2716,17 @@ impl World {
                 .get(s)
                 .map_or(0, |r| (r.byte_0 as i16 - 1).clamp(0, 255) as u8)
         } else {
-            self.mc2_book.levels[s]
+            self.mc2_book[hx].levels[s]
         };
         let t = tier.min(cap);
-        self.mc2_book.sel[s] = t;
+        self.mc2_book[hx].sel[s] = t;
         // Retail's SpellIndexLeft/Right is ONE lane; the port splits
         // it into the book (the cast machine's read) and the Player
         // mirror (the import/obs lane) — keep both in step, or an
         // equip pair's obs projects the stale hand (mc2l3 t=108).
-        self.mc2_set_hand(hand != 0, spell as i8);
-        let m = self.mc2_book.ent[s] as usize;
-        self.mc2_set_spell(m, t);
+        self.mc2_set_hand(hx, hand != 0, spell as i8);
+        let m = self.mc2_book[hx].ent[s] as usize;
+        self.mc2_set_spell(hx, m, t);
         // ⭐⭐⭐ ARMING TELEPORT II IS WHAT SETS THE RETURN POINT.
         // `CopyAxisForSpellWithLife_6D830` (EF:58203-12) is called by
         // this very handler ONE STATEMENT AFTER `SetSpell_6D5E0`
@@ -2749,13 +2754,13 @@ impl World {
                 .get(10)
                 .is_some_and(|r| r.tiers[(t as usize).min(2)].life == 1)
         {
-            let (px, py, pz) = self.human_pose;
+            let (px, py, pz) = self.human_pose(hx);
             let e = &mut self.g.ent[m];
             e.dest_x = px;
             e.dest_y = py;
             e.site_z = pz;
         }
-        self.g.snd_player(14);
+        self.g.snd_player(hx, 14);
         // The change-spell toast (EF:37925): the chosen TIER's own name
         // ("Possession" / "Mana Magnet" / "Thunderstorm"), so a level-N
         // pick reads as its distinct spell, not a generic label.
@@ -2774,13 +2779,13 @@ impl World {
     /// sits on each button. The toggle/move truth table lives in the
     /// SENDER (the app's pane click, PI:856-878); the sim just
     /// stores.
-    pub(crate) fn mc2_ring_set(&mut self, spell: u8, val: u8) {
+    pub(crate) fn mc2_ring_set(&mut self, hx: Hx, spell: u8, val: u8) {
         let s = spell as usize;
         if s >= 26 {
             return;
         }
-        self.mc2_book.ring[s] = val.min(2);
-        self.g.snd_player(14);
+        self.mc2_book[hx].ring[s] = val.min(2);
+        self.g.snd_player(hx, 14);
     }
 
     /// The rest of retail's cross-level carry (`sub_549A0` L:1261-68
@@ -2794,6 +2799,7 @@ impl World {
     /// pass derived.
     pub fn mc2_install_selector_carry(
         &mut self,
+        hx: Hx,
         sel: &[u8; 26],
         ring: &[u8; 26],
         left: i8,
@@ -2803,22 +2809,22 @@ impl World {
             return;
         }
         for s in 0..26 {
-            self.mc2_book.ring[s] = ring[s].min(2);
+            self.mc2_book[hx].ring[s] = ring[s].min(2);
             // sel ≤ levels holds in any well-formed carry (select
             // clamps at write); min() only guards a foreign save.
-            self.mc2_book.sel[s] = sel[s].min(self.mc2_book.levels[s]);
-            let m = self.mc2_book.ent[s] as usize;
+            self.mc2_book[hx].sel[s] = sel[s].min(self.mc2_book[hx].levels[s]);
+            let m = self.mc2_book[hx].ent[s] as usize;
             if m != 0 {
                 // Push the carried tier into the live manifestation
                 // (retail's sub_55AB0 SetSpells to array_0x437).
-                self.mc2_set_spell(m, self.mc2_book.sel[s]);
+                self.mc2_set_spell(hx, m, self.mc2_book[hx].sel[s]);
             }
         }
-        if (0..26).contains(&(left as i32)) && self.mc2_book.ent[left as usize] != 0 {
-            self.mc2_set_hand(false, left);
+        if (0..26).contains(&(left as i32)) && self.mc2_book[hx].ent[left as usize] != 0 {
+            self.mc2_set_hand(hx, false, left);
         }
-        if (0..26).contains(&(right as i32)) && self.mc2_book.ent[right as usize] != 0 {
-            self.mc2_set_hand(true, right);
+        if (0..26).contains(&(right as i32)) && self.mc2_book[hx].ent[right as usize] != 0 {
+            self.mc2_set_hand(hx, true, right);
         }
     }
 
@@ -2828,13 +2834,13 @@ impl World {
     /// can pin that the jar law still overwrites the left hand.
     #[cfg(test)]
     pub(crate) fn mc2_dev_grant_for_test(&mut self, spell: usize) {
-        self.mc2_dev_grant(spell);
+        self.mc2_dev_grant(Hx::FIRST, spell);
     }
 
-    fn mc2_dev_grant(&mut self, spell: usize) {
-        let (px, py, pz) = self.human_pose;
+    fn mc2_dev_grant(&mut self, hx: Hx, spell: usize) {
+        let (px, py, pz) = self.human_pose(hx);
         if let Some(m) = self.mc2_new_spell_token(spell as u8, px, py, pz) {
-            self.mc2_adopt_manifestation(m, spell);
+            self.mc2_adopt_manifestation(hx, m, spell);
         }
     }
 
@@ -2848,7 +2854,7 @@ impl World {
     /// so a plausible scroll count yields a plausible tier. `banked_xp`
     /// is the app's campaign estimate (jar union → learned set; scroll
     /// census → XP). No-op off-MC2 (the book is MC2-only state).
-    pub fn mc2_grant_plausible(&mut self, grants: &[(u8, i32)]) {
+    pub fn mc2_grant_plausible(&mut self, hx: Hx, grants: &[(u8, i32)]) {
         if !matches!(self.game(), crate::ids::GameId::Mc2) {
             return;
         }
@@ -2857,20 +2863,20 @@ impl World {
             if s >= 26 {
                 continue;
             }
-            if self.mc2_book.ent[s] == 0 {
-                self.mc2_dev_grant(s);
+            if self.mc2_book[hx].ent[s] == 0 {
+                self.mc2_dev_grant(hx, s);
             }
             // Grant can fail if the event pool is exhausted; skip XP.
-            if self.mc2_book.ent[s] == 0 {
+            if self.mc2_book[hx].ent[s] == 0 {
                 continue;
             }
-            self.mc2_book.xp_bank[s] = xp.max(0);
+            self.mc2_book[hx].xp_bank[s] = xp.max(0);
             // Derive the level from the new banked XP (no re-bank, no
             // level-up toast — this is an init-time install).
-            self.mc2_relevel(s, false, false);
+            self.mc2_relevel(hx, s, false, false);
         }
         // Level-start binding, not the pickup law (see the fn doc).
-        self.mc2_rebind_hands_canonical();
+        self.mc2_rebind_hands_canonical(hx);
     }
 
     /// The carried spells this level BLOCKS for the human
@@ -2882,17 +2888,17 @@ impl World {
     /// Alliance quest jar is the case the player meets. For each
     /// `(spell, banked_xp)` not already owned: bank the XP and derive
     /// the tier, minting nothing. No-op off-MC2.
-    pub fn mc2_bank_withheld(&mut self, withheld: &[(u8, i32)]) {
+    pub fn mc2_bank_withheld(&mut self, hx: Hx, withheld: &[(u8, i32)]) {
         if !matches!(self.game(), crate::ids::GameId::Mc2) {
             return;
         }
         for &(spell, xp) in withheld {
             let s = spell as usize;
-            if s >= 26 || self.mc2_book.ent[s] != 0 {
+            if s >= 26 || self.mc2_book[hx].ent[s] != 0 {
                 continue;
             }
-            self.mc2_book.xp_bank[s] = xp.max(0);
-            self.mc2_relevel(s, false, false);
+            self.mc2_book[hx].xp_bank[s] = xp.max(0);
+            self.mc2_relevel(hx, s, false, false);
         }
     }
 
@@ -2900,7 +2906,7 @@ impl World {
     /// (token trace §3, EF:55715-49): the token BECOMES the wizard's
     /// spell object — state 3M, cooldown 64, owner rebound; grant +
     /// quick-slot bind + SetSpell at the chosen tier.
-    pub(crate) fn mc2_adopt_manifestation(&mut self, m: usize, spell: usize) {
+    pub(crate) fn mc2_adopt_manifestation(&mut self, hx: Hx, m: usize, spell: usize) {
         {
             let e = &mut self.g.ent[m];
             e.tick70 = (spell as u8).wrapping_mul(3);
@@ -2914,7 +2920,7 @@ impl World {
             if crate::engine::features::no_mc2_pickup_only_steal_lock() {
                 e.f54 = 64;
             }
-            e.id24 = PLAYER_TARGET;
+            e.id24 = self.g.human_tag[hx].0;
             // ⚠ `e.f26 = 0; e.f44 = 0;` WERE INVENTED. `sub_68FF0`'s
             // collect block (EF:56056-64) writes exactly
             // `byte[0] |= 1; byte[3] &= 0xFD; parentId_0x28_40 = wiz;
@@ -2953,7 +2959,7 @@ impl World {
             // `f2c 0 → 1` at mc2l7 t=21683.
             e.f44 = 0;
         }
-        self.mc2_book.ent[spell] = m as u16;
+        self.mc2_book[hx].ent[spell] = m as u16;
         // The stolen-jar hand hint (`word_0x4A_74` → f36, sub_68FF0
         // EF:55728-40): 1 = re-equip the RIGHT hand, 2 = the LEFT —
         // the hand the wraith yanked it from; cleared after use.
@@ -2967,11 +2973,11 @@ impl World {
         } else if hint == 1 {
             false
         } else {
-            self.mc2_book.left == -1 || self.mc2_book.right != -1
+            self.mc2_book[hx].left == -1 || self.mc2_book[hx].right != -1
         };
-        self.mc2_set_hand(!to_left, spell as i8);
-        self.mc2_relevel(spell, false, false);
-        self.mc2_set_spell(m, self.mc2_book.sel[spell]);
+        self.mc2_set_hand(hx, !to_left, spell as i8);
+        self.mc2_relevel(hx, spell, false, false);
+        self.mc2_set_spell(hx, m, self.mc2_book[hx].sel[spell]);
     }
 
     /// `sub_61050`'s TIER FORK (EF:62130-62199) — the `life_0x1A`
@@ -3059,8 +3065,8 @@ impl World {
         // the victim), EF:62158-59. The human's carpet is a pool record
         // under conformance; native play has none, and the fallback
         // keeps the scatter random rather than degenerate.
-        let vslot = if victim == PLAYER_TARGET {
-            self.mc2_carpet_slot as usize
+        let vslot = if let Some(hx) = self.hx_of_tag(victim) {
+            self.mc2_carpet_slot[hx] as usize
         } else {
             victim as usize
         };
@@ -3115,16 +3121,24 @@ impl World {
     /// in-hand bit is write-only in the port (its lone retail reader
     /// is the presentation-side owned-jar tint, unmodeled).
     pub(crate) fn mc2_spell_steal(&mut self, wraith: u16, hand: u8) {
+        // The victim is the wraith's own target (`+146`, the drain lock
+        // the steal roll ran under).
+        let hx = self
+            .g
+            .ent
+            .get(wraith as usize)
+            .and_then(|e| self.hx_of_tag(e.f146))
+            .unwrap_or(Hx::FIRST);
         let spell = if hand == 1 {
-            self.mc2_book.right
+            self.mc2_book[hx].right
         } else {
-            self.mc2_book.left
+            self.mc2_book[hx].left
         };
         if spell < 0 {
             return;
         }
         let s = spell as usize;
-        let m = self.mc2_book.ent[s] as usize;
+        let m = self.mc2_book[hx].ent[s] as usize;
         if m == 0 {
             return;
         }
@@ -3160,22 +3174,22 @@ impl World {
             }
         }
         // Snap the jar onto the player (CopyEntityPosition, EF:55810).
-        let (px, py, pz) = self.human_pose;
+        let (px, py, pz) = self.human_pose(hx);
         self.g.move_relink(m, px, py, pz);
         // Unlearn (`SpellEnabled[model] = 0`, EF:55811) — the pane
         // greys out and the ground jar becomes collectible again.
-        self.mc2_book.ent[s] = 0;
-        self.g.mc2_spell_tokens.0 &= !(1 << s);
+        self.mc2_book[hx].ent[s] = 0;
+        self.g.mc2_spell_tokens[hx].0 &= !(1 << s);
         // Unequip every hand holding the model; the hint remembers
         // the LAST cleared hand (left wins on the both-hands edge,
         // EF:55814-24 — independent ifs, verbatim).
         self.g.ent[m].f36 = 0;
-        if self.mc2_book.right == spell {
-            self.mc2_set_hand(true, -1);
+        if self.mc2_book[hx].right == spell {
+            self.mc2_set_hand(hx, true, -1);
             self.g.ent[m].f36 = 1;
         }
-        if self.mc2_book.left == spell {
-            self.mc2_set_hand(false, -1);
+        if self.mc2_book[hx].left == spell {
+            self.mc2_set_hand(hx, false, -1);
             self.g.ent[m].f36 = 2;
         }
         self.entities_dirty = true;
@@ -3204,11 +3218,12 @@ impl World {
     /// (once its edge lane was alive) 408.
     pub(crate) fn mc2_cast_input(
         &mut self,
+        hx: Hx,
         edge: (bool, bool),
         held: (bool, bool),
         ring: Option<u8>,
     ) {
-        if self.player.state != LifeState::Alive {
+        if self.human_state(hx) != LifeState::Alive {
             return;
         }
         // ⭐⭐⭐ ROUND 98 — THE RECORDED MOVE BYTE IS ALREADY RETAIL'S
@@ -3227,7 +3242,7 @@ impl World {
             if spell < 0 {
                 return false;
             }
-            let m = w.mc2_book.ent[spell as usize] as usize;
+            let m = w.mc2_book[hx].ent[spell as usize] as usize;
             if m == 0 {
                 return false;
             }
@@ -3239,11 +3254,11 @@ impl World {
             // the test is `== 1`, not `!= 0`).
             edge || (held && w.g.ent[m].f59 != 1 && w.g.ent[m].f26 > 0)
         };
-        if fires(self, self.mc2_book.left, edge.0, held.0) {
-            self.mc2_cast_gate(self.mc2_book.left as usize, false);
+        if fires(self, self.mc2_book[hx].left, edge.0, held.0) {
+            self.mc2_cast_gate(hx, self.mc2_book[hx].left as usize, false);
         }
-        if fires(self, self.mc2_book.right, edge.1, held.1) {
-            self.mc2_cast_gate(self.mc2_book.right as usize, true);
+        if fires(self, self.mc2_book[hx].right, edge.1, held.1) {
+            self.mc2_cast_gate(hx, self.mc2_book[hx].right as usize, true);
         }
         // ⭐⭐⭐ THE THIRD ARM (EF:60858-62). `if (w & 0x40) sub_5F660(
         // a1x, SpellEnabled[spellIndex_D94FF[spellIndex_0x458_1112]],
@@ -3261,9 +3276,9 @@ impl World {
         // divergence head.
         if !crate::engine::world::no_mc2_ring_cast_bit()
             && let Some(spell) = ring
-            && (spell as usize) < self.mc2_book.ent.len()
+            && (spell as usize) < self.mc2_book[hx].ent.len()
         {
-            self.mc2_cast_gate(spell as usize, false);
+            self.mc2_cast_gate(hx, spell as usize, false);
         }
     }
 
@@ -3271,8 +3286,8 @@ impl World {
     /// re-arm/retrigger switch, then the mana gate (`mana <
     /// maxMana` → fail sound 29), then the arm (`sub_5F7B0`
     /// EF:60973: timer = duration).
-    fn mc2_cast_gate(&mut self, spell: usize, right: bool) {
-        let m = self.mc2_book.ent[spell] as usize;
+    fn mc2_cast_gate(&mut self, hx: Hx, spell: usize, right: bool) {
+        let m = self.mc2_book[hx].ent[spell] as usize;
         if m == 0 {
             return;
         }
@@ -3304,14 +3319,14 @@ impl World {
             // spend it on a re-fire.
             1 if armed > 0 => {
                 self.g.ent[m].f56 = 1;
-                self.mc2_stamp_hand(m, right);
-                self.mc2_arm_invis_break(spell);
+                self.mc2_stamp_hand(hx, m, right);
+                self.mc2_arm_invis_break(hx, spell);
                 return;
             }
             // Castle: a re-cast while the ball flies buzzes
             // (EF:60908-13).
             2 if armed > 0 => {
-                self.g.snd_player(29);
+                self.g.snd_player(hx, 29);
                 return;
             }
             // Lightning: tier 0 re-arms freely (the RAPID stream);
@@ -3340,8 +3355,8 @@ impl World {
         // collapses the window the same tick — regen resumes
         // immediately, not f26 ticks late.
         let cost = self.g.ent[m].max_life;
-        if !self.dev_spells && (self.player.mana as u64) < cost as u64 {
-            self.g.snd_player(29);
+        if !self.dev_spells && (self.human_mana(hx) as u64) < cost as u64 {
+            self.g.snd_player(hx, 29);
             return;
         }
         // `sub_5F7B0`: ARM — timer = duration; the effect state now
@@ -3351,11 +3366,11 @@ impl World {
         // EF:60973-82) — the launch reads it back exactly as
         // `sub_68E50` does.
         self.g.ent[m].f26 = self.g.ent[m].f28.max(1) as i16;
-        self.mc2_stamp_hand(m, right);
+        self.mc2_stamp_hand(hx, m, right);
         // A release signal left over from the marker's last tick
         // must not refire into the fresh arm.
         self.g.ent[m].f56 = 0;
-        self.mc2_arm_invis_break(spell);
+        self.mc2_arm_invis_break(hx, spell);
     }
 
     /// `sub_5F7B0`'s hand stamp (EF:60977-78):
@@ -3366,8 +3381,11 @@ impl World {
     /// the conformance import can seed it off the recorded carpet.
     /// The `dual_wield_muzzle` patch additionally remembers the hand
     /// on the TOKEN (`World::token_hand`, port-only, both arms write).
-    fn mc2_stamp_hand(&mut self, m: usize, right: bool) {
-        self.hand_bits = (self.hand_bits & !0x300) | if right { 0x200 } else { 0x100 };
+    fn mc2_stamp_hand(&mut self, hx: Hx, m: usize, right: bool) {
+        self.set_human_hands(
+            hx,
+            (self.human_hands(hx) & !0x300) | if right { 0x200 } else { 0x100 },
+        );
         self.token_hand.insert(m as u16, right);
     }
 
@@ -3382,12 +3400,12 @@ impl World {
     /// window's `f26` so the mana-regen block lifts with the cloak
     /// (functional termination must clear the burst).
     /// docs/spell-audit/rival-spells.md §2.
-    fn mc2_arm_invis_break(&mut self, spell: usize) {
-        let s = self.player.invis_strength;
+    fn mc2_arm_invis_break(&mut self, hx: Hx, spell: usize) {
+        let s = self.players[hx].invis_strength;
         if s != 0 && (s < 2 || (s <= 2 && spell != 1)) {
-            self.player.invisible = false;
-            self.player.invis_strength = 0;
-            let inv = self.mc2_book.ent[0xB] as usize;
+            self.set_human_invisible(hx, false);
+            self.players[hx].invis_strength = 0;
+            let inv = self.mc2_book[hx].ent[0xB] as usize;
             if inv != 0 {
                 self.g.ent[inv].f26 = 0;
             }
@@ -3399,14 +3417,14 @@ impl World {
     /// `sub_68D50` (EF:55548) — may the cast proceed this tick?
     /// Caster alive; upkeep spells need the own castle's pool to
     /// cover `manaRegen`; the first tick re-checks the full cost.
-    fn mc2_afford(&self, m: usize) -> bool {
-        if self.player.state != LifeState::Alive {
+    fn mc2_afford(&self, hx: Hx, m: usize) -> bool {
+        if self.human_state(hx) != LifeState::Alive {
             return false;
         }
         let e = &self.g.ent[m];
         if e.f136 > 0 {
             let ok = self
-                .player_castle()
+                .seat_castle(hx)
                 .is_some_and(|c| self.g.ent[c].f140 >= e.f136);
             if !ok {
                 return false;
@@ -3416,7 +3434,7 @@ impl World {
         // duration row arms f26=1; comparing against a raw 0 would
         // skip the first-tick full-cost re-check.
         if e.f26 as u16 == e.f28.max(1) {
-            return self.dev_spells || self.player.mana as u64 >= e.max_life as u64;
+            return self.dev_spells || self.human_mana(hx) as u64 >= e.max_life as u64;
         }
         true
     }
@@ -3427,9 +3445,9 @@ impl World {
     /// the negative-delta stamp, [`World::mana_debit`]), countdown,
     /// pending-tier apply at expiry (`sub_6D880`); plus the cooldown
     /// tick (`word_0x36_54--`).
-    pub(crate) fn mc2_cast_tick(&mut self, p: PlayerPose, ctx: &MobCtx) {
+    pub(crate) fn mc2_cast_tick(&mut self, hx: Hx, p: PlayerPose, ctx: &MobCtx) {
         for spell in 0..26usize {
-            let m = self.mc2_book.ent[spell] as usize;
+            let m = self.mc2_book[hx].ent[spell] as usize;
             if m == 0 {
                 continue;
             }
@@ -3444,7 +3462,7 @@ impl World {
             }) {
                 continue;
             }
-            self.mc2_manifestation_tick(spell, m, p, ctx);
+            self.mc2_manifestation_tick(hx, spell, m, p, ctx);
         }
     }
 
@@ -3454,13 +3472,19 @@ impl World {
     /// tick (`word` = `sub_68E50`'s muzzle buffer, low dword). See
     /// [`crate::engine::features::no_mc2_m27_v34_token_transparent`] and
     /// [`crate::engine::features::no_mc2_m27_v34_meteor_cast_residue`].
-    pub(crate) fn mc2_v34_token_pre(&self, spell: usize, m: usize, p: PlayerPose) -> TokenV34 {
+    pub(crate) fn mc2_v34_token_pre(
+        &self,
+        hx: Hx,
+        spell: usize,
+        m: usize,
+        p: PlayerPose,
+    ) -> TokenV34 {
         let e = &self.g.ent[m];
         if e.f26 <= 0 {
             return TokenV34::Idle;
         }
-        if spell == 9 && e.f26 as u16 == e.f28.max(1) && self.mc2_afford(m) {
-            let (mx, my, _) = self.muzzle_side(p, self.mc2_fire_side(m));
+        if spell == 9 && e.f26 as u16 == e.f28.max(1) && self.mc2_afford(hx, m) {
+            let (mx, my, _) = self.muzzle_side(p, self.mc2_fire_side(hx, m));
             return TokenV34::MeteorFire(u32::from(mx) | u32::from(my) << 16);
         }
         TokenV34::Other
@@ -3516,6 +3540,7 @@ impl World {
     /// [`World::mc2_manifestation_pass`]).
     pub(crate) fn mc2_manifestation_tick(
         &mut self,
+        hx: Hx,
         spell: usize,
         m: usize,
         p: PlayerPose,
@@ -3531,7 +3556,7 @@ impl World {
             // downgrade the player never cast — so it lives outside the
             // `f26 > 0` gate below.
             if spell == 2 {
-                self.mc2_castle_spell_tick(m, p, ctx);
+                self.mc2_castle_spell_tick(hx, m, p, ctx);
                 if self.g.ent[m].f54 > 0 {
                     self.g.ent[m].f54 -= 1;
                 }
@@ -3541,7 +3566,7 @@ impl World {
             // shares nothing with the skeleton below but the trailing
             // `word_0x36_54` decrement.
             if spell == 5 {
-                self.mc2_heal_token_tick(m);
+                self.mc2_heal_token_tick(hx, m);
                 return;
             }
             if self.g.ent[m].f26 > 0 {
@@ -3553,7 +3578,7 @@ impl World {
                 // regeneration" law (docs/spell-audit/mana-regen.md).
                 // Read `first` before the countdown.
                 let first = self.g.ent[m].f26 as u16 == self.g.ent[m].f28.max(1);
-                let afford = self.mc2_afford(m);
+                let afford = self.mc2_afford(hx, m);
                 // ⭐ SPEED's `word_0xe_14` COLLAPSE IS THE SAME ARM AS
                 // THE UNAFFORDABLE ONE. Retail's shape is
                 // `if (!afford || v14) { if (v14) counter = 1 }` with
@@ -3565,7 +3590,7 @@ impl World {
                 // recompute stands on the very tick the window dies
                 // (galore t=6279, `player.mana` off by one +1153 regen
                 // step when the collapse suppressed it anyway).
-                let v14_collapse = spell == 3 && self.mc1_v14;
+                let v14_collapse = spell == 3 && self.mc1_v14[hx];
                 // ⭐⭐ THE DUEL FIZZLE IS `sub_6B610`'s OWN `LABEL_19`,
                 // AND LABEL_19 SKIPS THE WHOLE ELSE — including
                 // `sub_68DE0` (EF:57277-57285). Retail's predicate is
@@ -3587,7 +3612,7 @@ impl World {
                 // suppressed on the collapse tick and held. Same law as
                 // the afford arm and the speed brake right above.
                 let duel_fizzle = spell == 14
-                    && self.mc2_duel.is_none()
+                    && self.mc2_duel[hx].is_none()
                     && (self.g.ent[m].f26 as i32) <= self.g.ent[m].f28.max(1) as i32 - 28;
                 // ⭐⭐⭐ THE SHIELD-III STATEMENT ORDER — see
                 // [`no_mc2_shield3_predecrement`]. `sub_6A480`'s
@@ -3612,18 +3637,18 @@ impl World {
                     self.g.ent[m].f26 = 1;
                 } else if afford {
                     if first {
-                        self.mc2_spell_fire(spell, m, p, ctx);
+                        self.mc2_spell_fire(hx, spell, m, p, ctx);
                         if shield3_predecrement {
                             // `sub_68DE0` with `v2 = f26 - 1`: the
                             // `v2 == word_0x30_48` debit is
                             // unreachable, so this takes the else —
                             // the mid-burst pin — on the ARM tick.
                             if self.g.ent[m].f26 > 1 {
-                                self.suppress_regen();
+                                self.suppress_regen(hx);
                             }
                         } else {
                             let cost = self.g.ent[m].max_life;
-                            self.mana_debit(cost);
+                            self.mana_debit(hx, cost);
                         }
                     } else if self.g.ent[m].f56 != 0 {
                         // The possess re-press RELEASE SIGNAL
@@ -3680,7 +3705,7 @@ impl World {
                                     .spells
                                     .get(spell)
                                     .map_or(Mc2SubSpell::default(), |r| r.tiers[tier]);
-                                self.mc2_possess_launch(m, p, 1, (10, 12), sub);
+                                self.mc2_possess_launch(hx, m, p, 1, (10, 12), sub);
                             }
                             let v7 = self.g.ent[m].f56.wrapping_add(1);
                             self.g.ent[m].f56 = if v7 > 3 { 0 } else { v7 };
@@ -3763,7 +3788,7 @@ impl World {
                     // NOTHING and the wizard's fresh recompute stands.
                     && !(shield3_predecrement && self.g.ent[m].f26 <= 1)
                 {
-                    self.suppress_regen();
+                    self.suppress_regen(hx);
                 }
                 // ⭐⭐⭐ AND SO IS THE SHIELD WINDOW — THE LAST OF THE
                 // FOUR WIZARD-BUFF COLUMNS TO GET IT.
@@ -3823,7 +3848,7 @@ impl World {
                         .map_or(Mc2SubSpell::default(), |r| r.tiers[tier.min(2)])
                         .life;
                     if life == 0 {
-                        self.player.shield = true;
+                        self.set_human_shield(hx, true);
                     }
                     // ⭐⭐⭐ AND THE OTHER ARM OF THE SAME `if` IS THE
                     // ARMED STAGE — `else if (v1 == 1) { if (sub_68D50)
@@ -3837,7 +3862,7 @@ impl World {
                     // (t=22531 / 22730 / 23116, `sel[6] == 2` and
                     // `SPELLS[6].tiers[2].life == 1`).
                     if life == 1 && first && !no_mc2_shield_armed() {
-                        self.player.shield_armed = true;
+                        self.set_human_shield_armed(hx, true);
                     }
                     if std::env::var_os("MGC_SHIELD_PROBE").is_some() {
                         let t = crate::DEBUG_TICK.load(std::sync::atomic::Ordering::Relaxed);
@@ -3887,9 +3912,9 @@ impl World {
                         _ => None,
                     };
                     if let Some(precise) = precise {
-                        self.player.rebound = true;
-                        self.g.player_rebound = true;
-                        self.g.mc2_rebound_precise.0 = precise as i32;
+                        self.players[hx].rebound = true;
+                        self.g.set_player_rebound(hx, true);
+                        self.g.mc2_rebound_precise[hx].0 = precise as i32;
                     }
                 }
                 // ⭐⭐ SPEED'S OWN REGISTER WRITE (`GetScroll_69DB0`
@@ -3937,11 +3962,11 @@ impl World {
                     let dir_src = if no_mc2_speed_sign_cmd() {
                         p.speed
                     } else {
-                        self.mc2_cmd_speed
+                        self.mc2_cmd_speed[hx]
                     };
                     let sign = if dir_src >= 0 { 1i16 } else { -1 };
                     let factor = self.g.ent[m].f30 as i16 + i16::from(first);
-                    self.pending_speed_base = Some(sign * 80 * factor);
+                    self.pending_speed_base[hx] = Some(sign * 80 * factor);
                 }
                 // SPEED's slipstream trail (`GetScroll_69DB0`
                 // EF:56251-59): every 4th tick of the live window
@@ -3969,7 +3994,7 @@ impl World {
                     && let Some(s) = self.g.mc2_spawn_speed_puff(p.x, p.y, p.z)
                 {
                     self.g.ent[s].act_life *= 4;
-                    self.g.ent[s].id24 = PLAYER_TARGET;
+                    self.g.ent[s].id24 = self.g.human_tag[hx].0;
                 }
                 self.g.ent[m].f26 -= 1;
                 if self.g.ent[m].f26 == 0 {
@@ -3983,11 +4008,11 @@ impl World {
                         let dir_src = if no_mc2_speed_sign_cmd() {
                             p.speed
                         } else {
-                            self.mc2_cmd_speed
+                            self.mc2_cmd_speed[hx]
                         };
-                        self.pending_speed_base = Some(if dir_src >= 0 { 80 } else { -80 });
+                        self.pending_speed_base[hx] = Some(if dir_src >= 0 { 80 } else { -80 });
                     }
-                    self.mc2_cast_expire(spell, m);
+                    self.mc2_cast_expire(hx, spell, m);
                 }
             }
             if self.g.ent[m].f54 > 0 {
@@ -4043,26 +4068,27 @@ impl World {
     /// - the XP award (`sub_6D8B0(parent, 5, 1)` :56452) is on the
     ///   first HEALING tick, so a cast at full life scores nothing;
     /// - sound 25 is on the first ADMITTED tick, healing or not.
-    fn mc2_heal_token_tick(&mut self, m: usize) {
+    fn mc2_heal_token_tick(&mut self, hx: Hx, m: usize) {
         if self.g.ent[m].f26 > 0 {
             let first = self.g.ent[m].f26 as u16 == self.g.ent[m].f28.max(1);
             let cost = self.g.ent[m].max_life;
             // `sub_68D50` is `mc2_afford`; the second leg is heal's own
             // per-tick purse test (:56445).
-            let admitted = self.mc2_afford(m) && (self.dev_spells || self.player.mana >= cost);
+            let admitted =
+                self.mc2_afford(hx, m) && (self.dev_spells || self.human_mana(hx) >= cost);
             if admitted {
                 if first {
-                    self.g.snd_player(25);
-                    self.player.heal_active = true;
+                    self.g.snd_player(hx, 25);
+                    self.players[hx].heal_active = true;
                 }
-                if self.player.life < PLAYER_LIFE_MAX {
+                if self.human_life(hx) < PLAYER_LIFE_MAX {
                     if first {
-                        self.mc2_award_xp(PLAYER_TARGET, 5, 1);
+                        self.mc2_award_xp(self.g.human_tag[hx].0, 5, 1);
                     }
                     // Retail's operand order: `maxLife * sub / 100`.
                     let step = (PLAYER_LIFE_MAX as i64 * self.g.ent[m].f30 as i64 / 100) as i32;
-                    self.player.life = (self.player.life + step).min(PLAYER_LIFE_MAX);
-                    self.mana_debit(cost);
+                    self.set_human_life(hx, (self.human_life(hx) + step).min(PLAYER_LIFE_MAX));
+                    self.mana_debit(hx, cost);
                 }
             } else {
                 // :56466 — the refusal RELEASES; the decrement below
@@ -4071,7 +4097,7 @@ impl World {
             }
             self.g.ent[m].f26 -= 1;
             if self.g.ent[m].f26 == 0 {
-                self.mc2_cast_expire(5, m);
+                self.mc2_cast_expire(hx, 5, m);
             }
         }
         if self.g.ent[m].f54 > 0 {
@@ -4092,7 +4118,7 @@ impl World {
     /// forced downgrade (an enemy razing the castle level by level) also
     /// raises it — you get the "split second between transforms" to cast
     /// a rebuild, faithful to both games.
-    fn mc2_castle_spell_tick(&mut self, m: usize, p: PlayerPose, ctx: &MobCtx) {
+    fn mc2_castle_spell_tick(&mut self, hx: Hx, m: usize, p: PlayerPose, ctx: &MobCtx) {
         // ⭐⭐⭐ `sub_69AB0` OPENS WITH THE SPENT-TIMER ARM, AND IT IS
         // THE ONLY PLACE THE MANIFESTATION'S DEFERRED TIER IS EVER
         // APPLIED (EF:56436-39):
@@ -4143,7 +4169,7 @@ impl World {
         // mc2l4-new (END -> 552) and mc2l1-new (END -> 3200) with
         // duplicate (9,10) balls (round 134-3).
         if !no_mc2_castle_tier_defer_lag() && self.g.ent[m].f26 <= 0 {
-            self.mc2_cast_expire(2, m);
+            self.mc2_cast_expire(hx, 2, m);
             if !no_mc2_castle_cast_latch() {
                 return;
             }
@@ -4159,7 +4185,7 @@ impl World {
             // held word (dur - 1) is released here only when the
             // caster can no longer carry it (dead / upkeep unmet), and
             // a fresh word (== dur) when the full cost is not there.
-            if self.g.ent[m].f26 > 0 && !self.mc2_afford(m) {
+            if self.g.ent[m].f26 > 0 && !self.mc2_afford(hx, m) {
                 self.g.ent[m].f26 = 0;
                 return;
             }
@@ -4167,9 +4193,9 @@ impl World {
             // sentinel is the only entry that fires + debits (the
             // transform pins 100 = dur - 1, never dur).
             if self.g.ent[m].f26 == dur {
-                self.mc2_spell_fire(2, m, p, ctx); // cast_castle: spawns the ball
+                self.mc2_spell_fire(hx, 2, m, p, ctx); // cast_castle: spawns the ball
                 let cost = self.g.ent[m].max_life;
-                self.mana_debit(cost);
+                self.mana_debit(hx, cost);
                 // THE PIN — VA 0x69BAE, in the ball spawn's own
                 // straight-line block and gated on the spawn having
                 // returned a slot (`test %eax,%eax / je`). The port
@@ -4178,7 +4204,7 @@ impl World {
                 // dispatch (same tick, higher slot) refuses the site
                 // releases it again through the ball-side mail —
                 // mc2l1-new t=3604.
-                if self.mc2_castle_ball_aloft() {
+                if self.mc2_castle_ball_aloft(hx) {
                     self.g.ent[m].f26 = dur - 1; // word_0x30_48 - 1
                 }
             }
@@ -4186,10 +4212,10 @@ impl World {
         }
         // ---- the pre-135 RE-DERIVE arm (`MGC_NO_MC2_CASTLE_CAST_LATCH`) ----
         if self.g.ent[m].f26 == dur {
-            if self.mc2_afford(m) {
-                self.mc2_spell_fire(2, m, p, ctx);
+            if self.mc2_afford(hx, m) {
+                self.mc2_spell_fire(hx, 2, m, p, ctx);
                 let cost = self.g.ent[m].max_life;
-                self.mana_debit(cost);
+                self.mana_debit(hx, cost);
             } else {
                 self.g.ent[m].f26 = 0;
                 return;
@@ -4198,12 +4224,12 @@ impl World {
         // Re-derive `sub_5F890`'s state every tick from a live scan.
         // Retail does no such thing — the word is a LATCH, released
         // only by the castle-side and ball-side `sub_5F890` sites.
-        let active = self.mc2_castle_lock_active();
+        let active = self.mc2_castle_lock_active(hx);
         let was = self.g.ent[m].f26 > 0;
         if active {
             self.g.ent[m].f26 = dur - 1; // word_0x30_48 - 1
         } else if was {
-            self.mc2_castle_lock_release(m);
+            self.mc2_castle_lock_release(hx, m);
         }
     }
 
@@ -4226,18 +4252,18 @@ impl World {
     /// the re-sync exactly like retail. (The retired
     /// `castle_recast_cost` patch used to re-sync it to the base-cost
     /// rebuild here — gone 2026-09-07, player-ruled.)
-    fn mc2_castle_lock_release(&mut self, m: usize) {
+    fn mc2_castle_lock_release(&mut self, hx: Hx, m: usize) {
         self.g.ent[m].f26 = 0;
         // ⚠ RETAIL'S `sub_6D880` HERE TAKES THE **CASTLE**, NOT `m` —
         // see the entry arm in [`Self::mc2_castle_spell_tick`] for the
         // EXE bytes. The manifestation's pending tier is applied one
         // tick later, by its own handler's spent-timer arm.
         if no_mc2_castle_tier_defer_lag() {
-            self.mc2_cast_expire(2, m);
+            self.mc2_cast_expire(hx, 2, m);
         }
-        if self.player_castle().is_some() {
+        if self.seat_castle(hx).is_some() {
             let tier = self.g.ent[m].f71;
-            self.mc2_set_spell(m, tier);
+            self.mc2_set_spell(hx, m, tier);
         }
     }
 
@@ -4325,8 +4351,8 @@ impl World {
                 // and runs `sub_6D880` on the CASTLE — no manifestation
                 // re-price exists for it.
                 self.g.ent[m].f26 = 0;
-            } else if own == PLAYER_TARGET {
-                self.mc2_castle_lock_release(m);
+            } else if let Some(hx) = self.hx_of_tag(own) {
+                self.mc2_castle_lock_release(hx, m);
             } else {
                 self.mc2_rival_castle_lock_release(m, own);
             }
@@ -4395,7 +4421,7 @@ impl World {
             return;
         }
         let own = self.g.ent[c].id24;
-        if own == PLAYER_TARGET
+        if self.g.is_human_tag(own)
             || !self
                 .g
                 .ent
@@ -4484,8 +4510,8 @@ impl World {
     /// survived a re-import can name a record that is no longer a
     /// manifestation at all.
     pub(crate) fn mc2_owner_castle_token(&self, own: u16) -> Option<usize> {
-        let m = if own == PLAYER_TARGET {
-            self.mc2_book.ent[2] as usize
+        let m = if let Some(hx) = self.hx_of_tag(own) {
+            self.mc2_book[hx].ent[2] as usize
         } else {
             let ri = (0..self.mc2_rivals.len())
                 .find(|&r| self.mc2_rivals[r].ent != 0 && self.mc2_rivals[r].ent == own)?;
@@ -4503,8 +4529,8 @@ impl World {
     /// The class test above is the port's; retail dereferences the
     /// index raw, which is how a marker `1` reaches pool slot 1.
     pub(crate) fn mc2_owner_castle_token_raw(&self, own: u16) -> Option<usize> {
-        let m = if own == PLAYER_TARGET {
-            self.mc2_book.ent[2] as usize
+        let m = if let Some(hx) = self.hx_of_tag(own) {
+            self.mc2_book[hx].ent[2] as usize
         } else {
             let ri = (0..self.mc2_rivals.len())
                 .find(|&r| self.mc2_rivals[r].ent != 0 && self.mc2_rivals[r].ent == own)?;
@@ -4584,20 +4610,23 @@ impl World {
     /// Retail asks it as `test %eax,%eax` on `NewEvent`'s return
     /// (VA 0x69BAE's guard); the port has no spawn handle to test, so
     /// it reads the pool the ball has just been placed in.
-    fn mc2_castle_ball_aloft(&self) -> bool {
-        self.g.ent.iter().skip(1).any(|e| {
-            e.class64 == 9 && e.model65 == 10 && e.id24 == PLAYER_TARGET && e.flags & 0x400 == 0
-        })
+    fn mc2_castle_ball_aloft(&self, hx: Hx) -> bool {
+        let tag = self.g.human_tag[hx].0;
+        self.g
+            .ent
+            .iter()
+            .skip(1)
+            .any(|e| e.class64 == 9 && e.model65 == 10 && e.id24 == tag && e.flags & 0x400 == 0)
     }
 
-    fn mc2_castle_lock_active(&self) -> bool {
+    fn mc2_castle_lock_active(&self, hx: Hx) -> bool {
         // The cast in transit: the (9,10) castle ball still flying.
-        if self.mc2_castle_ball_aloft() {
+        if self.mc2_castle_ball_aloft(hx) {
             return true;
         }
         // The castle mid-transform: idle = action 4, no settle timer,
         // no armed upgrade (`mc2_castle_standing`/`_build`/`_destroy`).
-        if let Some(c) = self.player_castle() {
+        if let Some(c) = self.seat_castle(hx) {
             let e = &self.g.ent[c];
             let idle = e.tick70 == 4 && e.f50 == 0 && e.flags & super::castle::F_UPGRADE_ARMED == 0;
             !idle
@@ -4608,11 +4637,11 @@ impl World {
 
     /// Cast-window expiry: apply the pending tier (`sub_6D880`
     /// EF:58215) and drop the armed-window player effects.
-    pub(crate) fn mc2_cast_expire(&mut self, spell: usize, m: usize) {
+    pub(crate) fn mc2_cast_expire(&mut self, hx: Hx, spell: usize, m: usize) {
         if self.g.ent[m].f44 > 0 {
             let t = (self.g.ent[m].f44 - 1) as u8;
             self.g.ent[m].f44 = 0;
-            self.mc2_set_spell(m, t);
+            self.mc2_set_spell(hx, m, t);
         }
         // Armed-window effects end with the window (shield
         // `dword &= 0xFFBFBFFF` EF:56496-tail, invis `&= 0xDF`
@@ -4622,12 +4651,12 @@ impl World {
             // stage bits — byte[1] 0x40 and byte[2] 0x40 — in one
             // store, so the window's end drops the ARMED stage too.
             6 => {
-                self.player.shield = false;
-                self.player.shield_armed = false;
+                self.set_human_shield(hx, false);
+                self.set_human_shield_armed(hx, false);
             }
             8 => {
-                self.player.rebound = false;
-                self.g.mc2_rebound_precise.0 = 0;
+                self.players[hx].rebound = false;
+                self.g.mc2_rebound_precise[hx].0 = 0;
             }
             // ⭐⭐⭐ THE DUEL WINDOW'S END IS NOT THE LOCK'S END, AND
             // THE PORT'S OWN COMMENT SAID SO. Retail never clears
@@ -4644,7 +4673,7 @@ impl World {
             // [`crate::engine::world::no_mc2_duel_expire_lag`].
             14 => {
                 if crate::engine::world::no_mc2_duel_expire_lag() {
-                    self.mc2_duel = None;
+                    self.mc2_duel[hx] = None;
                 }
             }
             // Metamorph teardown (`sub_6A030` expiry EF:56394): despawn
@@ -4655,7 +4684,7 @@ impl World {
                     self.g.ent[c].flags |= 0x400;
                 }
                 self.g.ent[m].f146 = 0;
-                self.player.metamorph = 0;
+                self.players[hx].metamorph = 0;
                 // …and the cloak lifts with it: `v2x->byte[0] &= 0xDF`
                 // beside the `DisableEntityDrawing04_57F10` despawn
                 // (EF:56403; shipped EXE 0x8EA50 `and cl,0xdf`). It is
@@ -4666,25 +4695,25 @@ impl World {
                 // t=8039, the (5,25) puppet at slot 197 is reap-flagged
                 // and the carpet's flags go 301 → 269 in the same tick.
                 if !crate::mc2::roster::no_metamorph_cloak() {
-                    self.player.invisible = false;
-                    self.g.player_invisible = self.ghost;
+                    self.set_human_invisible(hx, false);
+                    self.g.player_invisible[hx] = self.ghost;
                 }
-                self.g.snd_player(60);
+                self.g.snd_player(hx, 60);
             }
             0xB => {
-                self.player.invisible = false;
-                self.player.invis_strength = 0;
+                self.set_human_invisible(hx, false);
+                self.players[hx].invis_strength = 0;
             }
-            0xC => self.player.beyond_sight = false,
-            5 => self.player.heal_active = false,
+            0xC => self.players[hx].beyond_sight = false,
+            5 => self.players[hx].heal_active = false,
             3 => {
-                self.player.accel = 0;
-                self.player.accel_mc2_factor = 0;
+                self.players[hx].accel = 0;
+                self.players[hx].accel_mc2_factor = 0;
             }
             // Teleport's window end repeats the flight target-speed
             // zero (`sub_6AD60` countdown-out arm, EF:57046
             // `speed_0xc_12 = 0` beside the `sub_6D880` teardown).
-            0xA => self.pending_speed_zero = true,
+            0xA => self.pending_speed_zero[hx] = true,
             _ => {}
         }
     }
@@ -4745,7 +4774,7 @@ impl World {
     /// route through the `sub_6DCA0` dispatch; the direct-effect
     /// spells (cast-path trace §2.2) write player state or spawn
     /// their entity directly.
-    fn mc2_spell_fire(&mut self, spell: usize, m: usize, p: PlayerPose, ctx: &MobCtx) {
+    fn mc2_spell_fire(&mut self, hx: Hx, spell: usize, m: usize, p: PlayerPose, ctx: &MobCtx) {
         let tier = self.g.ent[m].f71 as usize;
         let row = self.g.assets.spells.get(spell).copied();
         let mut sub = row.map_or(Mc2SubSpell::default(), |r| r.tiers[tier.min(2)]);
@@ -4783,7 +4812,7 @@ impl World {
             };
             let mut twin: Option<usize> = None;
             for &off in fan {
-                let Some(i) = self.mc2_launch(spell, m, &arm, sub, p) else {
+                let Some(i) = self.mc2_launch(hx, spell, m, &arm, sub, p) else {
                     continue;
                 };
                 // Steal Mana: `sub_6B3E0` post-writes the bolt's
@@ -4826,7 +4855,7 @@ impl World {
                     }
                 }
                 twin = Some(i);
-                self.g.snd_player(v6);
+                self.g.snd_player(hx, v6);
             }
             return;
         }
@@ -4866,7 +4895,7 @@ impl World {
                     _ => None,
                 };
                 if let Some((subtype, impact)) = arm {
-                    self.mc2_possess_launch(m, p, subtype, impact, sub);
+                    self.mc2_possess_launch(hx, m, p, subtype, impact, sub);
                 }
             }
             // castle: the castle-ball cast (the MC1 machinery on the
@@ -4876,8 +4905,8 @@ impl World {
                 // The hand pick feeds MC1's muzzle anchor only; the
                 // MC2 lane always spawns at the carpet (cast_castle's
                 // mc2 gate), so the side is inert here.
-                self.cast_castle(p, false, Some(m));
-                self.g.snd_player(15);
+                self.cast_castle(hx, p, false, Some(m));
+                self.g.snd_player(hx, 15);
             }
             // speed_up: the accelerate channel (`GetScroll_69DB0`
             // EF:56189), sound 19. The per-tier factor `subSpellIndex`
@@ -4897,13 +4926,13 @@ impl World {
                 let dir_src = if no_mc2_speed_sign_cmd() {
                     p.speed
                 } else {
-                    self.mc2_cmd_speed
+                    self.mc2_cmd_speed[hx]
                 };
-                self.player.accel = if dir_src >= 0 { 1 } else { -1 };
-                self.player.accel_held = true;
-                self.player.accel_mc2_factor = sub.sub_spell.clamp(1, 8) as i8;
-                self.mc2_award_xp(PLAYER_TARGET, 3, 1);
-                self.g.snd_player(19);
+                self.players[hx].accel = if dir_src >= 0 { 1 } else { -1 };
+                self.players[hx].accel_held = true;
+                self.players[hx].accel_mc2_factor = sub.sub_spell.clamp(1, 8) as i8;
+                self.mc2_award_xp(self.g.human_tag[hx].0, 3, 1);
+                self.g.snd_player(hx, 19);
             }
             // heal (5) NEVER REACHES HERE. `sub_6A300` is not a
             // "fire once on the first tick" spell at all — its whole
@@ -4923,9 +4952,9 @@ impl World {
             // re-stamp lives in `mc2_manifestation_tick`.
             6 => {
                 if sub.life == 1 && !no_mc2_shield_armed() {
-                    self.player.shield_armed = true;
+                    self.set_human_shield_armed(hx, true);
                 } else {
-                    self.player.shield = true;
+                    self.set_human_shield(hx, true);
                 }
                 // ⛔ NO XP HERE. `sub_6A480` never calls `sub_6D8B0`;
                 // spell 6's only award site in the shipped image is
@@ -4933,7 +4962,7 @@ impl World {
                 // [`no_mc2_shield_xp_on_absorb`] and its twin hunk in
                 // `World::apply_player_damage`.
                 if no_mc2_shield_xp_on_absorb() {
-                    self.mc2_award_xp(PLAYER_TARGET, 6, 1);
+                    self.mc2_award_xp(self.g.human_tag[hx].0, 6, 1);
                 }
             }
             // rebound (`sub_6AA00` EF:56721-51): armed-window flag +
@@ -4956,7 +4985,7 @@ impl World {
                 // `Gen::mc2_rebound_deflect` already mails. This arm
                 // was a second, invented credit.
                 if no_mc2_rebound_xp_on_deflect() {
-                    self.mc2_award_xp(PLAYER_TARGET, 8, 1);
+                    self.mc2_award_xp(self.g.human_tag[hx].0, 8, 1);
                 }
             }
             // teleport (`sub_6AD60` EF:56860): the real per-tier
@@ -4964,27 +4993,27 @@ impl World {
             // all castles (docs/spell-audit/teleport.md). Sound 22 is
             // played inside on a castle success (silent random hop).
             0xA => {
-                self.mc2_cast_teleport(m, p);
-                self.mc2_award_xp(PLAYER_TARGET, 10, 1);
+                self.mc2_cast_teleport(hx, m, p);
+                self.mc2_award_xp(self.g.human_tag[hx].0, 10, 1);
             }
             // invisible (EF:57068): set the flag AND the per-tier
             // break strength (`byte_0x1BF_447 = life_0x1A` = {1,2,3}),
             // which the arm-path break law consults (mc2_cast_gate).
             0xB => {
-                self.player.invisible = true;
-                self.player.invis_strength = sub.life.clamp(0, 3) as i8;
+                self.set_human_invisible(hx, true);
+                self.players[hx].invis_strength = sub.life.clamp(0, 3) as i8;
                 // …and the SAME statement block clears the caster's
                 // spawn grace (`word_0x159_345 = 0`, NETHERW.EXE
                 // 0x8FA46) — see [`no_mc2_invis_clears_grace`].
                 if !no_mc2_invis_clears_grace() {
-                    self.player.grace = 0;
+                    self.players[hx].grace = 0;
                 }
-                self.mc2_award_xp(PLAYER_TARGET, 11, 1);
+                self.mc2_award_xp(self.g.human_tag[hx].0, 11, 1);
             }
             // beyond_sight (EF:57132).
             0xC => {
-                self.player.beyond_sight = true;
-                self.mc2_award_xp(PLAYER_TARGET, 12, 1);
+                self.players[hx].beyond_sight = true;
+                self.mc2_award_xp(self.g.human_tag[hx].0, 12, 1);
             }
             // summon_army (`sub_6C170` EF:57638): the (9,24) carrier
             // flies forward and LANDS to spawn a ring of allied class-5
@@ -4994,6 +5023,7 @@ impl World {
             0x13 => {
                 if self
                     .mc2_launch(
+                        hx,
                         spell,
                         m,
                         &DispatchArm {
@@ -5006,7 +5036,7 @@ impl World {
                     )
                     .is_some()
                 {
-                    self.g.snd_player(9);
+                    self.g.snd_player(hx, 9);
                 }
             }
             // fools_mana (`sub_6C870` EF:57868): a SHOTGUN of six
@@ -5017,8 +5047,8 @@ impl World {
                 // Retail's sub_6C870 cast awards no XP (the trap's
                 // SPEND points in sub_36680 do); sound 11 gates on the
                 // burst spawning (EF:57924).
-                if self.mc2_cast_fools_mana(m, p, sub) {
-                    self.g.snd_player(11);
+                if self.mc2_cast_fools_mana(hx, m, p, sub) {
+                    self.g.snd_player(hx, 11);
                 }
             }
             // magic_mine (`sub_6CAC0` EF:57960): the (9,29) carrier flies
@@ -5029,6 +5059,7 @@ impl World {
             0x17 => {
                 if self
                     .mc2_launch(
+                        hx,
                         spell,
                         m,
                         &DispatchArm {
@@ -5041,7 +5072,7 @@ impl World {
                     )
                     .is_some()
                 {
-                    self.g.snd_player(15);
+                    self.g.snd_player(hx, 15);
                 }
             }
             // alliance: class-9 subtype 25 direct (`sub_6CD20`
@@ -5054,6 +5085,7 @@ impl World {
             0x18 => {
                 if self
                     .mc2_launch(
+                        hx,
                         spell,
                         m,
                         &DispatchArm {
@@ -5066,18 +5098,18 @@ impl World {
                     )
                     .is_some()
                 {
-                    self.g.snd_player(9);
+                    self.g.snd_player(hx, 9);
                 }
             }
             // metamorph (`sub_6A030` EF:56294): transform the caster
             // into a pooled class-5 creature (pose-puppet), carpet hidden.
-            4 => self.mc2_cast_metamorph(m, sub, p),
+            4 => self.mc2_cast_metamorph(hx, m, sub, p),
             // duel (`sub_6B610` EF:57258): FIRE THE (9,7) DUEL DART.
             // The (10,26) tether is the dart's IMPACT, not the cast
             // product. The grip → lock → enforcement machinery lives
             // in world.rs (`mc2_duel_tether_tick` / `mc2_duel_enforce`);
             // docs/spell-audit/duel.md.
-            0xE => self.mc2_cast_duel(m, sub, p),
+            0xE => self.mc2_cast_duel(hx, m, sub, p),
             _ => {}
         }
         let _ = ctx;
@@ -5091,6 +5123,7 @@ impl World {
     /// directly, past the tier walk (see `mc2_manifestation_tick`).
     fn mc2_possess_launch(
         &mut self,
+        hx: Hx,
         m: usize,
         p: PlayerPose,
         subtype: u8,
@@ -5098,6 +5131,7 @@ impl World {
         sub: Mc2SubSpell,
     ) {
         let Some(i) = self.mc2_launch(
+            hx,
             1,
             m,
             &DispatchArm {
@@ -5128,7 +5162,7 @@ impl World {
         // EF:63314/59052). The lane is not compared; the XP wiring
         // wins.
         let token_sub = self.g.ent[m].f30 as i32;
-        let caster_speed = self.mc2_caster_act_speed(p);
+        let caster_speed = self.mc2_caster_act_speed(hx, p);
         {
             let e = &mut self.g.ent[i];
             // ⭐⭐⭐ THE LEVELED BOLT'S @0x10 IS A **32-BIT SQUARED
@@ -5170,7 +5204,7 @@ impl World {
             e.f126 = 384i32.saturating_add(caster_speed as i32) as i16;
         }
         // Sound 40 only on a successful spawn.
-        self.g.snd_player(40);
+        self.g.snd_player(hx, 40);
     }
 
     /// The launch block shared by every projectile arm (cast-path
@@ -5191,7 +5225,7 @@ impl World {
     /// (docs/spell-audit/fools-mana.md). The trap machinery is the
     /// (10,57) TICK's, not a cast flag: the authored ground spheres run
     /// the identical path off their NewEvent defaults.
-    fn mc2_cast_fools_mana(&mut self, m: usize, p: PlayerPose, sub: Mc2SubSpell) -> bool {
+    fn mc2_cast_fools_mana(&mut self, hx: Hx, m: usize, p: PlayerPose, sub: Mc2SubSpell) -> bool {
         // ⭐⭐⭐ THE HUMAN'S FOOL'S MANA IS `sub_6C870` — THE SAME BODY
         // THE RIVAL COLUMN RUNS. The port's human arm was a paraphrase
         // assembled from the WRONG retail function: the `dword_0x10_16
@@ -5243,10 +5277,10 @@ impl World {
         // 10633->10634: retail births six (10,57) at z
         // 389/401/398/394/390/386 off a caster z of 257; the port held
         // 489/501/498/494/490/486 — the only six rows in the pair.
-        let (mx, my, _) = self.muzzle_side(p, self.mc2_fire_side(m));
+        let (mx, my, _) = self.muzzle_side(p, self.mc2_fire_side(hx, m));
         let payload = sub.sub_spell.clamp(0, u16::MAX as i32) as u16;
         let tier = sub.life.max(0) as u8;
-        let base = (4 * self.mc2_caster_act_speed(p) as i32).clamp(140, 280);
+        let base = (4 * self.mc2_caster_act_speed(hx, p) as i32).clamp(140, 280);
         let mut spawned = false;
         for _ in 0..6 {
             let Some(s) = self.g.mc2_spawn_mana_sphere(57, mx, my, p.z) else {
@@ -5262,14 +5296,14 @@ impl World {
             let yaw = p.heading.wrapping_sub(85).wrapping_add((r2 % 0xAA) as u16) & 0x7FF;
             let e = &mut self.g.ent[s];
             e.f126 = speed; // actSpeed — the throw
-            e.id24 = PLAYER_TARGET; // parentId = caster (the skip-gate)
+            e.id24 = self.g.human_tag[hx].0; // parentId = caster (the skip-gate)
             e.f44 = payload; // subSpellIndex damage payload
             e.f71 = tier; // byte_0x46_70 retaliation tier
             e.f144 = 0; // NEUTRAL — no owner colour (the "fool")
             e.f30 = yaw; // launch heading
             e.f32 = p.pitch; // launch pitch (EF:57919)
             if tier >= 3 {
-                e.f144 = PLAYER_TARGET;
+                e.f144 = self.g.human_tag[hx].0;
                 self.g.ball_resize(s);
             }
             spawned = true;
@@ -5322,8 +5356,8 @@ impl World {
     /// `muzzle_side` already carries), the `axis_0x9A_154x` aim point
     /// = the caster's position stepped 10240 along the launch bearing,
     /// the bearing itself, and `PrepareEventSound(…, -1, 9)`.
-    fn mc2_cast_duel(&mut self, m: usize, sub: Mc2SubSpell, p: PlayerPose) {
-        let (mx, my, mz) = self.muzzle_side(p, self.mc2_fire_side(m));
+    fn mc2_cast_duel(&mut self, hx: Hx, m: usize, sub: Mc2SubSpell, p: PlayerPose) {
+        let (mx, my, mz) = self.muzzle_side(p, self.mc2_fire_side(hx, m));
         let Some(i) = self.g.mc2_spawn_cast_proj(7, mx, my, mz) else {
             return; // pool full: no dart, NO cast sound
         };
@@ -5339,7 +5373,7 @@ impl World {
         let tier = self.g.ent[m].f71;
         {
             let e = &mut self.g.ent[i];
-            e.id24 = PLAYER_TARGET;
+            e.id24 = self.g.human_tag[hx].0;
             e.f68 = 10;
             e.f69 = 26;
             e.f44 = sub.sub_spell.clamp(0, u16::MAX as i32) as u16;
@@ -5358,10 +5392,10 @@ impl World {
             e.dest_y = dest.1;
             e.site_z = dest.2;
         }
-        self.g.snd_player(9);
+        self.g.snd_player(hx, 9);
     }
 
-    fn mc2_cast_metamorph(&mut self, m: usize, sub: Mc2SubSpell, p: PlayerPose) {
+    fn mc2_cast_metamorph(&mut self, hx: Hx, m: usize, sub: Mc2SubSpell, p: PlayerPose) {
         let model = sub.life.max(0) as u8;
         // sub_6A030 (EF:56325) mints at the caster's FULL 3-D
         // position — position_0x4C_76 forwarded untouched through
@@ -5375,7 +5409,7 @@ impl World {
             let e = &mut self.g.ent[s];
             e.site_z = 12; // StageVar2 = 12 (metamorph pose-puppet)
             e.tick70 = model.wrapping_mul(8).wrapping_add(7); // action 8*M+7
-            e.id24 = PLAYER_TARGET; // caster's team → allied
+            e.id24 = self.g.human_tag[hx].0; // caster's team → allied
             // ⭐ THE CTOR'S `dword_0x10_16 = slot % 100` SURVIVES —
             // `sub_6A030` makes no @0x10 store and neither does
             // `sub_1E4D0`. See
@@ -5394,7 +5428,7 @@ impl World {
             }
         }
         self.g.ent[m].f146 = s as u16; // manifestation link (word_0x96_150)
-        self.player.metamorph = model; // hide the carpet, draw the creature
+        self.players[hx].metamorph = model; // hide the carpet, draw the creature
         // ⭐⭐⭐ THE METAMORPH CLOAK IS THE INVISIBILITY BIT.
         // `sub_6A030`'s first-tick block ends `v2x->byte[0] |= 0x21`
         // (EF:56335; shipped EXE 0x8E92F `or dl,0x21`) on the CASTER —
@@ -5415,25 +5449,26 @@ impl World {
         // never touches `byte_0x1BF_447` here, so arming a spell does
         // not break a metamorph cloak.
         if !crate::mc2::roster::no_metamorph_cloak() {
-            self.player.invisible = true;
-            self.g.player_invisible = true;
+            self.set_human_invisible(hx, true);
+            self.g.player_invisible[hx] = true;
         }
-        self.mc2_award_xp(PLAYER_TARGET, 4, 1);
-        self.g.snd_player(60);
+        self.mc2_award_xp(self.g.human_tag[hx].0, 4, 1);
+        self.g.snd_player(hx, 60);
     }
 
     /// The CASTER's live `actSpeed_0x82_130` as a cast thunk reads it
     /// mid-walk. See [`no_mc2_speed_token_live_actspeed`].
-    pub(crate) fn mc2_caster_act_speed(&self, p: PlayerPose) -> i16 {
+    pub(crate) fn mc2_caster_act_speed(&self, hx: Hx, p: PlayerPose) -> i16 {
         if no_mc2_speed_token_live_actspeed() {
             return p.speed;
         }
-        self.pending_speed_base.unwrap_or(p.speed)
+        self.pending_speed_base[hx].unwrap_or(p.speed)
     }
 
     /// Returns the spawned projectile's slot (None = pool full).
     fn mc2_launch(
         &mut self,
+        hx: Hx,
         spell: usize,
         m: usize,
         arm: &DispatchArm,
@@ -5448,7 +5483,7 @@ impl World {
         // is the CASTER's own flag bits, which is why `hand_bits`
         // rather than a token register carries it (the
         // `dual_wield_muzzle` patch overrides it per token).
-        let (mx, my, mz) = self.muzzle_side(p, self.mc2_fire_side(m));
+        let (mx, my, mz) = self.muzzle_side(p, self.mc2_fire_side(hx, m));
         // ⭐ THE ARMY AND ALLIANCE ARMS NEITHER LIFT NOR RE-PRICE.
         // Diffed statement by statement against their five siblings,
         // `sub_6C170` (EF:57659-81) and `sub_6CD20` (EF:58062-86) are
@@ -5482,14 +5517,14 @@ impl World {
         // ⭐⭐⭐ THE CARPET BOOST IS THE **LIVE** `actSpeed_0x82_130`,
         // NOT THE TICK-TOP POSE — see
         // [`no_mc2_speed_token_live_actspeed`].
-        let caster_speed = self.mc2_caster_act_speed(p);
+        let caster_speed = self.mc2_caster_act_speed(hx, p);
         let Some(i) = self.g.mc2_spawn_cast_proj(arm.subtype, mx, my, mz) else {
             return None; // pool full: no projectile, NO cast sound
             // (retail gates the sound on the spawn, EF:44224-39)
         };
         {
             let e = &mut self.g.ent[i];
-            e.id24 = PLAYER_TARGET;
+            e.id24 = self.g.human_tag[hx].0;
             e.f68 = arm.impact.0;
             e.f69 = arm.impact.1;
             // The tier payload rides every projectile (EF:55864 —
@@ -5722,8 +5757,8 @@ impl World {
         // loop — and the possession arms overwrite the bank with
         // their own @0x10 law after this helper returns while
         // keeping the zero (EF:56058/55975).
-        self.g.ent[i].f26 = self.wiz_charge[self.g.human_seat.0 as usize] as i16;
-        self.wiz_charge[self.g.human_seat.0 as usize] = 0;
+        self.g.ent[i].f26 = self.wiz_charge[self.g.human_seat[hx].0 as usize] as i16;
+        self.wiz_charge[self.g.human_seat[hx].0 as usize] = 0;
         // ⭐⭐⭐ `word_0x26_38` IS THE (15,x) TOKEN'S **POOL SLOT**,
         // NOT THE SPELL INDEX, AND TWO RETAIL READERS DEREFERENCE IT:
         // the impact XP award (`sub_6D8B0(id,
@@ -5761,13 +5796,14 @@ impl World {
     /// spell or empty cone.
     pub(crate) fn mc2_aim_preview(
         &self,
+        hx: Hx,
         p: PlayerPose,
         right: bool,
         spell: usize,
     ) -> Option<AimLock> {
         // The would-be projectile subtype: the sub_6DCA0 band + the
         // direct class-9 arms (possess/summon/mine/alliance).
-        let tier = self.mc2_book.sel.get(spell).copied().unwrap_or(0) as usize;
+        let tier = self.mc2_book[hx].sel.get(spell).copied().unwrap_or(0) as usize;
         let life = self
             .g
             .assets
@@ -5797,13 +5833,13 @@ impl World {
             yaw: p.heading,
             pitch: p.pitch,
             model: subtype,
-            own: PLAYER_TARGET,
+            own: self.g.human_tag[hx].0,
             // The would-be shot's owner is the human carpet, a wizard
             // row like any other (`sub_67CB0`'s owner hoist).
-            range: self.g.mc2_owner_lock_range(PLAYER_TARGET),
+            range: self.g.mc2_owner_lock_range(self.g.human_tag[hx].0),
             reach: speed as i64 * max_life as i64,
         };
-        let slot = self.g.mc2_aim_scan(&probe, None)?;
+        let slot = self.g.mc2_aim_scan(&probe, &[])?;
         let e = &self.g.ent[slot as usize];
         Some(AimLock {
             x: e.x as f32 / 256.0,
@@ -5849,18 +5885,18 @@ impl World {
     /// (whose row IS `{0,1}`) and harmless for the hands, but OPEN —
     /// see docs/ROADMAP.md. The campaign carry itself is already right
     /// (`apply_campaign_book`).
-    pub(crate) fn mc2_seed_default_spells(&mut self) {
+    pub(crate) fn mc2_seed_default_spells(&mut self, hx: Hx) {
         for s in [0usize, 1] {
-            if self.mc2_book.ent[s] != 0 {
+            if self.mc2_book[hx].ent[s] != 0 {
                 continue;
             }
-            let (px, py, pz) = self.human_pose;
+            let (px, py, pz) = self.human_pose(hx);
             if let Some(m) = self.mc2_new_spell_token(s as u8, px, py, pz) {
-                self.mc2_adopt_manifestation(m, s);
-                self.g.mc2_spell_tokens.0 |= 1 << s;
+                self.mc2_adopt_manifestation(hx, m, s);
+                self.g.mc2_spell_tokens[hx].0 |= 1 << s;
             }
         }
-        self.mc2_rebind_hands_canonical();
+        self.mc2_rebind_hands_canonical(hx);
     }
 
     /// The level-start book beyond the `{0, 1}` floor: mint a token for
@@ -5871,22 +5907,22 @@ impl World {
     /// human's carried book, ahead of the rivals. The conformance
     /// instruments (`terrain-check`) read the list off a take's record
     /// 0; the app's campaign carry keeps `mc2_grant_plausible`.
-    pub fn mc2_grant_start_book(&mut self, spells: &[u8]) {
+    pub fn mc2_grant_start_book(&mut self, hx: Hx, spells: &[u8]) {
         if !matches!(self.game(), crate::ids::GameId::Mc2) {
             return;
         }
         for &sp in spells {
             let s = sp as usize;
-            if s >= 26 || self.mc2_book.ent[s] != 0 {
+            if s >= 26 || self.mc2_book[hx].ent[s] != 0 {
                 continue;
             }
-            let (px, py, pz) = self.human_pose;
+            let (px, py, pz) = self.human_pose(hx);
             if let Some(m) = self.mc2_new_spell_token(s as u8, px, py, pz) {
-                self.mc2_adopt_manifestation(m, s);
-                self.g.mc2_spell_tokens.0 |= 1 << s;
+                self.mc2_adopt_manifestation(hx, m, s);
+                self.g.mc2_spell_tokens[hx].0 |= 1 << s;
             }
         }
-        self.mc2_rebind_hands_canonical();
+        self.mc2_rebind_hands_canonical(hx);
     }
 
     /// The MC2 level-init hand assignment (`InitialiseSpells_54A50`,
@@ -5905,17 +5941,17 @@ impl World {
     /// SECOND. mc2:003's `{0,1,2,3,4,6,11,12}` came out Beyond Sight
     /// (12) / Possession (1) instead of Fireball / Possession. The
     /// pickup law is right for actual pickups and is unchanged.
-    pub(crate) fn mc2_rebind_hands_canonical(&mut self) {
-        self.mc2_set_hand(false, -1);
-        self.mc2_set_hand(true, -1);
+    pub(crate) fn mc2_rebind_hands_canonical(&mut self, hx: Hx) {
+        self.mc2_set_hand(hx, false, -1);
+        self.mc2_set_hand(hx, true, -1);
         for s in 0..26usize {
-            if self.mc2_book.ent[s] == 0 {
+            if self.mc2_book[hx].ent[s] == 0 {
                 continue;
             }
-            if self.mc2_book.left == -1 {
-                self.mc2_set_hand(false, s as i8);
-            } else if self.mc2_book.right == -1 {
-                self.mc2_set_hand(true, s as i8);
+            if self.mc2_book[hx].left == -1 {
+                self.mc2_set_hand(hx, false, s as i8);
+            } else if self.mc2_book[hx].right == -1 {
+                self.mc2_set_hand(hx, true, s as i8);
                 break;
             }
         }
@@ -5945,7 +5981,7 @@ impl World {
     /// token's live `rand` field (retail's scatter never writes it;
     /// mc2l3 t=15300 keeps all 26 seeds at their allocation values).
     /// OPEN: import `carpet.rand` and roll the real stream.
-    pub(crate) fn mc2_scatter_spells(&mut self, p: PlayerPose) {
+    pub(crate) fn mc2_scatter_spells(&mut self, hx: Hx, p: PlayerPose) {
         // ⭐⭐ ONE RUNNING STREAM, THE DYING CARPET'S OWN (`sub_5E310`
         // EF:60153-61): three draws per scattered token, CONTINUING
         // across all 26 — not each token's private seed restarted 26
@@ -5955,7 +5991,7 @@ impl World {
         // it, so the value standing here is the one retail scatters
         // with. mc2l0 t=11192: twelve draws, three each for the four
         // owned spells.
-        let cs = self.mc2_carpet_slot as usize;
+        let cs = self.mc2_carpet_slot[hx] as usize;
         let mut carpet_rand = if cs != 0 && cs < self.g.ent.len() {
             self.g.ent[cs].rand
         } else {
@@ -5969,12 +6005,12 @@ impl World {
         // the wizard holds, so the cosmetic jar just expires.
         let keep = self.patches.no_spell_loss && !self.strict_retail;
         for spell in 0..26usize {
-            let m = self.mc2_book.ent[spell] as usize;
+            let m = self.mc2_book[hx].ent[spell] as usize;
             if m == 0 {
                 continue;
             }
             if !keep {
-                self.mc2_book.ent[spell] = 1; // the boolean "still known" marker
+                self.mc2_book[hx].ent[spell] = 1; // the boolean "still known" marker
             }
             // ⚠ SIXTEEN-BIT STEPS. `rand_0x14_20` is a `uint16_t`
             // (global_types.h:331), so every store truncates — and
@@ -6010,7 +6046,7 @@ impl World {
                 // See [`World::player_death_clear_effects`].
                 if spell != 2 && self.g.ent[m].f26 > 0 {
                     self.g.ent[m].f26 = 0;
-                    self.mc2_cast_expire(spell, m);
+                    self.mc2_cast_expire(hx, spell, m);
                 }
                 continue;
             }
@@ -6037,7 +6073,7 @@ impl World {
             self.g.ent[cs].rand = carpet_rand;
         }
         if !keep {
-            self.g.mc2_spell_tokens.0 = 0;
+            self.g.mc2_spell_tokens[hx].0 = 0;
         }
     }
 }
@@ -6162,16 +6198,15 @@ mod fools_retaliation_arm_tests {
         World::new_for_game(planes, &[], 1, assets, GameId::Mc2)
     }
 
-    fn ctx() -> MobCtx {
+    fn ctx(g: &mut crate::engine::features::Gen) -> MobCtx {
+        *g.view_mut(crate::engine::world::Hx::FIRST) = crate::engine::features::SeatView {
+            x: 200 << 8,
+            y: 200 << 8,
+            z: 100,
+            ..Default::default()
+        };
         MobCtx {
-            px: 200 << 8,
-            py: 200 << 8,
-            pz: 100,
-            pyaw: 0,
-            pmana: 0,
-            pmana_max: 0,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: crate::patches::WorldPatches::RETAIL,
             mc2_turn: 0,
@@ -6204,7 +6239,7 @@ mod fools_retaliation_arm_tests {
         // keeps NewEvent_4A050's `id_0x1A_26 = <own pool index>`.
         let mut w = world(true);
         let s = sphere(&mut w, 7);
-        let c = ctx();
+        let c = ctx(&mut w.g);
         w.g.mc2_fools_bolt(s, 0, (10, 0), 4242, &c);
         let splash = (1..w.g.ent.len())
             .find(|&j| w.g.ent[j].class64 == 10 && w.g.ent[j].model65 == 5)
@@ -6222,7 +6257,7 @@ mod fools_retaliation_arm_tests {
         // (`sub_104D0_terrain_tile_is_water`, 0x5B003-0x5B012).
         let mut w = world(false);
         let s = sphere(&mut w, 7);
-        let c = ctx();
+        let c = ctx(&mut w.g);
         w.g.mc2_fools_bolt(s, 0, (10, 0), 4242, &c);
         assert!(
             !(1..w.g.ent.len()).any(|j| w.g.ent[j].class64 == 10 && w.g.ent[j].model65 == 5),
@@ -6240,7 +6275,7 @@ mod fools_retaliation_arm_tests {
         // handed it.
         let mut w = world(false);
         let s = sphere(&mut w, 7);
-        let c = ctx();
+        let c = ctx(&mut w.g);
         w.g.mc2_fools_bolt(s, 9, (10, 23), 4242, &c);
         let bolt = (1..w.g.ent.len())
             .find(|&j| w.g.ent[j].class64 == 9 && w.g.ent[j].model65 == 9)
@@ -6256,6 +6291,7 @@ mod fools_retaliation_arm_tests {
 #[cfg(test)]
 mod shield_billing_tests {
     use crate::engine::features::{FeatureAssets, Planes};
+    use crate::engine::world::Hx;
     use crate::engine::world::{PlayerCommand, PlayerPose, World};
     use crate::ids::GameId;
     use crate::mc1::mobs::PLAYER_TARGET;
@@ -6299,14 +6335,14 @@ mod shield_billing_tests {
             mc1_sprite_ext: Vec::new(),
         };
         let mut w = World::new_for_game(planes, &[], 1, assets, GameId::Mc2);
-        w.mc2_grant_plausible(&[(6, 0)]);
-        let m = w.mc2_book.ent[6] as usize;
+        w.mc2_grant_plausible(Hx::FIRST, &[(6, 0)]);
+        let m = w.mc2_book[Hx::FIRST].ent[6] as usize;
         assert!(m != 0, "shield was granted");
-        w.mc2_book.left = 6;
+        w.mc2_book[Hx::FIRST].left = 6;
         // Fund the purse the supported way (a CLAIMED sphere lifts the
         // ceiling the census re-derives every lap; a bare
         // `player.mana =` is clamped back).
-        let (px, py, _) = w.human_pose;
+        let (px, py, _) = w.human_pose(Hx::FIRST);
         let b = w.g.spawn_mana_ball(px, py, 4000).expect("purse");
         w.g.ent[b].f140 = 200_000;
         w.g.ent[b].f144 = PLAYER_TARGET;
@@ -6315,11 +6351,11 @@ mod shield_billing_tests {
         for _ in 0..70 {
             w.tick(away(), PlayerCommand::default());
         }
-        w.player.mana = w.player.mana_max;
+        w.set_human_mana(Hx::FIRST, w.human_mana_max(Hx::FIRST));
         assert!(
-            w.player.mana >= 10_000,
+            w.human_mana(Hx::FIRST) >= 10_000,
             "the rig must be able to afford the 10,000 cast; got {}",
-            w.player.mana
+            w.human_mana(Hx::FIRST)
         );
         assert_eq!(w.g.ent[m].f26, 0, "the window is not armed yet");
         assert_eq!(w.g.ent[m].f54, 0, "the grant cooldown has run off");
@@ -6353,7 +6389,7 @@ mod shield_billing_tests {
         fire(&mut w);
         assert!(w.g.ent[m].f26 > 0, "the shield window armed (life 0)");
         assert_eq!(
-            w.debug_player_mana_delta(),
+            w.debug_player_mana_delta(Hx::FIRST),
             -10_000,
             "sub_6A480's `life_0x1A == 0` arm calls sub_68DE0 BEFORE \
              the decrement, so the first-tick full-cost debit lands \
@@ -6365,7 +6401,7 @@ mod shield_billing_tests {
         fire(&mut w);
         assert!(w.g.ent[m].f26 > 0, "the shield window armed (life 1)");
         assert_eq!(
-            w.debug_player_mana_delta(),
+            w.debug_player_mana_delta(Hx::FIRST),
             0,
             "sub_6A480's `life_0x1A == 1` arm decrements FIRST \
              (NETHERW.EXE 0x8ed29..0x8ed30 dec / 0x8ed34 call), so \
@@ -6393,7 +6429,7 @@ mod shield_billing_tests {
         w.tick(away(), PlayerCommand::default());
         assert!(w.g.ent[m].f26 > 1, "still mid-window");
         assert_eq!(
-            w.debug_player_mana_delta(),
+            w.debug_player_mana_delta(Hx::FIRST),
             0,
             "a mid-burst shield tick pins the regen (sub_68DE0's else)"
         );
@@ -6402,10 +6438,10 @@ mod shield_billing_tests {
         w.tick(away(), PlayerCommand::default());
         assert_eq!(w.g.ent[m].f26, 0, "the window ended on that tick");
         assert!(
-            w.debug_player_mana_delta() > 0,
+            w.debug_player_mana_delta(Hx::FIRST) > 0,
             "the post-decrement counter is 0, so sub_68DE0 pins \
              NOTHING and the wizard's own recompute stands; got {}",
-            w.debug_player_mana_delta()
+            w.debug_player_mana_delta(Hx::FIRST)
         );
     }
 
@@ -6427,11 +6463,12 @@ mod shield_billing_tests {
     fn shield_xp_is_paid_on_the_absorb_and_not_at_the_cast() {
         // ── POSITIVE CONTROL: a hit with no shield window ─────────
         let (mut w, _) = shield_world(0);
-        w.player.grace = 0; // the spawn-grace memset wipes every channel
-        w.g.player_mail[0] = (400, 1);
+        w.players[Hx::FIRST].grace = 0; // the spawn-grace memset wipes every channel
+        w.g.pmail_mut(Hx::FIRST)[0] = (400, 1);
         w.tick(away(), PlayerCommand::default());
         assert_eq!(
-            w.mc2_book.xp_vol[6], 0,
+            w.mc2_book[Hx::FIRST].xp_vol[6],
+            0,
             "sub_5EFA0's award is INSIDE `byte[1] & 0x40 || byte[2] & 0x40` \
              — an unshielded letter pays no shield XP"
         );
@@ -6440,9 +6477,13 @@ mod shield_billing_tests {
         let (mut w, m) = shield_world(0);
         fire(&mut w);
         assert!(w.g.ent[m].f26 > 0, "the shield window armed");
-        assert!(w.player.shield, "and the CHARGED stage is stamped");
+        assert!(
+            w.human_shield(Hx::FIRST),
+            "and the CHARGED stage is stamped"
+        );
         assert_eq!(
-            w.mc2_book.xp_vol[6], 0,
+            w.mc2_book[Hx::FIRST].xp_vol[6],
+            0,
             "sub_6A480 has NO sub_6D8B0 call — the cast pays no XP \
              (the 33 e8-rel32 callers of 0x920B0 place none in \
              0x8F200..0x8F560)"
@@ -6452,22 +6493,24 @@ mod shield_billing_tests {
             w.tick(away(), PlayerCommand::default());
         }
         assert_eq!(
-            w.mc2_book.xp_vol[6], 0,
+            w.mc2_book[Hx::FIRST].xp_vol[6],
+            0,
             "a shield window that absorbs nothing earns nothing"
         );
 
         // Now the letter.
-        w.player.grace = 0;
-        let life0 = w.player.life;
-        w.g.player_mail[0] = (400, 1);
+        w.players[Hx::FIRST].grace = 0;
+        let life0 = w.human_life(Hx::FIRST);
+        w.g.pmail_mut(Hx::FIRST)[0] = (400, 1);
         w.tick(away(), PlayerCommand::default());
         assert_eq!(
-            w.player.life,
+            w.human_life(Hx::FIRST),
             life0 - 100,
             "the CHARGED stage quartered the letter, so it really was absorbed"
         );
         assert_eq!(
-            w.mc2_book.xp_vol[6], 1,
+            w.mc2_book[Hx::FIRST].xp_vol[6],
+            1,
             "sub_5EFA0 file 0x8399D: push $0x1 / push $0x6 / push the \
              victim's slot / call 0x920B0, above the absorb split"
         );
@@ -6487,6 +6530,7 @@ mod rebound_xp_tests {
     //!
     //! ⛔ UNGRADED (a WIZEXT lane, book re-imported at every anchor).
     use crate::engine::features::{FeatureAssets, Planes};
+    use crate::engine::world::Hx;
     use crate::engine::world::{PlayerCommand, PlayerPose, World};
     use crate::ids::GameId;
     use crate::mc1::mobs::PLAYER_TARGET;
@@ -6522,18 +6566,18 @@ mod rebound_xp_tests {
             mc1_sprite_ext: Vec::new(),
         };
         let mut w = World::new_for_game(planes, &[], 1, assets, GameId::Mc2);
-        w.mc2_grant_plausible(&[(8, 0)]);
-        let m = w.mc2_book.ent[8] as usize;
+        w.mc2_grant_plausible(Hx::FIRST, &[(8, 0)]);
+        let m = w.mc2_book[Hx::FIRST].ent[8] as usize;
         assert!(m != 0, "rebound was granted");
-        w.mc2_book.left = 8;
-        let (px, py, _) = w.human_pose;
+        w.mc2_book[Hx::FIRST].left = 8;
+        let (px, py, _) = w.human_pose(Hx::FIRST);
         let b = w.g.spawn_mana_ball(px, py, 4000).expect("purse");
         w.g.ent[b].f140 = 200_000;
         w.g.ent[b].f144 = PLAYER_TARGET;
         for _ in 0..70 {
             w.tick(away(), PlayerCommand::default());
         }
-        w.player.mana = w.player.mana_max;
+        w.set_human_mana(Hx::FIRST, w.human_mana_max(Hx::FIRST));
         assert_eq!(w.g.ent[m].f26, 0, "the window is not armed yet");
         assert_eq!(w.g.ent[m].f54, 0, "the grant cooldown has run off");
         (w, m)
@@ -6557,16 +6601,21 @@ mod rebound_xp_tests {
             },
         );
         assert!(w.g.ent[m].f26 > 0, "the rebound window armed");
-        assert!(w.player.rebound, "and the window flag is stamped");
+        assert!(
+            w.players[Hx::FIRST].rebound,
+            "and the window flag is stamped"
+        );
         assert_eq!(
-            w.mc2_book.xp_vol[8], 0,
+            w.mc2_book[Hx::FIRST].xp_vol[8],
+            0,
             "sub_6AA00 has no sub_6D8B0 call — the cast pays no XP"
         );
         for _ in 0..8 {
             w.tick(away(), PlayerCommand::default());
         }
         assert_eq!(
-            w.mc2_book.xp_vol[8], 0,
+            w.mc2_book[Hx::FIRST].xp_vol[8],
+            0,
             "and no later window tick pays one either"
         );
 
@@ -6575,7 +6624,8 @@ mod rebound_xp_tests {
         w.g.mc2_cast_xp.0.push((PLAYER_TARGET, 8, 1));
         w.tick(away(), PlayerCommand::default());
         assert_eq!(
-            w.mc2_book.xp_vol[8], 1,
+            w.mc2_book[Hx::FIRST].xp_vol[8],
+            1,
             "sub_68740 file 0x8D009 `push $0x8` is the ONE award site"
         );
     }
@@ -6601,6 +6651,7 @@ mod replay_xp_gate_tests {
     //! re-imported at every anchor, so no recording fixture can hold
     //! this. A unit test is the lane.
     use crate::engine::features::{FeatureAssets, Planes};
+    use crate::engine::world::Hx;
     use crate::engine::world::World;
     use crate::ids::GameId;
     use crate::mc1::mobs::PLAYER_TARGET;
@@ -6643,7 +6694,8 @@ mod replay_xp_gate_tests {
         let mut w = mc2_world(false);
         w.mc2_award_xp(PLAYER_TARGET, 7, 5);
         assert_eq!(
-            w.mc2_book.xp_vol[7], 5,
+            w.mc2_book[Hx::FIRST].xp_vol[7],
+            5,
             "a FIRST-PLAY level credits the award"
         );
 
@@ -6651,7 +6703,8 @@ mod replay_xp_gate_tests {
         let mut w = mc2_world(true);
         w.mc2_award_xp(PLAYER_TARGET, 7, 5);
         assert_eq!(
-            w.mc2_book.xp_vol[7], 0,
+            w.mc2_book[Hx::FIRST].xp_vol[7],
+            0,
             "a REPLAYED level accrues nothing — sub_6D8B0's first line"
         );
 
@@ -6659,14 +6712,14 @@ mod replay_xp_gate_tests {
         // a replayed level.
         for replayed in [false, true] {
             let mut w = mc2_world(replayed);
-            w.mc2_recast_surcharge = true;
+            w.mc2_recast_surcharge[Hx::FIRST] = true;
             w.mc2_award_xp(PLAYER_TARGET, 2, 1);
             assert!(
-                !w.mc2_recast_surcharge,
+                !w.mc2_recast_surcharge[Hx::FIRST],
                 "the castle level-up latch clear sits ABOVE the gate (replayed={replayed})"
             );
             assert_eq!(
-                w.mc2_book.xp_vol[2],
+                w.mc2_book[Hx::FIRST].xp_vol[2],
                 if replayed { 0 } else { 1 },
                 "…while the XP half of the SAME call obeys it (replayed={replayed})"
             );
@@ -6690,19 +6743,24 @@ mod replay_xp_gate_tests {
     fn a_dead_human_still_accrues_spell_xp() {
         // POSITIVE CONTROL — alive.
         let mut w = mc2_world(false);
-        w.player.state = crate::engine::world::LifeState::Alive;
+        w.set_human_state(Hx::FIRST, crate::engine::world::LifeState::Alive);
         w.mc2_award_xp(PLAYER_TARGET, 9, 1);
-        assert_eq!(w.mc2_book.xp_vol[9], 1, "a LIVE human credits the award");
+        assert_eq!(
+            w.mc2_book[Hx::FIRST].xp_vol[9],
+            1,
+            "a LIVE human credits the award"
+        );
 
         for state in [
             crate::engine::world::LifeState::Falling,
             crate::engine::world::LifeState::Dead,
         ] {
             let mut w = mc2_world(false);
-            w.player.state = state;
+            w.set_human_state(Hx::FIRST, state);
             w.mc2_award_xp(PLAYER_TARGET, 9, 1);
             assert_eq!(
-                w.mc2_book.xp_vol[9], 1,
+                w.mc2_book[Hx::FIRST].xp_vol[9],
+                1,
                 "sub_6D8B0 has no life test ({state:?})"
             );
         }
@@ -6712,6 +6770,7 @@ mod replay_xp_gate_tests {
 #[cfg(test)]
 mod invis_grace_tests {
     use crate::engine::features::{FeatureAssets, Planes};
+    use crate::engine::world::Hx;
     use crate::engine::world::{PlayerCommand, PlayerPose, World};
     use crate::ids::GameId;
     use crate::mc1::mobs::PLAYER_TARGET;
@@ -6752,19 +6811,19 @@ mod invis_grace_tests {
             mc1_sprite_ext: Vec::new(),
         };
         let mut w = World::new_for_game(planes, &[], 1, assets, GameId::Mc2);
-        w.mc2_grant_plausible(&[(11, 0)]);
-        let m = w.mc2_book.ent[11] as usize;
+        w.mc2_grant_plausible(Hx::FIRST, &[(11, 0)]);
+        let m = w.mc2_book[Hx::FIRST].ent[11] as usize;
         assert!(m != 0, "invisibility was granted");
-        w.mc2_book.left = 11;
+        w.mc2_book[Hx::FIRST].left = 11;
         // Fund the purse the supported way (see the shield rig).
-        let (px, py, _) = w.human_pose;
+        let (px, py, _) = w.human_pose(Hx::FIRST);
         let b = w.g.spawn_mana_ball(px, py, 4000).expect("purse");
         w.g.ent[b].f140 = 200_000;
         w.g.ent[b].f144 = PLAYER_TARGET;
         for _ in 0..70 {
             w.tick(away(), PlayerCommand::default());
         }
-        w.player.mana = w.player.mana_max;
+        w.set_human_mana(Hx::FIRST, w.human_mana_max(Hx::FIRST));
         assert_eq!(w.g.ent[m].f26, 0, "the window is not armed yet");
         assert_eq!(w.g.ent[m].f54, 0, "the grant cooldown has run off");
         (w, m)
@@ -6788,7 +6847,7 @@ mod invis_grace_tests {
     fn going_invisible_zeroes_the_casters_spawn_grace() {
         let (mut w, m) = invis_world();
         // A fresh respawn's window (`sub_5C950` arms 100).
-        w.player.grace = 100;
+        w.players[Hx::FIRST].grace = 100;
         w.tick(
             away(),
             PlayerCommand {
@@ -6797,11 +6856,11 @@ mod invis_grace_tests {
             },
         );
         assert!(w.g.ent[m].f26 > 0, "fixture: the cloak window opened");
-        assert!(w.player.invisible, "fixture: the cloak edge ran");
+        assert!(w.human_invisible(Hx::FIRST), "fixture: the cloak edge ran");
         // Pre-dig (`MGC_NO_MC2_INVIS_CLEARS_GRACE=1`) the mailbox
         // block's own `--` is the only mover and this reads 99.
         assert_eq!(
-            w.vitals().grace,
+            w.vitals(Hx::FIRST).grace,
             0,
             "the cloak edge's third write is `word_0x159_345 = 0`"
         );
@@ -6811,6 +6870,7 @@ mod invis_grace_tests {
 #[cfg(test)]
 mod scatter_window_tests {
     use crate::engine::features::{FeatureAssets, Planes};
+    use crate::engine::world::Hx;
     use crate::engine::world::{PlayerCommand, PlayerPose, World};
     use crate::ids::GameId;
     use crate::mc2::spells::{MC2_SPELL_ROWS, Mc2SpellRow};
@@ -6869,8 +6929,8 @@ mod scatter_window_tests {
     #[test]
     fn the_death_scatter_leaves_the_window_counter_standing() {
         let mut w = flat_mc2();
-        w.mc2_grant_plausible(&[(3, 0)]);
-        let m = w.mc2_book.ent[3] as usize;
+        w.mc2_grant_plausible(Hx::FIRST, &[(3, 0)]);
+        let m = w.mc2_book[Hx::FIRST].ent[3] as usize;
         assert!(m != 0, "Speed Up was granted");
         assert_eq!(w.g.ent[m].tick70, 9, "the owned state is 3M");
         // An ACTIVE Speed Up window, two ticks in.
@@ -6879,10 +6939,11 @@ mod scatter_window_tests {
         w.g.ent[m].flags |= 1; // byte[0] bit 0 — in the book
 
         let corpse = PlayerPose::from_tiles(40.0, 40.0, 12.0, 0.0, 0.0, 0.0);
-        w.mc2_scatter_spells(corpse);
+        w.mc2_scatter_spells(Hx::FIRST, corpse);
 
         assert_eq!(
-            w.mc2_book.ent[3], 1,
+            w.mc2_book[Hx::FIRST].ent[3],
+            1,
             "the book entry is the boolean marker (EF:60146)"
         );
         assert_eq!(

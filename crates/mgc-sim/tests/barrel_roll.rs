@@ -9,6 +9,7 @@
 //! player's gamedata bake is absent (CI without game assets).
 
 use mgc_formats::LevelPackage;
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::World;
 use mgc_sim::ids::GameId;
@@ -68,8 +69,8 @@ fn world(root: &Path, game: GameId) -> Option<World> {
 
 fn sim_of(w: World) -> Simulation {
     let mut s = Simulation::with_world(w);
-    s.thrust_model = ThrustModel::Mc1;
-    s.sync_carpet_from_flyer();
+    s.thrust_model[Hx::FIRST] = ThrustModel::Mc1;
+    s.sync_carpet_from_flyer(Hx::FIRST);
     s
 }
 
@@ -115,17 +116,17 @@ fn mc2_command_rolls_the_view_and_settles() {
     for _ in 0..30 {
         s.step(&FlightInput::default());
     }
-    assert!(!s.barrel_rolling());
-    let level_roll = s.flyer.roll;
+    assert!(!s.barrel_rolling(Hx::FIRST));
+    let level_roll = s.flyer[Hx::FIRST].roll;
     assert!(level_roll.abs() < 0.1, "level flight before the roll");
 
     s.step(&ROLL);
-    assert!(s.barrel_rolling(), "the command arms the roll");
+    assert!(s.barrel_rolling(Hx::FIRST), "the command arms the roll");
     let (mut ticks, mut past_half) = (0u32, false);
-    while s.barrel_rolling() {
+    while s.barrel_rolling(Hx::FIRST) {
         s.step(&FlightInput::default());
         // Masked to [0, 2π): inverted is the middle of the circle.
-        past_half |= (2.0..4.5).contains(&s.flyer.roll);
+        past_half |= (2.0..4.5).contains(&s.flyer[Hx::FIRST].roll);
         ticks += 1;
         assert!(ticks < 400, "the roll must settle");
     }
@@ -135,9 +136,9 @@ fn mc2_command_rolls_the_view_and_settles() {
         s.step(&FlightInput::default());
     }
     assert!(
-        s.flyer.roll.abs() < 0.1,
+        s.flyer[Hx::FIRST].roll.abs() < 0.1,
         "level flight resumes: {}",
-        s.flyer.roll
+        s.flyer[Hx::FIRST].roll
     );
 }
 
@@ -158,5 +159,5 @@ fn mc1_world_refuses_the_command() {
         s.step(&FlightInput::default());
     }
     s.step(&ROLL);
-    assert!(!s.barrel_rolling(), "MC1 never rolls");
+    assert!(!s.barrel_rolling(Hx::FIRST), "MC1 never rolls");
 }

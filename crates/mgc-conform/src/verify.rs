@@ -13,6 +13,7 @@
 
 use crate::Args;
 use mgc_formats::mgcr::{EntObsMc1, ObsMc1, Recording, RetailEntMc1, RetailMc1, decode_retail_mc1};
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::conformance::PinnedMc1;
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
@@ -1441,7 +1442,7 @@ pub(crate) fn build_world_mc1_with_book(
         // Wizard 0's tokens in the recorded acquisition order
         // (`sub_44D30` :54882-905), after the constructor's carpet
         // record (:54843) and before the rivals.
-        w.grant_spells(book);
+        w.grant_spells(Hx::FIRST, book);
     }
     let (wizards, player_count) = rival_configs(pkg.wizards.as_ref());
     w.set_wizards(&wizards, player_count);

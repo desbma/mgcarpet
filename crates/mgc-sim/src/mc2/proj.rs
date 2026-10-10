@@ -33,8 +33,9 @@
 
 use super::behavior::BEHAVIOR;
 use crate::engine::features::Gen;
+use crate::engine::world::Hx;
 use crate::mc1::combat::MailTarget;
-use crate::mc1::mobs::{MobCtx, PLAYER_TARGET};
+use crate::mc1::mobs::MobCtx;
 
 /// MC2-native projectile marker on [`Ent::flags`] (see
 /// [`super::mobs`] for the other high bits). MC1-fallback projectiles
@@ -782,7 +783,7 @@ impl Gen {
     /// retail has no player test on either statement. The human's
     /// purse lives outside our pool, so the quarter rides the
     /// [`Gen::player_deflect_debit`] seat the MC1 column has used
-    /// since its own deflect law; the gate reads `ctx.pmana` less
+    /// since its own deflect law; the gate reads `view.mana` less
     /// what this tick's earlier deflections already owe, exactly as
     /// `mc1::combat` does. mc2l6-rsg t=4567 measures the debit
     /// directly: the (9,0) carries mana 20, and the human's purse
@@ -844,8 +845,18 @@ impl Gen {
     ) -> bool {
         // The victim's live-window test (retail `word[0] & 0x8010`).
         let (active, precise) = match hit {
-            MailTarget::Player => (self.player_rebound, self.mc2_rebound_precise.0 != 0),
-            MailTarget::Pool(j) => (self.ent[j].flags & 0x8000 != 0, false),
+            MailTarget::Player(hx) => {
+                (self.player_rebound(hx), self.mc2_rebound_precise[hx].0 != 0)
+            }
+            // The precise tier (`byte[0] & 0x10`) has no record home in
+            // the port (its `& 0x10` is the chain/reap bit), so the
+            // human's — met at his record as a pool victim — stays on
+            // the register; no other wizard's tier is modelled.
+            MailTarget::Pool(j) => (
+                self.ent[j].flags & 0x8000 != 0,
+                self.hx_of_rec(j)
+                    .is_some_and(|hx| self.mc2_rebound_precise[hx].0 != 0),
+            ),
         };
         if !active {
             return false;
@@ -870,21 +881,25 @@ impl Gen {
                 }
                 self.ent[j].f140 -= quarter;
             }
-            MailTarget::Player => {
+            MailTarget::Player(hx) => {
                 let owed = quarter.max(0) as u32;
-                if owed > ctx.pmana.saturating_sub(self.player_deflect_debit.0) {
+                if owed
+                    > self
+                        .seat_purse_read(ctx, hx)
+                        .saturating_sub(self.player_deflect_debit[hx].0)
+                {
                     return false;
                 }
-                self.player_deflect_debit.0 += owed;
+                self.player_deflect_debit[hx].0 += owed;
             }
         }
         self.snd(28, i); // the deflection twang
         let deflector = match hit {
-            MailTarget::Player => PLAYER_TARGET,
+            MailTarget::Player(hx) => self.human_tag[hx].0,
             MailTarget::Pool(j) => self.ent[j].id24,
         };
-        if deflector == PLAYER_TARGET {
-            self.mc2_cast_xp.0.push((PLAYER_TARGET, 8, 1));
+        if let Some(hx) = self.hx_of_tag(deflector) {
+            self.mc2_cast_xp.0.push((self.human_tag[hx].0, 8, 1));
         }
         let shooter = self.ent[i].id24;
         let (modulus, half) = window;
@@ -929,7 +944,7 @@ impl Gen {
         // (EF:55298-300 `Entities[word_0x96_150]`, no player test) —
         // the returned bolt now hunts the kind that fired it.
         // mc2l6-rsg t=4567: 378 is a (3,1), and retail stamps 3/1.
-        let (sx, sy) = if shooter == PLAYER_TARGET {
+        let (sx, sy) = if self.is_human_tag(shooter) {
             (3, 0) // the human carpet's class/model
         } else {
             let e = &self.ent[shooter as usize];
@@ -951,12 +966,15 @@ impl Gen {
                 };
                 self.move_relink(i, jx, jy, jz.wrapping_add(jf as i16));
             }
-            MailTarget::Player => self.move_relink(
-                i,
-                ctx.px,
-                ctx.py,
-                ctx.pz.wrapping_add(crate::mc1::combat::PLAYER_HH as i16),
-            ),
+            MailTarget::Player(hx) => {
+                let (px, py, pz) = self.seat_at(ctx, hx);
+                self.move_relink(
+                    i,
+                    px,
+                    py,
+                    pz.wrapping_add(crate::mc1::combat::PLAYER_HH as i16),
+                )
+            }
         }
         true
     }
@@ -977,7 +995,7 @@ impl Gen {
                     .then_some(hit)
                     .flatten()
             }
-            Some(MailTarget::Player) => (fc == 3 && (fm == 0xFF || fm == 0))
+            Some(MailTarget::Player(_)) => (fc == 3 && (fm == 0xFF || fm == 0))
                 .then_some(hit)
                 .flatten(),
             None => None,
@@ -1040,7 +1058,8 @@ impl Gen {
             (e.f146, e.id24, e.f140 as u32)
         };
         let paralyze = self.ent[i].tick70 == 71;
-        if victim == PLAYER_TARGET {
+        // The victim's own seat, when a human is the victim.
+        if let Some(hx) = self.hx_of_tag(victim) {
             // ⭐⭐⭐ THE GRUNT DRAW, THE BACKWARD KICK AND THE STUN
             // MAIL ALL LIVE INSIDE THE "NOT ALREADY PARALYZED" ARM.
             // `sub_38F70` EF:28434-43 verbatim:
@@ -1100,13 +1119,13 @@ impl Gen {
             // with `knock_mag` still decaying +4/tick — retail never
             // re-armed the −80.
             let already_stunned = if paralyze {
-                self.mc2_mobilize.0 != 0
+                self.mc2_mobilize[hx].0 != 0
             } else {
-                !no_stagger_level_gate() && self.mc2_slow.0 != 0
+                !no_stagger_level_gate() && self.mc2_slow[hx].0 != 0
             };
             if !already_stunned {
                 let grunt = 54 + (self.ent_rand(i) & 3) as u8;
-                self.snd_player(grunt);
+                self.snd_player(hx, grunt);
                 // ⭐⭐⭐ AN INVENTED WRITE: retail writes ONLY the
                 // MAGNITUDE, and it writes it NEGATIVE —
                 // `moveBoost_0x1E_30 = -80` (EF:28411 / EF:28437).
@@ -1138,13 +1157,14 @@ impl Gen {
                 // (`amt/10` = 78 on a fresh heading) overwrote the -80
                 // before the mover ran and both columns agreed.
                 if no_stale_debuff_knock() {
-                    self.player_knock = ((ctx.pyaw.wrapping_add(1024)) & 0x7FF, 80);
+                    self.player_knock[hx] =
+                        ((self.seat_yaw(ctx, hx).wrapping_add(1024)) & 0x7FF, 80);
                 } else {
-                    self.player_knock.1 = -80;
+                    self.player_knock[hx].1 = -80;
                 }
             }
             if paralyze {
-                self.mc2_debuffs.stun = self.mc2_debuffs.stun.saturating_add(1);
+                self.mc2_debuffs[hx].stun = self.mc2_debuffs[hx].stun.saturating_add(1);
                 // ⭐⭐⭐ …AND THE LATCH IS VISIBLE IMMEDIATELY. Retail
                 // has ONE storage: `sub_38F70` writes
                 // `mobilizeCounter_0x14E_334` straight onto the
@@ -1172,14 +1192,14 @@ impl Gen {
                 // dispatch and `mc2_move` step 8 decays it in the
                 // same pass, which is retail's own phase (stamp at T,
                 // first decay at T+1). Only the READ window moves.
-                self.mc2_mobilize.0 = 1;
+                self.mc2_mobilize[hx].0 = 1;
                 // `sub_38F70`'s write is `sub_11900` — the POINT
                 // protocol, not the area one ([`Gen::mc2_melee_write`]).
                 // It is the LAST statement of the gated arm above
                 // (EF:28440), so a re-stamp on a stunned wizard bills
                 // nothing.
                 if !already_stunned {
-                    self.mc2_melee_write(PLAYER_TARGET, amt, id);
+                    self.mc2_melee_write(self.human_tag[hx].0, amt, id);
                 }
             } else {
                 // The queue push stays unconditional: retail's
@@ -1189,9 +1209,9 @@ impl Gen {
                 // move_speed += 1 } move_speed_ctr = 8`). Only the
                 // MIRROR needs retail's ceiling, because it is the
                 // operand the next stamp's gate reads.
-                self.mc2_debuffs.slow = self.mc2_debuffs.slow.saturating_add(1);
-                if self.mc2_slow.0 < 3 {
-                    self.mc2_slow.0 += 1;
+                self.mc2_debuffs[hx].slow = self.mc2_debuffs[hx].slow.saturating_add(1);
+                if self.mc2_slow[hx].0 < 3 {
+                    self.mc2_slow[hx].0 += 1;
                 }
             }
         } else {
@@ -1266,7 +1286,7 @@ impl Gen {
     /// tick, the port's class-15 `f26`) cannot be reached until the
     /// launcher stamps the slot. Owner: the cast column.
     fn mc2_mine_swallow(&mut self, i: usize, victim: u16) -> bool {
-        if no_mine_swallow() || victim == 0 || victim == PLAYER_TARGET {
+        if no_mine_swallow() || victim == 0 || self.is_human_tag(victim) {
             return false;
         }
         let (model, own, x, y, z, tok) = {
@@ -1355,7 +1375,7 @@ impl Gen {
         if !matches!(model, 0 | 3 | 7..=9 | 12 | 25 | 28) {
             return;
         }
-        let pooled = |s: u16| s != 0 && s != PLAYER_TARGET && (s as usize) < self.ent.len();
+        let pooled = |s: u16| s != 0 && !self.is_human_tag(s) && (s as usize) < self.ent.len();
         let hit = pooled(struck)
             && pooled(aimed)
             && self.ent[struck as usize].id24 == self.ent[aimed as usize].id24;
@@ -1561,7 +1581,7 @@ impl Gen {
             // bounce off.
             (10, 54) | (10, 69) => {
                 let struck =
-                    victim != 0 && victim != PLAYER_TARGET && (victim as usize) < self.ent.len();
+                    victim != 0 && !self.is_human_tag(victim) && (victim as usize) < self.ent.len();
                 if struck {
                     // EF:59036-45 — the pulse spawns FIRST (it takes
                     // the lower pool slot; the l24 `want=12 got=54`
@@ -1773,7 +1793,7 @@ impl Gen {
                 if let Some(s) = s {
                     self.ent[s].max_life = 30;
                     self.ent[s].act_life = 30;
-                    let human = id == PLAYER_TARGET;
+                    let human = self.is_human_tag(id);
                     let mut n = self.ent[s].f54 as usize;
                     while n != 0 {
                         self.ent[n].id24 = id;
@@ -1817,7 +1837,7 @@ impl Gen {
             // and the wrong unit on the channel (an amount where
             // retail carries a tier index).
             (10, 25) => {
-                let wizard = victim == PLAYER_TARGET
+                let wizard = self.is_human_tag(victim)
                     || self
                         .ent
                         .get(victim as usize)
@@ -1964,7 +1984,7 @@ impl Gen {
             // the `subSpellIndex` copy (EF:63544) overwrites the
             // ctor's 200 with the dart's payload.
             (10, 26) => {
-                let wizard = victim == crate::mc1::mobs::PLAYER_TARGET
+                let wizard = self.is_human_tag(victim)
                     || self
                         .ent
                         .get(victim as usize)
@@ -2072,7 +2092,7 @@ impl Gen {
         // possession `CastPosses_65F60` (action 1) never calls it. The
         // dart's non-wizard fork (`sub_662E0` EF:63531-36) passes NO
         // struck record and mints nothing, yet still counts the shot.
-        if id == PLAYER_TARGET && act != 1 {
+        if self.is_human_tag(id) && act != 1 {
             let struck = if (fc, fm) == (10, 26) && spawned.is_none() {
                 0
             } else {
@@ -2225,14 +2245,14 @@ impl Gen {
                 let cast_mana = self.ent[i].f140;
                 let (vflags, vmana) = match victim {
                     0 => (0u32, 0i32),
-                    crate::mc1::mobs::PLAYER_TARGET => {
-                        let f = if self.player_rebound { 0x8000 } else { 0 }
-                            | if self.mc2_rebound_precise.0 != 0 {
+                    ht if let Some(hx) = self.hx_of_tag(ht) => {
+                        let f = if self.player_rebound(hx) { 0x8000 } else { 0 }
+                            | if self.mc2_rebound_precise[hx].0 != 0 {
                                 0x10
                             } else {
                                 0
                             };
-                        (f, ctx.pmana.min(i32::MAX as u32) as i32)
+                        (f, self.seat_purse(ctx, hx).min(i32::MAX as u32) as i32)
                     }
                     j if (self.ent[j as usize].class64 == 3) => {
                         let v = &self.ent[j as usize];
@@ -2330,7 +2350,7 @@ impl Gen {
         // creature owners never award — sub_6D8B0's own guard is
         // `class == 3 && model == 0`, the HUMAN wizard only
         // (EF:58240-41); retail rivals have no spell-XP progression.
-        if victim != 0 && id == PLAYER_TARGET && self.ent[i].flags & F_MC2PROJ != 0 {
+        if victim != 0 && self.is_human_tag(id) && self.ent[i].flags & F_MC2PROJ != 0 {
             // ⭐⭐⭐ THE IMPACT-XP LANE IS THE WORKER'S, NOT THE FLYER'S.
             // This tail folds SEVEN retail impact workers into one and
             // they do NOT agree about which spell the hit credits —
@@ -2453,7 +2473,7 @@ impl Gen {
         // for one tick — no aim-pitch stamp (91 vs 77), no whiff
         // hover (z 4642 vs 4646). That pair was the segment wall.
         let repoint = !matches!(act, 1 | 18 | 12);
-        if repoint && victim != 0 && id != 0 && id != PLAYER_TARGET {
+        if repoint && victim != 0 && id != 0 && !self.is_human_tag(id) {
             let owner = id as usize;
             // The human owner is stamped by retail too, but his pool
             // record is the reserved hole here (out-of-pool carpet)
@@ -2646,7 +2666,7 @@ impl Gen {
             let hit = self.victim_scan_at(p, (bx, by, bz), ctx);
             let v = match self.mc2_proj_filter(p, hit) {
                 Some(MailTarget::Pool(j)) => j as u16,
-                Some(MailTarget::Player) => PLAYER_TARGET,
+                Some(MailTarget::Player(hx)) => self.human_tag[hx].0,
                 None => 0,
             };
             self.mc2_proj_impact(p, v, ctx, Some(blast_at));
@@ -2830,7 +2850,7 @@ impl Gen {
         self.ent[i].z = at.2;
         let v = match h {
             MailTarget::Pool(j) => self.ent_overlap(i, j),
-            MailTarget::Player => self.player_overlap(i, ctx),
+            MailTarget::Player(hx) => self.player_overlap_at(i, self.seat_at(ctx, hx)),
         };
         self.ent[i].x = old.0;
         self.ent[i].y = old.1;
@@ -2861,7 +2881,7 @@ impl Gen {
     pub(crate) fn mc2_castle_ball_tick(&mut self, i: usize, ctx: &MobCtx) {
         let patched = ctx.patches.one_castle_per_wizard && !ctx.strict;
         let tgt = self.ent[i].f146 as usize;
-        let upgrade_flight = tgt != 0 && tgt != PLAYER_TARGET as usize && tgt < self.ent.len();
+        let upgrade_flight = tgt != 0 && !self.is_human_tag(tgt as u16) && tgt < self.ent.len();
         if !upgrade_flight && self.ent[i].flags & 2 == 0 {
             // sub_66D00's head: latch the arm bit, site-test the
             // launch pose, and do NOT move. A refusal RELEASES the
@@ -3089,8 +3109,8 @@ impl Gen {
     /// life-guarded read dropped to the one-shot arm and flew on
     /// frozen.
     fn mc2_flyer_target(&self, slot: u16, ctx: &MobCtx) -> Option<(u16, u16, i16)> {
-        if slot == PLAYER_TARGET {
-            return Some((ctx.px, ctx.py, ctx.pz));
+        if let Some(hx) = self.hx_of_tag(slot) {
+            return Some(self.seat_at(ctx, hx));
         }
         let j = slot as usize;
         if j == 0 || j >= self.ent.len() {
@@ -3228,7 +3248,7 @@ impl Gen {
                 // and `sub_65580` lifts it like any other; the
                 // pose-only player's box center is pz + PLAYER_HH.
                 let target = self.ent[i].f146;
-                let tz = if target == PLAYER_TARGET {
+                let tz = if self.is_human_tag(target) {
                     tz + crate::mc1::combat::PLAYER_HH as i16
                 } else {
                     self.ent[target as usize].aim_z()
@@ -3663,7 +3683,7 @@ impl Gen {
             && matches!(self.ent[i].tick70, 0 | 29)
             && !no_mc2_shield_swallow()
             && match h {
-                MailTarget::Player => self.player_rebound,
+                MailTarget::Player(hx) => self.player_rebound(hx),
                 MailTarget::Pool(j) => self.ent[j].flags & 0x8010 != 0,
             }
         {
@@ -3873,7 +3893,7 @@ impl Gen {
                 self.move_relink(i, vx, vy, vz);
                 v as u16
             }
-            Some(MailTarget::Player) => {
+            Some(MailTarget::Player(hx)) => {
                 // The player is a raised victim too (see the Pool arm:
                 // retail's player wizard gets the same `sub_65580`
                 // lift) — land at the box center so the burst's area
@@ -3895,13 +3915,14 @@ impl Gen {
                 // wrote 5115. Same row at t=9999/10000/10002/10006
                 // (slots 892/888/872/980), 13666, 22166, 52931, 53161,
                 // 53946 and 53948: eleven segment heads, one lift.
+                let (px, py, pz) = self.seat_at(ctx, hx);
                 let pz = if self.mc2_beam_defer.armed {
-                    ctx.pz
+                    pz
                 } else {
-                    ctx.pz.wrapping_add(crate::mc1::combat::PLAYER_HH as i16)
+                    pz.wrapping_add(crate::mc1::combat::PLAYER_HH as i16)
                 };
-                self.move_relink(i, ctx.px, ctx.py, pz);
-                PLAYER_TARGET
+                self.move_relink(i, px, py, pz);
+                self.human_tag[hx].0
             }
             None => {
                 self.move_relink(i, pos.0, pos.1, pos.2);
@@ -3916,8 +3937,8 @@ impl Gen {
     /// `sub_5EF70` (EF:60598): poke the target wizard's danger timer.
     /// Pool wizards carry no reader yet (the rival MC2 column).
     pub(crate) fn mc2_danger_poke(&mut self, target: u16) {
-        if target == PLAYER_TARGET {
-            self.player_danger = 100;
+        if let Some(hx) = self.hx_of_tag(target) {
+            self.player_danger[hx] = 100;
         }
     }
 
@@ -3941,18 +3962,14 @@ impl Gen {
     /// (MC2 targets carry no per-channel mask; the human's inbox feeds
     /// the World intake.)
     pub(crate) fn mc2_melee_write(&mut self, target: u16, amt: u32, src: u16) {
-        let tgt = if target == PLAYER_TARGET {
-            MailTarget::Player
-        } else {
-            MailTarget::Pool(target as usize)
-        };
+        let tgt = self.target_of_tag(target);
         self.mail_write_single(tgt, 0, amt, src);
     }
 
     /// The target's (class, model) for the projectile filter bytes —
     /// the human is faithfully (3, 0).
     fn mc2_target_cm(&self, target: u16) -> (u8, u8) {
-        if target == PLAYER_TARGET || target as usize >= self.ent.len() {
+        if self.is_human_tag(target) || target as usize >= self.ent.len() {
             (3, 0)
         } else {
             let t = &self.ent[target as usize];
@@ -4097,7 +4114,7 @@ impl Gen {
     /// same wizard default here.
     pub(crate) fn mc2_owner_lock_range(&self, own: u16) -> i64 {
         let row = match own {
-            PLAYER_TARGET | 0 => crate::mc2::rivals::WIZARD_ROW,
+            ht if self.is_human_tag(ht) || ht == 0 => crate::mc2::rivals::WIZARD_ROW,
             o if (o as usize) < self.ent.len() => self.ent[o as usize].row156,
             _ => crate::mc2::rivals::WIZARD_ROW,
         };
@@ -4112,7 +4129,7 @@ impl Gen {
     pub(crate) fn mc2_aim_scan(
         &self,
         probe: &AimProbe,
-        human: Option<(u16, u16, i16)>,
+        human: &[(Hx, (u16, u16, i16))],
     ) -> Option<u16> {
         let (wizards, creatures, worms_always, spheres, buildings, yc, pc, _alarm, charm_eligible) =
             Self::mc2_aim_lists(probe.model)?;
@@ -4148,9 +4165,57 @@ impl Gen {
             // `id != own` and the invisibility bit (EF:54785), so a
             // wizard/castle/balloon that dies MID-tick stays a lock
             // candidate for the rest of the frame.
+            // (On the roster the human is met at his own slot.)
+            // Seat `seat`'s candidacy, when he is an eligible target.
+            let human_at = |g: &Self, best: &mut _, seat: Hx| {
+                if let Some(&(_, (hx, hy, hz))) = human.iter().find(|h| h.0 == seat) {
+                    let dz = (hz as i64) - (probe.z as i64);
+                    let d = Self::isqrt(
+                        (Self::dist2_sq(probe.x, probe.y, hx, hy) as i64 + dz * dz)
+                            .min(u32::MAX as i64) as u32,
+                    ) as i64;
+                    if d <= wiz_range {
+                        // ⭐⭐⭐ THE SCORER'S RAISE LIFTS THE HUMAN TOO — AND
+                        // THE PITCH CONE IS INSIDE IT. `sub_68490`
+                        // (EF:55450) opens with `sub_65580(a2x)` and undoes
+                        // it with `sub_655A0(a2x)` on ALL FOUR exit paths
+                        // (EF:55463/55472/55478/55484), so BOTH the tan
+                        // pitch and the ±0x71 cone test that gates it run
+                        // on `z + array_0x52_82.yaw`. Only the castle twin
+                        // `sub_685D0` scores raw. The port raised pool
+                        // candidates (`Ent::aim_z`) but handed the
+                        // out-of-pool human his RAW pose here, so the human
+                        // was rejected by the pitch cone a full box too low
+                        // — a law landed on the LOCK (`sub_655C0`, below)
+                        // and missed on the SCORER, the same function's
+                        // other call path.
+                        // mc2l24 t=45473->45474: the pyramid's (9,9)
+                        // lightning at (10721, 54123, 768) pitch 2013 scores
+                        // the human at (11248, 52468, 256): raw z gives
+                        // want_pitch 92, `arc_err` 127 > 0x71 → REJECTED and
+                        // the beam flew on at the launch attitude 134/2013,
+                        // laying 40 nodes and detonating at z 1098. The
+                        // raised 356 gives want_pitch 75, `arc_err` 110 ≤
+                        // 0x71 → retail's lock (`word_0x96_150` 116, yaw 99 /
+                        // pitch 75) and the blast at the carpet, z 346.
+                        let hz = if no_mc2_aim_human_raise() {
+                            hz
+                        } else {
+                            hz + crate::mc1::combat::PLAYER_HH as i16
+                        };
+                        consider(g, best, g.human_tag[seat].0, (hx, hy, hz), yc, wiz_pc);
+                    }
+                }
+            };
             for c in 0..self.wiz_chain.visible_len() {
                 let v = self.wiz_chain.list[c] as usize;
                 let e = &self.ent[v];
+                if let Some(seat) = self.hx_of_rec(v) {
+                    if self.human_rides_chain(seat) {
+                        human_at(self, &mut best, seat);
+                    }
+                    continue;
+                }
                 if e.id24 == own || v as u16 == own || e.flags & 0x20 != 0 {
                     continue;
                 }
@@ -4169,42 +4234,9 @@ impl Gen {
                 let pos = (e.x, e.y, e.aim_z());
                 consider(self, &mut best, v as u16, pos, yc, wiz_pc);
             }
-            if let Some((hx, hy, hz)) = human {
-                let dz = (hz as i64) - (probe.z as i64);
-                let d = Self::isqrt(
-                    (Self::dist2_sq(probe.x, probe.y, hx, hy) as i64 + dz * dz).min(u32::MAX as i64)
-                        as u32,
-                ) as i64;
-                if d <= wiz_range {
-                    // ⭐⭐⭐ THE SCORER'S RAISE LIFTS THE HUMAN TOO — AND
-                    // THE PITCH CONE IS INSIDE IT. `sub_68490`
-                    // (EF:55450) opens with `sub_65580(a2x)` and undoes
-                    // it with `sub_655A0(a2x)` on ALL FOUR exit paths
-                    // (EF:55463/55472/55478/55484), so BOTH the tan
-                    // pitch and the ±0x71 cone test that gates it run
-                    // on `z + array_0x52_82.yaw`. Only the castle twin
-                    // `sub_685D0` scores raw. The port raised pool
-                    // candidates (`Ent::aim_z`) but handed the
-                    // out-of-pool human his RAW pose here, so the human
-                    // was rejected by the pitch cone a full box too low
-                    // — a law landed on the LOCK (`sub_655C0`, below)
-                    // and missed on the SCORER, the same function's
-                    // other call path.
-                    // mc2l24 t=45473->45474: the pyramid's (9,9)
-                    // lightning at (10721, 54123, 768) pitch 2013 scores
-                    // the human at (11248, 52468, 256): raw z gives
-                    // want_pitch 92, `arc_err` 127 > 0x71 → REJECTED and
-                    // the beam flew on at the launch attitude 134/2013,
-                    // laying 40 nodes and detonating at z 1098. The
-                    // raised 356 gives want_pitch 75, `arc_err` 110 ≤
-                    // 0x71 → retail's lock (`word_0x96_150` 116, yaw 99 /
-                    // pitch 75) and the blast at the carpet, z 346.
-                    let hz = if no_mc2_aim_human_raise() {
-                        hz
-                    } else {
-                        hz + crate::mc1::combat::PLAYER_HH as i16
-                    };
-                    consider(self, &mut best, PLAYER_TARGET, (hx, hy, hz), yc, wiz_pc);
+            for seat in self.human_tag.ixs() {
+                if !self.human_rides_chain(seat) {
+                    human_at(self, &mut best, seat);
                 }
             }
         }
@@ -4441,9 +4473,14 @@ impl Gen {
                 reach: e.f128 as i64 * e.max_life as i64,
             }
         };
-        let human = (probe.own != PLAYER_TARGET && !self.player_invisible)
-            .then_some((ctx.px, ctx.py, ctx.pz));
-        let Some(target) = self.mc2_aim_scan(&probe, human) else {
+        // Every seat but the caster's own, uncloaked.
+        let human: Vec<(Hx, (u16, u16, i16))> = self
+            .human_tag
+            .ixs()
+            .filter(|&hx| self.human_tag[hx].0 != probe.own && !self.player_cloaked(hx))
+            .map(|hx| (hx, self.seat_at(ctx, hx)))
+            .collect();
+        let Some(target) = self.mc2_aim_scan(&probe, &human) else {
             return false;
         };
         let alarm = Self::mc2_aim_lists(probe.model).is_some_and(|l| l.7);
@@ -4464,11 +4501,11 @@ impl Gen {
         // where the raw 256 gave 21, and `sub_65C20`'s arm copies that
         // word straight into `pitch_0x1E_30` (EF:63104/63118), so the
         // whole flight flew a box low (z 455 vs retail's 467).
-        let (tx, ty, tz) = if target == PLAYER_TARGET {
+        let (tx, ty, tz) = if let Some(hx) = self.hx_of_tag(target) {
             (
-                ctx.px,
-                ctx.py,
-                ctx.pz + crate::mc1::combat::PLAYER_HH as i16,
+                self.seat_at(ctx, hx).0,
+                self.seat_at(ctx, hx).1,
+                self.seat_at(ctx, hx).2 + crate::mc1::combat::PLAYER_HH as i16,
             )
         } else {
             let t = &self.ent[target as usize];
@@ -4489,7 +4526,7 @@ impl Gen {
         if matches!(
             probe.model,
             0 | 3 | 4 | 0x12 | 0x13 | 0x16 | 0x1A | 0x1C | 0x1E
-        ) && target != PLAYER_TARGET
+        ) && !self.is_human_tag(target)
         {
             let v = target as usize;
             if self.ent[v].class64 == 5 && self.ent[v].model65 == 0 {
@@ -4497,7 +4534,7 @@ impl Gen {
             }
         }
         if alarm {
-            let is_wizard = target == PLAYER_TARGET
+            let is_wizard = self.is_human_tag(target)
                 || (self.ent[target as usize].class64 == 3
                     && self.ent[target as usize].model65 == 0);
             if is_wizard {
@@ -4832,6 +4869,7 @@ impl Gen {
 mod debuff_knock_tests {
     use crate::chassis::ChassisParams;
     use crate::engine::features::{FeatureAssets, Gen, Planes};
+    use crate::engine::world::Hx;
     use crate::mc1::combat::MailTarget;
     use crate::mc1::mobs::{MobCtx, PLAYER_TARGET};
     use crate::verbs::VerbSet;
@@ -4856,16 +4894,19 @@ mod debuff_knock_tests {
         Gen::new(planes, assets, 1, ChassisParams::MC2, VerbSet::MC2)
     }
 
-    fn ctx() -> MobCtx {
+    fn ctx(g: &mut crate::engine::features::Gen) -> MobCtx {
+        // yaw: a bearing the INVENTED write would have used
+        *g.view_mut(crate::engine::world::Hx::FIRST) = crate::engine::features::SeatView {
+            x: 40 * 256,
+            y: 40 * 256,
+            z: 400,
+            yaw: 1024,
+            mana: 1000,
+            mana_max: 1000,
+            ..Default::default()
+        };
         MobCtx {
-            px: 40 * 256,
-            py: 40 * 256,
-            pz: 400,
-            pyaw: 1024, // a bearing the INVENTED write would have used
-            pmana: 1000,
-            pmana_max: 1000,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: crate::patches::WorldPatches::RETAIL,
             mc2_turn: 0,
@@ -4923,7 +4964,11 @@ mod debuff_knock_tests {
             e.act_life = 100;
         }
         let before = g.ent.iter().filter(|e| e.class64 == 9).count();
-        assert!(g.mc2_atk_heavy9(lev, vic as u16, &ctx()), "the bolt fires");
+        let rig_ctx = ctx(&mut g);
+        assert!(
+            g.mc2_atk_heavy9(lev, vic as u16, &rig_ctx),
+            "the bolt fires"
+        );
         let bolt = g
             .ent
             .iter()
@@ -4938,7 +4983,8 @@ mod debuff_knock_tests {
         // aim origin is in question.
         assert_eq!(g.ent[bolt].z, 1366, "spawned at position.z + fov");
 
-        let tpos = g.mc2_target(vic as u16, &ctx()).expect("target resolves");
+        let rig_ctx = ctx(&mut g);
+        let tpos = g.mc2_target(vic as u16, &rig_ctx).expect("target resolves");
         let dh = Gen::isqrt(Gen::dist2_sq(40 * 256, 40 * 256, tpos.0, tpos.1) as u32) as i32;
         let from_muzzle = Gen::pitch_toward(1366, tpos.2, dh);
         let from_caster = Gen::pitch_toward(1000, tpos.2, dh);
@@ -5009,21 +5055,24 @@ mod debuff_knock_tests {
         }
         // A bearing an earlier buffet left in the register. Retail
         // does not touch it, so the kick must still ride THIS value,
-        // not anything derived from `ctx.pyaw`.
-        g.player_knock = (1729, 40);
+        // not anything derived from `view.yaw`.
+        g.player_knock[Hx::FIRST] = (1729, 40);
+        let rig_ctx = ctx(&mut g);
 
-        g.mc2_debuff_stamp_tick(tok, &ctx());
+        g.mc2_debuff_stamp_tick(tok, &rig_ctx);
 
         assert_eq!(
-            g.player_knock.1, -80,
+            g.player_knock[Hx::FIRST].1,
+            -80,
             "the stamp writes moveBoost_0x1E_30 = -80 (EXE 0x5d7b3 \
              mov WORD PTR [eax+0x1e],0xffb0), NEGATIVE — a +80 here is \
              the invented magnitude and sends the carpet the wrong way"
         );
         assert_eq!(
-            g.player_knock.0, 1729,
+            g.player_knock[Hx::FIRST].0,
+            1729,
             "the heading register (+0x20) is STALE — nothing in \
-             sub_38F70/sub_38E70 writes it. Seeing ctx.pyaw + 0x400 \
+             sub_38F70/sub_38E70 writes it. Seeing view.yaw + 0x400 \
              (= 0) here means the invented heading write is back"
         );
     }
@@ -5071,9 +5120,10 @@ mod debuff_knock_tests {
             e.f44 = 12;
         }
         let free_before = g.free.len();
+        let rig_ctx = ctx(&mut g);
 
         // victim = 0: the claim probe found nobody.
-        g.mc2_proj_impact(bolt, 0, &ctx(), None);
+        g.mc2_proj_impact(bolt, 0, &rig_ctx, None);
 
         assert_eq!(
             g.free.len(),
@@ -5133,8 +5183,9 @@ mod debuff_knock_tests {
         assert_eq!(g.ent[victim].class64, 10, "the sphere survives the drain");
         assert_eq!(g.ent[bolt].class64, 9, "the bolt survives the drain");
         let exhausted_before = g.exhausted;
+        let rig_ctx = ctx(&mut g);
 
-        g.mc2_proj_impact(bolt, victim as u16, &ctx(), None);
+        g.mc2_proj_impact(bolt, victim as u16, &rig_ctx, None);
 
         assert!(
             g.exhausted > exhausted_before,
@@ -5188,8 +5239,9 @@ mod debuff_knock_tests {
                 g.new_event().expect("drain");
             }
             let (free_before, exhausted_before) = (g.free.len(), g.exhausted);
+            let rig_ctx = ctx(&mut g);
 
-            g.mc2_proj_impact(ball, 0, &ctx(), None);
+            g.mc2_proj_impact(ball, 0, &rig_ctx, None);
 
             assert_eq!(g.free.len(), free_before, "(10,{fm}): nothing allocated");
             assert_eq!(
@@ -5261,7 +5313,8 @@ mod debuff_knock_tests {
                 .filter(|e| (e.class64, e.model65) == cm && e.flags & 0x400 == 0)
                 .count()
         };
-        g.mc2_proj_impact(bolt, mine as u16, &ctx(), None);
+        let rig_ctx = ctx(&mut g);
+        g.mc2_proj_impact(bolt, mine as u16, &rig_ctx, None);
         assert_ne!(g.ent[bolt].flags & 0x400, 0, "the bolt is disabled");
         assert_ne!(g.ent[mine].f36, 0, "the mine disarmed itself");
         assert_eq!(count(&g, (10, 0)), 1, "sub_68AC0 spawns its bare (10,0)");
@@ -5287,7 +5340,8 @@ mod debuff_knock_tests {
             e.y = 40 * 256;
             e.z = 400;
         }
-        g.mc2_proj_impact(bolt2, mine as u16, &ctx(), None);
+        let rig_ctx = ctx(&mut g);
+        g.mc2_proj_impact(bolt2, mine as u16, &rig_ctx, None);
         assert_eq!(count(&g, (10, 17)), 1, "a disarmed mine no longer swallows");
     }
 
@@ -5397,7 +5451,8 @@ mod debuff_knock_tests {
                     "the fireball is swallowed"
                 );
             }
-            g.mc2_mine_tick(mine, &ctx());
+            let rig_ctx = ctx(&mut g);
+            g.mc2_mine_tick(mine, &rig_ctx);
             g.ent[mine].flags & (1 << 23)
         };
         assert_eq!(run(PLAYER_TARGET, false), 0, "an uncharged mine is opaque");
@@ -5469,7 +5524,7 @@ mod debuff_knock_tests {
         // `lit` = (bolt f146, twin class, bolt f54, bolt life).
         let lit = |act: u8, model: u8| -> (u16, u8, u16, i32) {
             let mut g = flat_gen();
-            let (px, py) = (ctx().px, ctx().py);
+            let (px, py) = (40 * 256, 40 * 256); // the ctx() carpet
             let mine = g.new_event().expect("mine slot");
             {
                 let e = &mut g.ent[mine];
@@ -5503,7 +5558,8 @@ mod debuff_knock_tests {
                 // ±0xAA about `yaw_0x1C_28`.
                 e.f30 = Gen::angle_between(px, py, px + 2048, py);
             }
-            g.mc2_flyer_tick(s, &ctx());
+            let rig_ctx = ctx(&mut g);
+            g.mc2_flyer_tick(s, &rig_ctx);
             let e = &g.ent[s];
             (e.f146, g.ent[t].class64, e.f54, e.act_life)
         };
@@ -5546,7 +5602,7 @@ mod debuff_knock_tests {
     /// The generic flyer lands on its victim's z-box CENTRE
     /// (`sub_65580` raise → CopyEntityPosition → `sub_655A0` restore,
     /// EF:62941-43), and for the pose-only human that centre is
-    /// `ctx.pz + PLAYER_HH`. A LIGHTNING BEAM does not run that body:
+    /// `view.z + PLAYER_HH`. A LIGHTNING BEAM does not run that body:
     /// its per-step worker is `sub_66610`, whose blocker arm is one
     /// bare `a1x->position_0x4C_76 = v2x->position_0x4C_76`
     /// (EF:63605-08) with no `sub_65580` bracket anywhere in the
@@ -5577,26 +5633,32 @@ mod debuff_knock_tests {
                 e.id24 = 1;
                 e.f68 = 10;
                 e.f69 = 23;
-                e.x = ctx().px;
-                e.y = ctx().py;
-                e.z = ctx().pz + 400; // anywhere but the answer
+                e.x = 40 * 256;
+                e.y = 40 * 256;
+                e.z = 400 + 400; // anywhere but the answer
                 e.act_life = 4;
             }
             let start = (g.ent[bolt].x, g.ent[bolt].y, g.ent[bolt].z);
             g.mc2_beam_defer.armed = armed;
-            g.mc2_proj_land(bolt, &ctx(), start, start, Some(MailTarget::Player));
+            let rig_ctx = ctx(&mut g);
+            g.mc2_proj_land(
+                bolt,
+                &rig_ctx,
+                start,
+                start,
+                Some(MailTarget::Player(Hx::FIRST)),
+            );
             g.mc2_beam_defer.armed = false;
             z[k] = g.ent[bolt].z;
         }
         assert_eq!(
             z[0],
-            ctx().pz + hh,
+            400 + hh,
             "the generic impact still lands at the player's box centre \
              (sub_65580, EF:62941-43)"
         );
         assert_eq!(
-            z[1],
-            ctx().pz,
+            z[1], 400,
             "sub_66610's blocker arm is a bare position copy \
              (EF:63605-08) — a beam parks at the player's RAW origin"
         );
@@ -5632,7 +5694,8 @@ mod debuff_knock_tests {
         let tally = |g: &Gen| (g.stats.0.offensive_shots, g.stats.0.offensive_hits);
 
         let b = fire(&mut g, 0, 0, (10, 0), ball as u16);
-        g.mc2_proj_impact(b, ball as u16, &ctx(), None);
+        let rig_ctx = ctx(&mut g);
+        g.mc2_proj_impact(b, ball as u16, &rig_ctx, None);
         assert_eq!(
             tally(&g),
             (1, 1),
@@ -5640,21 +5703,26 @@ mod debuff_knock_tests {
         );
 
         let b = fire(&mut g, 0, 0, (10, 0), 0);
-        g.mc2_proj_impact(b, ball as u16, &ctx(), None);
+        let rig_ctx = ctx(&mut g);
+        g.mc2_proj_impact(b, ball as u16, &rig_ctx, None);
         assert_eq!(tally(&g), (2, 1), "an unaimed strike is a shot, not a hit");
 
         let b = fire(&mut g, 0, 0, (10, 0), ball as u16);
-        g.mc2_proj_impact(b, 0, &ctx(), None);
+        let rig_ctx = ctx(&mut g);
+        g.mc2_proj_impact(b, 0, &rig_ctx, None);
         assert_eq!(tally(&g), (3, 1), "a terrain stop is a miss");
 
         let b = fire(&mut g, 1, 1, (10, 12), ball as u16);
-        g.mc2_proj_impact(b, ball as u16, &ctx(), None);
+        let rig_ctx = ctx(&mut g);
+        g.mc2_proj_impact(b, ball as u16, &rig_ctx, None);
         let b = fire(&mut g, 17, 18, (10, 54), ball as u16);
-        g.mc2_proj_impact(b, ball as u16, &ctx(), None);
+        let rig_ctx = ctx(&mut g);
+        g.mc2_proj_impact(b, ball as u16, &rig_ctx, None);
         assert_eq!(tally(&g), (3, 1), "possession is not an offensive shot");
 
         let b = fire(&mut g, 7, 13, (10, 26), ball as u16);
-        g.mc2_proj_impact(b, ball as u16, &ctx(), None);
+        let rig_ctx = ctx(&mut g);
+        g.mc2_proj_impact(b, ball as u16, &rig_ctx, None);
         assert_eq!(
             tally(&g),
             (4, 1),
@@ -5663,12 +5731,14 @@ mod debuff_knock_tests {
 
         let b = fire(&mut g, 0, 0, (10, 0), ball as u16);
         g.ent[b].id24 = 557;
-        g.mc2_proj_impact(b, ball as u16, &ctx(), None);
+        let rig_ctx = ctx(&mut g);
+        g.mc2_proj_impact(b, ball as u16, &rig_ctx, None);
         assert_eq!(tally(&g), (4, 1), "a rival's shot is not the human's");
 
         let b = fire(&mut g, 0, 0, (10, 0), ball as u16);
         while g.new_event().is_some() {}
-        g.mc2_proj_impact(b, ball as u16, &ctx(), None);
+        let rig_ctx = ctx(&mut g);
+        g.mc2_proj_impact(b, ball as u16, &rig_ctx, None);
         assert_eq!(
             tally(&g),
             (4, 1),
@@ -5734,16 +5804,17 @@ mod impact_xp_spell_tests {
         Gen::new(planes, assets, 1, ChassisParams::MC2, VerbSet::MC2)
     }
 
-    fn ctx() -> MobCtx {
+    fn ctx(g: &mut crate::engine::features::Gen) -> MobCtx {
+        *g.view_mut(crate::engine::world::Hx::FIRST) = crate::engine::features::SeatView {
+            x: 40 * 256,
+            y: 40 * 256,
+            z: 400,
+            mana: 1000,
+            mana_max: 1000,
+            ..Default::default()
+        };
         MobCtx {
-            px: 40 * 256,
-            py: 40 * 256,
-            pz: 400,
-            pyaw: 0,
-            pmana: 1000,
-            pmana_max: 1000,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: crate::patches::WorldPatches::RETAIL,
             mc2_turn: 0,
@@ -5792,7 +5863,8 @@ mod impact_xp_spell_tests {
             e.flags |= super::F_MC2PROJ;
         }
         g.link(bolt, 40 << 8, 40 << 8, 100);
-        g.mc2_proj_impact(bolt, victim as u16, &ctx(), None);
+        let rig_ctx = ctx(&mut g);
+        g.mc2_proj_impact(bolt, victim as u16, &rig_ctx, None);
         g.mc2_cast_xp.0.clone()
     }
 
@@ -5889,16 +5961,17 @@ mod step_commit_tests {
         Gen::new(planes, assets, 1, ChassisParams::MC2, VerbSet::MC2)
     }
 
-    fn ctx() -> MobCtx {
+    fn ctx(g: &mut crate::engine::features::Gen) -> MobCtx {
+        *g.view_mut(crate::engine::world::Hx::FIRST) = crate::engine::features::SeatView {
+            x: 10 * 256,
+            y: 10 * 256,
+            z: 400,
+            mana: 1000,
+            mana_max: 1000,
+            ..Default::default()
+        };
         MobCtx {
-            px: 10 * 256,
-            py: 10 * 256,
-            pz: 400,
-            pyaw: 0,
-            pmana: 1000,
-            pmana_max: 1000,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             // retail's single end-of-step probe, no anti-tunnel march
             strict: true,
             patches: crate::patches::WorldPatches::RETAIL,
@@ -5945,8 +6018,9 @@ mod step_commit_tests {
         assert_eq!(g.map_entity[t] as usize, b, "chain starts b -> a -> flyer");
         assert_eq!(g.ent[b].next20 as usize, a);
         assert_eq!(g.ent[a].next20 as usize, fly);
+        let rig_ctx = ctx(&mut g);
 
-        g.mc2_flyer_tick(fly, &ctx());
+        g.mc2_flyer_tick(fly, &rig_ctx);
 
         // POSITIVE CONTROL — the contact arm really ran and reverted
         // the dying step, in BOTH arms of the switch.

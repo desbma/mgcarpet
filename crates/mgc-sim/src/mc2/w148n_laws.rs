@@ -45,16 +45,15 @@ fn flat_gen() -> Gen {
     Gen::new(planes, assets, 1, ChassisParams::MC2, VerbSet::MC2)
 }
 
-fn ctx_at(px: u16, py: u16) -> MobCtx {
+fn ctx_at(g: &mut crate::engine::features::Gen, px: u16, py: u16) -> MobCtx {
+    *g.view_mut(crate::engine::world::Hx::FIRST) = crate::engine::features::SeatView {
+        x: px,
+        y: py,
+        z: 100,
+        ..Default::default()
+    };
     MobCtx {
-        px,
-        py,
-        pz: 100,
-        pyaw: 0,
-        pmana: 0,
-        pmana_max: 0,
-        pdead: false,
-        pdead_top: false,
+        phx: crate::engine::world::Hx::FIRST,
         strict: false,
         patches: WorldPatches::RETAIL,
         mc2_turn: 0,
@@ -154,7 +153,7 @@ fn m27_hide_mask_is_bit0_only() {
 fn m15_chase_aims_before_the_life_test() {
     let off = crate::mc2::roster::no_mc2_m15_aim_before_life_test();
     let mut g = flat_gen();
-    let ctx = ctx_at(0, 0);
+    let ctx = ctx_at(&mut g, 0, 0);
 
     // The target: a record placed due EAST of the guard and ALREADY
     // dead (`life_0x8 < 0`) — the mc2l12 t=1580 shape, where a (3,1)
@@ -204,7 +203,7 @@ fn m15_chase_aims_before_the_life_test() {
 #[test]
 fn m15_chase_aim_respects_the_phase_gate() {
     let mut g = flat_gen();
-    let ctx = ctx_at(0, 0);
+    let ctx = ctx_at(&mut g, 0, 0);
     let t = g.new_event().expect("target slot");
     g.ent[t].class64 = 3;
     g.ent[t].model65 = 1;

@@ -20,7 +20,7 @@
 //! +60==0 set; an MC2 tier whose `byte_0x3B_59` is not 1 — Repeat
 //! Fireball) is manual by construction: the raw level must reach it.
 
-use super::{LifeState, World};
+use super::{Hx, LifeState, World};
 use crate::ids::GameId;
 
 /// What one hand offers the autofire macro this tick.
@@ -57,12 +57,13 @@ impl World {
     /// The autofire view of one hand (`right` = the RMB hand). Read
     /// BEFORE the tick whose input it shapes, so the purse it judges
     /// is the one the command-site gates will read.
-    pub fn autofire_hand(&self, right: bool) -> AutofireHand {
-        let halted = self.player.state != LifeState::Alive || self.won || self.mc2_endseq.is_some();
+    pub fn autofire_hand(&self, hx: Hx, right: bool) -> AutofireHand {
+        let halted =
+            self.human_state(hx) != LifeState::Alive || self.won || self.mc2_endseq[hx].is_some();
         if matches!(self.game, GameId::Mc2) {
-            self.autofire_hand_mc2(right, halted)
+            self.autofire_hand_mc2(hx, right, halted)
         } else {
-            self.autofire_hand_mc1(right, halted)
+            self.autofire_hand_mc1(hx, right, halted)
         }
     }
 
@@ -70,21 +71,21 @@ impl World {
     /// is a bare reload, `sub_46B00_46E40` LABEL_32), so the only
     /// closed gate is the token's own: castle ladder + full cost
     /// (`sub_55DD0_56300`).
-    fn autofire_hand_mc1(&self, right: bool, halted: bool) -> AutofireHand {
+    fn autofire_hand_mc1(&self, hx: Hx, right: bool, halted: bool) -> AutofireHand {
         let hand = if right {
-            self.player.right
+            self.players[hx].right
         } else {
-            self.player.left
+            self.players[hx].left
         };
         let Some(id) = hand.map(|s| s.0 as usize) else {
             return AutofireHand::Manual;
         };
-        if !mc1_listed(self.game, id) || self.player.owned.get(id).is_none_or(|&m| m == 0) {
+        if !mc1_listed(self.game, id) || self.players[hx].owned.get(id).is_none_or(|&m| m == 0) {
             return AutofireHand::Manual;
         }
         if halted {
             AutofireHand::Halted
-        } else if self.mc1_token_gate(id) {
+        } else if self.mc1_token_gate(hx, id) {
             AutofireHand::Ready
         } else {
             AutofireHand::Wait
@@ -100,16 +101,16 @@ impl World {
     /// Possession) or rewrites the running cast's timer instead of
     /// launching (Duel's channel-retrigger arm, EF:60914-28), so the
     /// macro waits the window out.
-    fn autofire_hand_mc2(&self, right: bool, halted: bool) -> AutofireHand {
+    fn autofire_hand_mc2(&self, hx: Hx, right: bool, halted: bool) -> AutofireHand {
         let spell = if right {
-            self.mc2_book.right
+            self.mc2_book[hx].right
         } else {
-            self.mc2_book.left
+            self.mc2_book[hx].left
         };
         if !mc2_listed(spell) {
             return AutofireHand::Manual;
         }
-        let m = self.mc2_book.ent[spell as usize] as usize;
+        let m = self.mc2_book[hx].ent[spell as usize] as usize;
         let Some(e) = self.g.ent.get(m).filter(|_| m != 0) else {
             return AutofireHand::Manual;
         };
@@ -134,9 +135,9 @@ impl World {
         // cast gate read them.
         let pool_ok = e.f136 <= 0
             || self
-                .player_castle()
+                .seat_castle(hx)
                 .is_some_and(|c| self.g.ent[c].f140 >= e.f136);
-        let purse_ok = self.dev_spells || self.player.mana as u64 >= e.max_life as u64;
+        let purse_ok = self.dev_spells || self.human_mana(hx) as u64 >= e.max_life as u64;
         if pool_ok && purse_ok {
             AutofireHand::Ready
         } else {
@@ -178,17 +179,17 @@ mod tests {
     /// jars are blue-blessed (no castle ladder), the dev bypass is off.
     fn mc1_world(game: GameId) -> World {
         let mut w = World::new_for_game(planes(), &[], 1, assets(Vec::new()), game);
-        w.set_dev_spells(true);
-        w.grant_all_spells();
-        w.debug_bless_owned_spells();
-        w.set_dev_spells(false);
-        w.player.mana = 1000;
+        w.set_dev_spells(Hx::FIRST, true);
+        w.grant_all_spells(Hx::FIRST);
+        w.debug_bless_owned_spells(Hx::FIRST);
+        w.set_dev_spells(Hx::FIRST, false);
+        w.set_human_mana(Hx::FIRST, 1000);
         w
     }
 
     fn mc1_hand(w: &mut World, id: u8) -> AutofireHand {
-        w.player.left = Some(SpellId(id));
-        w.autofire_hand(false)
+        w.players[Hx::FIRST].left = Some(SpellId(id));
+        w.autofire_hand(Hx::FIRST, false)
     }
 
     #[test]
@@ -201,37 +202,49 @@ mod tests {
                 AutofireHand::Manual
             };
             // Meteor's 10,000 needs a purse to read Ready.
-            w.player.mana = 100_000;
+            w.set_human_mana(Hx::FIRST, 100_000);
             assert_eq!(mc1_hand(&mut w, id), want, "MC1 spell {id}");
         }
-        w.player.left = None;
-        assert_eq!(w.autofire_hand(false), AutofireHand::Manual, "empty hand");
+        w.players[Hx::FIRST].left = None;
+        assert_eq!(
+            w.autofire_hand(Hx::FIRST, false),
+            AutofireHand::Manual,
+            "empty hand"
+        );
         // Each hand is judged on its own spell.
-        w.player.right = Some(SpellId(3));
-        assert_eq!(w.autofire_hand(true), AutofireHand::Ready, "right hand");
-        w.player.right = Some(SpellId(4));
-        assert_eq!(w.autofire_hand(true), AutofireHand::Manual, "right hand");
+        w.players[Hx::FIRST].right = Some(SpellId(3));
+        assert_eq!(
+            w.autofire_hand(Hx::FIRST, true),
+            AutofireHand::Ready,
+            "right hand"
+        );
+        w.players[Hx::FIRST].right = Some(SpellId(4));
+        assert_eq!(
+            w.autofire_hand(Hx::FIRST, true),
+            AutofireHand::Manual,
+            "right hand"
+        );
     }
 
     #[test]
     fn hidden_worlds_adds_its_homing_meteor() {
         let mut w = mc1_world(GameId::Mc1Hw);
-        w.player.mana = 100_000;
+        w.set_human_mana(Hx::FIRST, 100_000);
         assert_eq!(mc1_hand(&mut w, 20), AutofireHand::Ready);
     }
 
     #[test]
     fn mc1_waits_on_a_short_purse_and_halts_on_death() {
         let mut w = mc1_world(GameId::Mc1);
-        w.player.mana = 199;
+        w.set_human_mana(Hx::FIRST, 199);
         assert_eq!(mc1_hand(&mut w, 0), AutofireHand::Wait, "fireball is 200");
-        w.player.mana = 200;
+        w.set_human_mana(Hx::FIRST, 200);
         assert_eq!(mc1_hand(&mut w, 0), AutofireHand::Ready);
-        w.player.state = LifeState::Dead;
+        w.set_human_state(Hx::FIRST, LifeState::Dead);
         assert_eq!(mc1_hand(&mut w, 0), AutofireHand::Halted);
         // A manual spell stays manual whatever the wizard's state.
         assert_eq!(mc1_hand(&mut w, 23), AutofireHand::Manual);
-        w.player.state = LifeState::Alive;
+        w.set_human_state(Hx::FIRST, LifeState::Alive);
         w.won = true;
         assert_eq!(mc1_hand(&mut w, 0), AutofireHand::Halted, "level won");
     }
@@ -248,14 +261,17 @@ mod tests {
             }
         }
         let mut w = World::new_for_game(planes(), &[], 1, assets(spells), GameId::Mc2);
-        w.mc2_grant_plausible(&[(0, 0), (1, 0), (6, 0), (9, 0), (13, 0), (14, 0), (24, 0)]);
-        w.player.mana = 1000;
+        w.mc2_grant_plausible(
+            Hx::FIRST,
+            &[(0, 0), (1, 0), (6, 0), (9, 0), (13, 0), (14, 0), (24, 0)],
+        );
+        w.set_human_mana(Hx::FIRST, 1000);
         w
     }
 
     fn mc2_hand(w: &mut World, spell: i8) -> AutofireHand {
-        w.mc2_book.left = spell;
-        w.autofire_hand(false)
+        w.mc2_book[Hx::FIRST].left = spell;
+        w.autofire_hand(Hx::FIRST, false)
     }
 
     #[test]
@@ -268,7 +284,7 @@ mod tests {
         assert_eq!(mc2_hand(&mut w, 7), AutofireHand::Manual, "unlearned");
         assert_eq!(mc2_hand(&mut w, -1), AutofireHand::Manual, "empty hand");
         // A tier that repeats on its own (Repeat Fireball) is manual.
-        let m = w.mc2_book.ent[0] as usize;
+        let m = w.mc2_book[Hx::FIRST].ent[0] as usize;
         w.g.ent[m].f59 = 0;
         assert_eq!(mc2_hand(&mut w, 0), AutofireHand::Manual);
     }
@@ -277,7 +293,7 @@ mod tests {
     fn mc2_waits_out_a_live_window_except_where_a_repress_is_a_shot() {
         let mut w = mc2_world();
         let arm = |w: &mut World, spell: usize, tier: u8| {
-            let m = w.mc2_book.ent[spell] as usize;
+            let m = w.mc2_book[Hx::FIRST].ent[spell] as usize;
             w.g.ent[m].f26 = 3;
             w.g.ent[m].f71 = tier;
         };
@@ -291,9 +307,9 @@ mod tests {
         arm(&mut w, 1, 0);
         assert_eq!(mc2_hand(&mut w, 1), AutofireHand::Wait);
         arm(&mut w, 1, 1);
-        w.player.mana = 0;
+        w.set_human_mana(Hx::FIRST, 0);
         assert_eq!(mc2_hand(&mut w, 1), AutofireHand::Ready);
-        w.player.mana = 1000;
+        w.set_human_mana(Hx::FIRST, 1000);
         // Everything else waits — Duel above all, whose re-press
         // rewrites the running cast's timer.
         for s in [9usize, 13, 14, 24] {
@@ -305,11 +321,11 @@ mod tests {
     #[test]
     fn mc2_waits_on_a_short_purse_and_halts_on_death() {
         let mut w = mc2_world();
-        w.player.mana = 99;
+        w.set_human_mana(Hx::FIRST, 99);
         assert_eq!(mc2_hand(&mut w, 9), AutofireHand::Wait);
-        w.player.mana = 100;
+        w.set_human_mana(Hx::FIRST, 100);
         assert_eq!(mc2_hand(&mut w, 9), AutofireHand::Ready);
-        w.player.state = LifeState::Falling;
+        w.set_human_state(Hx::FIRST, LifeState::Falling);
         assert_eq!(mc2_hand(&mut w, 9), AutofireHand::Halted);
     }
 }

@@ -4,6 +4,7 @@
 //! compare against the retail observation (retail: stable/declining,
 //! tightly clustered; ours: suspected explosion + dispersal).
 //! Usage: cargo run -p mgc-sim --example tmp_villagepop [level] [ticks]
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
 use mgc_sim::ids::GameId;
@@ -58,7 +59,7 @@ fn main() {
     for t in 0..horizon {
         w.tick(pose, idle);
 
-        let poses = w.live_poses();
+        let poses = w.live_poses(Hx::FIRST);
         // Death diff.
         let cur: HashSet<(u16, u32)> = poses.iter().map(|p| (p.slot, p.generation)).collect();
         for gone in prev.difference(&cur) {

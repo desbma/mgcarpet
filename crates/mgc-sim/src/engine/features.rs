@@ -54,6 +54,7 @@ use crate::mc1::tables::{ATAN, BIT_SQRT, COS, PAINT_AC, PAINT_BC, PAINT_EC, PAIN
 use mgc_formats::Thing;
 
 use crate::chassis::{ChassisParams, RandWidth};
+use crate::engine::world::{Hx, Seats};
 use crate::verbs::{VerbKind, VerbSet};
 
 /// A/B toggle for the MC1 CLAIMED-DWELLING FLAG EXTENTS: set
@@ -1197,13 +1198,13 @@ pub(crate) struct Gen {
     /// because `state_hash` hashes `g` wholesale and `Gen` is
     /// `#[derive(Hash)]`. [`Mc2Pinned`]'s empty `Hash` impl is the
     /// opt-out, exactly as [`CrtRand`] is for the CRT stream.
-    pub(crate) mc2_pinned: Mc2Pinned,
+    pub(crate) mc2_pinned: Seats<Mc2Pinned>,
     /// The MC1 twin of [`Gen::mc2_pinned`]: `World::mc1_carpet_slot`
     /// mirrored below the World layer for the bucket[0] readers that
     /// seat the out-of-pool human ([`Gen::mc1_human_on_wiz_chain`]).
     /// 0 = native play (no pooled carpet). Save-silent and
     /// hash-silent like the MC2 mirror.
-    pub(crate) mc1_pinned: Mc1Pinned,
+    pub(crate) mc1_pinned: Seats<Mc1Pinned>,
     /// The castle-guard REGISTER (retail wizext+84, per OWNER): 34
     /// positional guard-slot entries the fleet dispatch walks
     /// (`sub_47400` :56412-47). The register lives on the WIZARD and
@@ -1235,7 +1236,13 @@ pub(crate) struct Gen {
     /// keeps its [`crate::mc1::mobs::PLAYER_TARGET`] owner tag; the
     /// tag resolves to THIS seat. Set once at level build
     /// ([`crate::engine::world::World::set_human_seat`]).
-    pub(crate) human_seat: HumanSeat,
+    pub(crate) human_seat: Seats<HumanSeat>,
+    /// The human's OWNER TAG — the word retail stores in a record's
+    /// owner/target fields (`+24`, `+144`, `+146`, mail sources, …)
+    /// for the human's things. Every sim site that names "the human"
+    /// by tag reads this field. Load-static (set where the human is
+    /// seated), so it hashes and saves nothing.
+    pub(crate) human_tag: Seats<HumanTag>,
     /// Global LCG (`rand_4`), = the level seed at scan time.
     pub(crate) rand: u32,
     /// Terrain-retile LCG (`pseudoRand`), u16 stream.
@@ -1254,13 +1261,15 @@ pub(crate) struct Gen {
     /// str_12): creature spawns record the old value into +63 and
     /// increment; model-7 sprite alternation keys off its parity.
     pub(crate) spawn_count: [u8; 20],
-    /// The human player's damage inbox — the player lives outside the
-    /// pool ([`crate::mc1::mobs::PLAYER_TARGET`]), so writers land here.
-    /// The invincible-player dev mode discards it every tick like the
+    /// The human player's damage inbox WHEN HE HAS NO RECORD (a bare
+    /// world, or `MGC_NO_HUMAN_MAIL_IN_RECORD=1`) — otherwise his
+    /// letters live in his carpet record's own `mail`. Always reach it
+    /// through [`Gen::pmail`] / [`Gen::pmail_mut`]. The
+    /// invincible-player dev mode discards it every tick like the
     /// original's spawn grace (:55367-71), accumulating the totals.
-    pub(crate) player_mail: [(u32, u16); 6],
+    pub(crate) player_mail: Seats<[(u32, u16); 6]>,
     /// Total ch0 damage the (invincible) player has absorbed.
-    pub(crate) player_damage: u64,
+    pub(crate) player_damage: Seats<u64>,
     /// `gamedata+36` / `gamedata+38` (sub_25EC0): the currently
     /// erupting volcano's pool slot and its (10,19) plume's slot —
     /// 0 = none. One volcano erupts at a time; a driver that dies
@@ -1273,7 +1282,7 @@ pub(crate) struct Gen {
     /// per-tick horizontal displacement forced onto the carpet.
     /// DIRECT struct writes in the original — spawn grace does NOT
     /// wipe them, so even the invincible dev player gets dragged.
-    pub(crate) player_knock: (u16, i16),
+    pub(crate) player_knock: Seats<(u16, i16)>,
     /// The kraken buffet's write on a POOL wizard (w154j): `sub_1C4F0`
     /// :23223-28 stores the TARGET record's wizext `+24 = bearing +
     /// 0x400`, `+26 = 256`, `+22 = 80` through `+146`'s `+160` pointer
@@ -1297,7 +1306,7 @@ pub(crate) struct Gen {
     /// the mover drains it once), but NO decay: retail re-writes it
     /// from scratch every tick the funnel holds you, and the tick it
     /// stops is the tick you stop turning.
-    pub(crate) player_spin: PlayerSpin,
+    pub(crate) player_spin: Seats<PlayerSpin>,
     /// The whirlwind's DIRECT POSE SEIZURE on the human wizard — the
     /// half of `sub_33340`'s victim body that is NOT a knock. Retail
     /// treats the human as an ordinary victim `ix`: the mid-ring arm
@@ -1312,7 +1321,7 @@ pub(crate) struct Gen {
     /// recorded, graded, decaying lane retail holds at 0. Same
     /// transport shape as the spin (world writes, the carpet's own
     /// walk slot drains it once, no decay).
-    pub(crate) player_whirl: PlayerWhirl,
+    pub(crate) player_whirl: Seats<PlayerWhirl>,
     /// ⭐ A WITHIN-WALK REGISTER, the [`Gen::m27_v34_slot`] idiom:
     /// has the whirlwind column published into [`Gen::player_whirl`]
     /// ALREADY, during THIS walk? `World::tick_inner` clears it before
@@ -1324,7 +1333,12 @@ pub(crate) struct Gen {
     /// is the HIGHEST live slot has no later walker to drain it, so
     /// the mailbox can and does survive the turn).
     /// Not on the wire, not hashed — a transient of the walk.
-    pub(crate) ww_walk_published: HashSilent<bool>,
+    pub(crate) ww_walk_published: Seats<HashSilent<bool>>,
+    /// Each seat's WALK VIEW ([`SeatView`]): the tick-top copy of his
+    /// pose, heading, purse and life sign that the walk publishes and
+    /// re-publishes at its phase points. Seeded at the tick top; not
+    /// on the wire, not hashed — a transient of the walk.
+    pub(crate) seat_view: Seats<HashSilent<SeatView>>,
     /// ⭐ A WITHIN-WALK REGISTER, the [`Gen::m27_v34_slot`] idiom: the
     /// DWORD an m22 tail segment's handler (`sub_26CA0`, action 0xB4)
     /// leaves at `W-52` below the entity walk's call site, tagged
@@ -1348,7 +1362,7 @@ pub(crate) struct Gen {
     /// decays −4/tick, so retail's 944-unit opening shove landed as
     /// 128 and then kept shoving for twenty ticks after the burst.
     /// Same transport shape as [`Gen::player_whirl`].
-    pub(crate) player_hurl: PlayerHurl,
+    pub(crate) player_hurl: Seats<PlayerHurl>,
     /// ⭐⭐ THE (10,67) QUAKE/FLOOD'S **Z PULL-DOWN** ON THE HUMAN —
     /// the half of `sub_39B60`'s shove that is NOT a knock, and the
     /// last un-ported line of `mc2::flood`'s module-header APPROX
@@ -1365,21 +1379,21 @@ pub(crate) struct Gen {
     /// sank. Same transport shape as [`Gen::player_hurl`]: the world
     /// arms it at the quake's own walk slot, the carpet's dispatch
     /// drains it once, no decay.
-    pub(crate) player_flood_pull: PlayerFloodPull,
+    pub(crate) player_flood_pull: Seats<PlayerFloodPull>,
     /// The mana quarters the human's REBOUND deflections owe this
     /// tick — see [`DeflectDebit`]. Written by the projectile
     /// walkers' deflect arms, drained by the MC1 wizard pass
     /// (pre-step: a debit from a walk slot BELOW the carpet lands on
     /// this tick's step, retail's order) with the tick tail catching
     /// the post-carpet slots (retail lands those raw after the step).
-    pub(crate) player_deflect_debit: DeflectDebit,
+    pub(crate) player_deflect_debit: Seats<DeflectDebit>,
     /// Pending MC2 debuff-stamp hits on the player — (10,65) slow
     /// web / (10,66) paralyze web (`sub_38E70`/`sub_38F70`
     /// EF:28407/28442) — drained into the flight `Mc2Ext` channels
     /// by the sim boundary each tick (docs/traces/mc2-flight-model.md
     /// §5c/5d). Hash-only-when-pending (the Planes pattern): the zero
     /// state contributes nothing.
-    pub(crate) mc2_debuffs: Mc2PlayerDebuffs,
+    pub(crate) mc2_debuffs: Seats<Mc2PlayerDebuffs>,
     /// Rival wizard entity by player slot (0 = none; slot 0 = the
     /// human, unused) — the sprite-family team resolver for owner
     /// recolors (mana balls 105+8·team, balloons 169+team, castle
@@ -1409,7 +1423,7 @@ pub(crate) struct Gen {
     /// population (building hits, villager-family hits and kills),
     /// decremented once per world tick (:55405-06). m4 militia only
     /// hunt a wizard whose timer is live — the hostility gate.
-    pub(crate) player_aggro: i16,
+    pub(crate) player_aggro: Seats<i16>,
     /// The RIVAL wizards' village-aggro timers, by player slot 1..=7
     /// (index 0 is the human, who uses [`Gen::player_aggro`]; kept 0).
     /// Retail carries this per wizard in the same +528 struct slot; the
@@ -1420,7 +1434,7 @@ pub(crate) struct Gen {
     pub(crate) rival_wanted: [i16; 8],
     /// The player's Invisible cloak (spell 12; the wizard's +16 0x20
     /// bit, :65689-90) mirrored in for the mob-side target gates.
-    pub(crate) player_invisible: bool,
+    pub(crate) player_invisible: Seats<bool>,
     /// Ghost mode (`World::ghost`), republished per tick beside the
     /// cloak mirror: the gate for the scans retail lets see THROUGH
     /// a cloak (castle turrets, the m27 branch scan). Per-tick echo
@@ -1432,7 +1446,7 @@ pub(crate) struct Gen {
     /// facing). Republished at the tick head; read only by the
     /// `mc2_leviathan_true_aim` patch arm ([`Gen::m28_lead`]). Per-tick
     /// echo of World state — not on the wire, not hashed.
-    pub(crate) player_vel: HashSilent<(i16, i16)>,
+    pub(crate) player_vel: Seats<HashSilent<(i16, i16)>>,
     /// The `mc2_flyers_clear_terrain` patch arm, republished per tick
     /// from `World::patches` (off under `strict_retail`) — the MC2
     /// move core has no ctx to read the set from. Config echo: not on
@@ -1476,18 +1490,25 @@ pub(crate) struct Gen {
     /// recorded carpet's @0x20 at every anchor, 0 on a fresh level
     /// like retail's ctor. Hash- and save-silent: it is a shim for a
     /// record the port does not keep.
-    pub(crate) human_roll_0x20: HashSilent<u16>,
+    /// ⭐ STAGE 3: since the human's (3,0) carpet record exists, ITS
+    /// `f32` (MC2 `@0x20`) is the home — read/write through
+    /// [`Gen::human_roll`] / [`Gen::set_human_roll`]; this register is
+    /// written through, the record-less fallback
+    /// ([`no_human_roll_on_record`]).
+    pub(crate) human_roll_0x20: Seats<HashSilent<u16>>,
     /// The player's Rebound deflection bit (spell 14; +17 0x80,
-    /// :65774) — incoming class-9 projectiles bounce back.
-    pub(crate) player_rebound: bool,
+    /// :65774) — incoming class-9 projectiles bounce back. The
+    /// written-through fallback: once his (3,0) record exists its
+    /// `flags & 0x8000` is the home ([`Gen::player_rebound`]).
+    pub(crate) player_rebound_reg: Seats<bool>,
     /// The out-of-pool human's seat in his own tile chain — see
     /// [`PlayerChain`].
-    pub(crate) player_chain: PlayerChain,
+    pub(crate) player_chain: Seats<PlayerChain>,
     /// Player stat counters: creatures killed (`Type_160+359`), shots
     /// resolved (+343), shots that struck the aimed target (+347).
-    pub(crate) kills: u32,
-    pub(crate) shots: u32,
-    pub(crate) hits: u32,
+    pub(crate) kills: Seats<u32>,
+    pub(crate) shots: Seats<u32>,
+    pub(crate) hits: Seats<u32>,
     /// The end-of-level stats ledger ([`super::stats`]) — retail's
     /// censuses plus the enhanced every-death tally. Bookkeeping only:
     /// no handler reads it, so it hashes to nothing, and the World
@@ -1501,13 +1522,13 @@ pub(crate) struct Gen {
     /// sub_20D00) — flight (state 0) and the fall (state 2) only, the
     /// dead-wait holds it (`no_mc1_danger_walk_seat`). MC2's twin
     /// still decrements in the tick tail.
-    pub(crate) player_danger: i16,
+    pub(crate) player_danger: Seats<i16>,
     /// The HUMAN's claimed-house mana tally (wizext u32_308), stashed
     /// by the per-tick census — the castle overflow ejector's trigger
     /// reads houses + stored vs capacity (sub_47130 :56185-89). The
     /// rivals' twins live in [`Gen::rival_banked_houses`]; every
     /// castle-side reader goes through [`Gen::owner_houses`].
-    pub(crate) banked_houses: i32,
+    pub(crate) banked_houses: Seats<i32>,
     /// The RIVALS' claimed-house tallies (wizext u32_308, one per
     /// player slot like [`Gen::rival_ents`]; `[0]` is unused — the
     /// human's is [`Gen::banked_houses`]). Rebuilt from zero by every
@@ -1524,12 +1545,12 @@ pub(crate) struct Gen {
     /// armed by every processed castle hit, decremented by the HUD
     /// DRAW on every other frame (`World::mc1_alert_cadence`,
     /// `sub_22E50` :27217-20) while the castle panel is drawn.
-    pub(crate) castle_alert: u8,
+    pub(crate) castle_alert: Seats<u8>,
     /// "You are being attacked" HUD flash (Type_160+392 = 4,
     /// :55679/:55692/:55723) — armed by every processed player hit /
     /// steal / grip, decremented by the HUD draw on every other frame
     /// (`sub_22E50` :27347-50). The SELF sub-panel's alert.
-    pub(crate) player_alert: u8,
+    pub(crate) player_alert: Seats<u8>,
     /// Balloon-under-attack HUD flash (Type_160+393 = 4, :56826) —
     /// armed by a processed hit on an own balloon. ⚠ DEAD IN RETAIL:
     /// the arm writes through the balloon's own `+160`, the
@@ -1537,7 +1558,7 @@ pub(crate) struct Gen {
     /// real `+393` never leaves 0 (`no_mc1_balloon_alert_sink`). The
     /// balloon sub-panel's alert; decremented by the HUD cadence
     /// (`World::mc1_alert_cadence`) while the castle register is set.
-    pub(crate) balloon_alert: u8,
+    pub(crate) balloon_alert: Seats<u8>,
     /// The full-screen palette flash armed by `sub_44BE0` — see
     /// [`PalFlash`]. Hash-silent (presentation).
     pub(crate) pal_flash: PalFlash,
@@ -1592,7 +1613,7 @@ pub(crate) struct Gen {
     /// EF:19331-34 drains the target wizard's mana; the MC2
     /// wizard-mana ledger consumes this when it lands). Pool wizards
     /// are debited directly. Hash-transparent at zero.
-    pub(crate) mc2_player_drain: Mc2Quiet<1>,
+    pub(crate) mc2_player_drain: Seats<Mc2Quiet<1>>,
     /// m26's mana leech against a RIVAL wizard: the victim's pool
     /// slot, posted by `m26_tick` and consumed by `World` right after
     /// the wraith's own dispatch (`mc2_rival_leech_apply`), so the
@@ -1604,7 +1625,7 @@ pub(crate) struct Gen {
     /// pickup (UpdateScroll_59C80 EF:41180-83) — so this counter is now
     /// a hashed tally only, not a deferral bank. Hash-transparent at
     /// zero.
-    pub(crate) mc2_scrolls: Mc2Quiet<2>,
+    pub(crate) mc2_scrolls: Seats<Mc2Quiet<2>>,
     /// The human's collected MC2 spell tokens, a bitmask by spell
     /// model 0..25 (retail: `SpellEnabled[model]` on the wizard,
     /// sub_68FF0 EF:55726) — banked for the Phase-4.2 spell system
@@ -1620,7 +1641,7 @@ pub(crate) struct Gen {
     /// re-mint restores none. `World::mc2_book`'s `ent` is the lane
     /// that always tracks ownership — `mc2_spell_token_tick` gates on
     /// that, and `mc2_owned_spell_jars_are_never_re_collected` pins it.
-    pub(crate) mc2_spell_tokens: Mc2Quiet<3>,
+    pub(crate) mc2_spell_tokens: Seats<Mc2Quiet<3>>,
     /// MC2 spell-XP mail (owner id, spell index): projectile impacts
     /// award from inside the pool tick (`sub_6D8B0` call sites,
     /// EF:63189 etc.); the world tick drains it into the wizard's
@@ -1737,7 +1758,7 @@ pub(crate) struct Gen {
     /// doubled payload; `life==0` scatter — byte[1]|=0x80). Rides
     /// beside the [`Gen::player_rebound`] mirror; 0 = scatter.
     /// Hash-transparent at zero.
-    pub(crate) mc2_rebound_precise: Mc2Quiet<6>,
+    pub(crate) mc2_rebound_precise: Seats<Mc2Quiet<6>>,
     /// ALLIANCE charms (spell 24): charmed creature slot → the
     /// caster's owner id (retail keeps `parentId` ON the entity,
     /// EF:29688; the port's creatures never modeled parentId — the
@@ -1776,7 +1797,7 @@ pub(crate) struct Gen {
     /// and contributing deterministically once armed. Save-silent
     /// like `castle_reg` — the driver re-pushes it every tick and
     /// conformance imports reseed it per pair.
-    pub(crate) mc2_mobilize: Mc2Quiet<9>,
+    pub(crate) mc2_mobilize: Seats<Mc2Quiet<9>>,
     /// THE HUMAN'S WEB-SLOW LEVEL `moveSpeed_0x14C_332` (0..3) — the
     /// twin of [`Gen::mc2_mobilize`] one field along, and imported,
     /// re-pushed and hash-opted-out the same way for the same reason.
@@ -1796,7 +1817,7 @@ pub(crate) struct Gen {
     /// conformance import, so feeding it into `Gen`'s stream would add
     /// no information and would move every MC2 golden recorded while
     /// the human was webbed.
-    pub(crate) mc2_slow: Mc2Echo,
+    pub(crate) mc2_slow: Seats<Mc2Echo>,
 }
 
 /// See [`Gen::mc2_castle_research`] — hashes to NOTHING while empty
@@ -2052,6 +2073,38 @@ impl std::hash::Hash for HumanSeat {
     }
 }
 
+/// A/B toggle for [`Gen::set_human_tag_slot`]: set
+/// `MGC_NO_HUMAN_SLOT_TAG` to keep the human's owner tag at the
+/// out-of-pool sentinel `0xFFFF` (the pre-multiplayer port).
+pub(crate) fn no_human_slot_tag() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("MGC_NO_HUMAN_SLOT_TAG").is_some())
+}
+
+/// The human's owner tag ([`Gen::human_tag`]) — hashes to NOTHING:
+/// it is load-static, and the tag VALUES it writes into the pool are
+/// what the hash sees.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct HumanTag(pub u16);
+
+impl Seats<HumanTag> {
+    /// Does any seat own `tag`? A field-level test, usable while
+    /// another `Gen` field is borrowed (the pool walk's `iter_mut`).
+    pub(crate) fn holds(&self, tag: u16) -> bool {
+        self.ixs().any(|hx| self[hx].0 == tag)
+    }
+}
+
+impl Default for HumanTag {
+    fn default() -> Self {
+        Self(crate::mc1::mobs::PLAYER_TARGET)
+    }
+}
+
+impl std::hash::Hash for HumanTag {
+    fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {}
+}
+
 /// A counter that hashes to NOTHING at zero (see [`Mc2Ord`]). The
 /// const TAG (unique per field) disambiguates ADJACENT quiet fields:
 /// without it, (drain=5, scrolls=0) and (drain=0, scrolls=5) feed
@@ -2075,6 +2128,42 @@ impl<const TAG: u8> std::hash::Hash for Mc2Quiet<TAG> {
 /// a bare field here would.
 #[derive(Default, Clone, Copy)]
 pub(crate) struct HashSilent<T>(pub T);
+
+/// One seat's WALK VIEW — what the walk publishes about a human between
+/// his record reads: the tick-top copy of his pose (`+72/+74/+76`),
+/// heading (`+28`), purse and ceiling (`+140`/`+136`) and life sign,
+/// re-published at the walk's phase points (the carpet's own slot, the
+/// warp and respawn peeks, the below-carpet view). Walkers read a human
+/// off his RECORD; the view stands in where no record homes the lane
+/// (record-less unit rigs, the pre-record load settle) or a switch
+/// restores the published copy, and it carries the two deliberate phase
+/// views (the carpet's own warp-peek probe, the wake pre-pass reference).
+/// `dead_top` is the TICK-TOP death latch the roster scans read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SeatView {
+    pub(crate) x: u16,
+    pub(crate) y: u16,
+    pub(crate) z: i16,
+    /// The heading (the wizard entity's +30) — the genie's ambush
+    /// blink (sub_1E770 :24733) lands ahead of the TARGET along the
+    /// target's own yaw.
+    pub(crate) yaw: u16,
+    /// The castable pool (+140) — the genie's mana hunt (:24523-46)
+    /// takes the first wizard holding ANY mana.
+    pub(crate) mana: u32,
+    /// The mana CEILING (+136): retail's ball-merge owner contest
+    /// (`sub_277D0` :29755-73) reads the owner wizards' `+136`.
+    pub(crate) mana_max: u32,
+    /// Dead or death-falling (`life_0x8 < 0`). Republished mid-walk
+    /// at the writer's slot — LIVE-read consumers (:24636, :26152)
+    /// want this one.
+    pub(crate) dead: bool,
+    /// The tick-top `dead`, NEVER republished: roster-MEMBERSHIP
+    /// consumers (the genie mana hunt's class-3 chain, :24527 — the
+    /// chain is built at tick top with actLife >= 0, :52254) read the
+    /// value the chain was built with, not the live one.
+    pub(crate) dead_top: bool,
+}
 
 impl<T> std::hash::Hash for HashSilent<T> {
     fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {}
@@ -2770,6 +2859,133 @@ fn no_mc2_seize_blank() -> bool {
     *V.get_or_init(|| std::env::var_os("MGC_NO_MC2_SEIZE_BLANK").is_some())
 }
 
+/// `MGC_NO_HUMAN_TILE_LINK=1`: the human's record stays OUT of the
+/// tile chains (the virtual [`PlayerChain`] seat alone) — see
+/// [`Gen::player_relink`]. Off with the mirror too
+/// (`MGC_NO_HUMAN_RECORD_MIRROR=1` = the whole stage 2 reverted).
+pub(crate) fn human_tile_link() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var_os("MGC_NO_HUMAN_TILE_LINK").is_none()
+            && std::env::var_os("MGC_NO_HUMAN_RECORD_MIRROR").is_none()
+    })
+}
+
+/// ⭐ MULTIPLAYER STAGE-2 TAIL — THE HUMAN'S MAIL LIVES IN HIS RECORD.
+/// Retail's carpet is a pool record, so every writer that hits the
+/// human writes the record's own `+90..` mailboxes and his tick drains
+/// them there (MC1 `sub_46540` :55641, MC2 `sub_5EFA0`). The port kept
+/// an out-of-pool `Gen::player_mail` block; with the mirrored record
+/// live, [`Gen::pmail`] / [`Gen::pmail_mut`] resolve to the record's
+/// `mail` instead. `MGC_NO_HUMAN_MAIL_IN_RECORD=1` restores the
+/// out-of-pool block (also off with the mirror).
+pub(crate) fn human_mail_in_record() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var_os("MGC_NO_HUMAN_MAIL_IN_RECORD").is_none()
+            && std::env::var_os("MGC_NO_HUMAN_RECORD_MIRROR").is_none()
+    })
+}
+
+/// ⭐ MULTIPLAYER STAGE-2 TAIL — THE SEAT ARMS MEET HIM AT HIS RECORD.
+/// With his record really linked ([`human_tile_link`]), a chain walk
+/// reaches the human's seat when its cursor lands ON HIS RECORD, the
+/// way retail's walkers meet the carpet — not in front of the virtual
+/// successor [`PlayerChain::next`]. See [`Gen::human_seat_at`].
+/// `MGC_NO_HUMAN_SEAT_AT_RECORD=1` restores the successor test.
+pub(crate) fn human_seat_at_record() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var_os("MGC_NO_HUMAN_SEAT_AT_RECORD").is_none() && human_tile_link()
+    })
+}
+
+/// ⭐ MULTIPLAYER STAGE-2 TAIL — AN AREA WRITE BILLS HIS RECORD. With
+/// his mail in his record ([`human_mail_in_record`]) and the record
+/// linked where his seat is ([`human_seat_at_record`]), the MC2 ch3/ch4
+/// free-only area arm meets him in its tile walk like any class-3
+/// member — retail's own shape (`sub_10C80` EF:4022-38) — instead of
+/// the post-walk player arm on the `ctx` pose. See
+/// [`Gen::human_area_at_record`]. `MGC_NO_HUMAN_AREA_AT_RECORD=1`
+/// restores the player arm.
+/// ⭐ MULTIPLAYER STAGE 3 — THE WALKERS READ HIS PURSE LIVE. Retail's
+/// genie mana hunt (:24527), the MC2 lightning rebound absorb and the
+/// ball-merge ceiling contest (:29755-73) read `+140` / `+136` off the
+/// carpet RECORD at the walker's own slot; the port handed them the
+/// tick-top `MobCtx` copy. With the record the home of his purse they
+/// read it there ([`Gen::human_purse`] / [`Gen::human_ceiling`]).
+/// `MGC_NO_HUMAN_LIVE_PURSE=1` keeps the tick-top copy.
+/// ⭐ MULTIPLAYER STAGE 3, SLICE 5c — THE WALKERS READ THE HUMAN OFF
+/// HIS RECORD. Retail's walkers read the carpet record at their own
+/// slot (pose, heading, life sign); the port read the `MobCtx` copy
+/// the walk republished before each slot. Every reader now goes
+/// through [`Gen::human_at`] / [`Gen::hpyaw`] / [`Gen::hpdead`], which
+/// read the seat's record — so a seat is read where it lives, not
+/// through one published view. `MGC_NO_HUMAN_ROSTER_READ=1` reads the
+/// `ctx` copy.
+pub(crate) fn no_human_roster_read() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("MGC_NO_HUMAN_ROSTER_READ").is_some())
+}
+
+pub(crate) fn no_human_live_purse() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("MGC_NO_HUMAN_LIVE_PURSE").is_some())
+}
+
+/// ⭐ MULTIPLAYER STAGE 3, CHANNEL 2 — THE HUMAN IS AN ORDINARY
+/// VICTIM. Retail's carpet carries the probe's damageable bit (`+16 & 8`:
+/// the recorded flags word is 0x20D in both games) and `sub_11980` /
+/// `sub_10780` / the area writers meet it in its tile chain like any
+/// member — they have no player arm. With his (3,0) record linked, the
+/// mirror stamps bit 8 and [`Gen::human_pool_victim`] retires the port's
+/// out-of-pool arms: the victim probe and the MC1/MC2 area writer bill
+/// `Pool(record)`. `MGC_NO_HUMAN_POOL_VICTIM=1` restores the player arms.
+pub(crate) fn no_human_pool_victim() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("MGC_NO_HUMAN_POOL_VICTIM").is_some())
+}
+
+/// ⭐ STAGE 3 — THE HUMAN'S REBOUND BIT IS HIS RECORD'S `+17 & 0x80`
+/// (port `flags & 0x8000`). Every deflect gate — the out-of-pool arm and
+/// the pool arm meeting his record alike — then reads one bit, set the
+/// moment the cast stamps it. `MGC_NO_HUMAN_REBOUND_ON_RECORD=1` keeps
+/// `player_rebound_reg` as the home and the record bit a mirrored copy.
+pub(crate) fn no_human_rebound_on_record() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("MGC_NO_HUMAN_REBOUND_ON_RECORD").is_some())
+}
+
+pub(crate) fn human_area_at_record() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var_os("MGC_NO_HUMAN_AREA_AT_RECORD").is_none()
+            && human_seat_at_record()
+            && human_mail_in_record()
+    })
+}
+
+/// ⭐ MULTIPLAYER STAGE 2 — THE HUMAN RIDES THE CLASS-3 ROSTER.
+/// Retail's carpet is an ordinary member of `var_u32_36462[0]` (MC1
+/// :52253-62) / `dword_38519` (MC2 EF:39975): admitted at the tick-top
+/// sweep by the same `actLife >= 0 && !(flags & 0x10)` gate as every
+/// wizard, hidden by the same seizure blank / severed-chain cut, and
+/// walked IN SLOT ORDER. The port seated him outside the roster with a
+/// per-reader arm (first, last, or slot-spliced) and per-reader
+/// stand-ins for the gate (`human_wiz_top`, `human_bucket_alive`,
+/// `dead_top`) and the cut (`mc1_human_on_wiz_chain`). With the
+/// mirrored (3,0) record on the roster, each reader meets him at his
+/// slot ([`Gen::chain_human`]) and reads the same human inputs its
+/// arm read. `MGC_NO_HUMAN_ON_WIZ_CHAIN=1` restores the arms.
+pub(crate) fn human_on_wiz_chain() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var_os("MGC_NO_HUMAN_ON_WIZ_CHAIN").is_none()
+            && std::env::var_os("MGC_NO_HUMAN_RECORD_CLASS3").is_none()
+            && std::env::var_os("MGC_NO_HUMAN_RECORD_MIRROR").is_none()
+    })
+}
+
 /// `MGC_NO_MC1_HUMAN_SEAT_CUT=1` restores the pre-dig pre-passes in
 /// which the out-of-pool human answered a bucket[0] walk (the fireball
 /// muzzle acquire, the creature wizard scan, the balloon-guard
@@ -3372,6 +3588,15 @@ pub(crate) fn no_mc2_flood_mail_seat() -> bool {
 /// is exactly retail's (−83, +31, −22) over the port's single shove.
 /// The knock's −4/tick residue after the well lets go was the take's
 /// t=6,962 and t=6,964 heads.
+/// ⭐ STAGE 3 — THE MC2 HUMAN'S `@0x20` (the death-spin target-yaw
+/// word) LIVES ON HIS RECORD's `f32` once the (3,0) record exists
+/// ([`Gen::human_roll`]). `MGC_NO_HUMAN_ROLL_ON_RECORD=1` keeps the
+/// `human_roll_0x20` register as the home.
+pub(crate) fn no_human_roll_on_record() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("MGC_NO_HUMAN_ROLL_ON_RECORD").is_some())
+}
+
 pub(crate) fn no_mc2_flood_human_seat() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("MGC_NO_MC2_FLOOD_HUMAN_SEAT").is_some())
@@ -4618,6 +4843,12 @@ pub(crate) struct PlayerFloodPull {
     /// [`no_mc2_flood_human_spin`]. Independent of `armed`: the close
     /// band moves nothing, so the walk-pose hook has nothing to adopt.
     pub spin: bool,
+    /// The positional legs (`dx`/`dy`/`pull`) are ON THE HUMAN'S
+    /// RECORD already — the walk hook's republish was the record write
+    /// ([`crate::engine::world::no_mc2_flood_record_write`]) — so the
+    /// carpet's dispatch, whose mover loads that record, must not
+    /// apply them again.
+    pub on_record: bool,
 }
 
 impl std::hash::Hash for PlayerFloodPull {
@@ -4672,7 +4903,7 @@ pub(crate) struct PlayerWhirl {
     /// not-yet-grabbed block more than once in a tick.
     pub bumps: u8,
     /// The human's pose (x, y, z, heading) at the HEAD of the tick's
-    /// visits — `ctx.px/py/pz/pyaw`, the pose the funnel's slot read
+    /// visits — `view.x/y/z/yaw`, the pose the funnel's slot read
     /// before any arm moved him. The faithful walk consumes `grab`
     /// as an absolute pose in the SAME tick, so it never needs this;
     /// the enhanced mover consumes one tick late (its move runs
@@ -5063,6 +5294,12 @@ impl std::hash::Hash for Mc1Pinned {
 /// Hash-silent OUTRIGHT, like [`CrtRand`] and [`Mc2Pinned`]: `Gen` is
 /// `#[derive(Hash)]` and a plain field would move every golden in both
 /// games for a lane that is pure bookkeeping.
+///
+/// Since the multiplayer stage 2 his record is REALLY linked at the
+/// seat, so walkers meet him at the record ([`Gen::human_seat_at`]):
+/// `next` is then just the record's own `+20`, kept for the record-less
+/// virtual seat, and `cell` names the chain that holds him (the mirror
+/// moves his x/y at points where retail does not relink).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlayerChain {
     /// The tile whose chain `next` indexes; `usize::MAX` = unseeded,
@@ -5156,7 +5393,7 @@ pub(crate) fn no_mc2_morph_puppet_roll() -> bool {
 
 /// A/B toggle for THE HUMAN CASTER'S half of that law: set
 /// `MGC_NO_MC2_HUMAN_PUPPET_ROLL` to restore the pre-dig
-/// `roll = ctx.pyaw` the human arm of
+/// `roll = view.yaw` the human arm of
 /// [`crate::engine::features::Gen::mc2_metamorph_creature_tick`] fell
 /// back to. ⚠ ROUND 148 LANDED THE POOLED HALF ONLY — `sub_1E4D0`
 /// copies `[ebx+0x20]` whoever the parent is, and the human's carpet
@@ -5402,7 +5639,7 @@ pub(crate) fn no_mc1_vulture_death_mover() -> bool {
 /// A/B toggle for **THE HUMAN'S TOKEN IS ITS `+42`, NOT THE REGISTER**
 /// (round 155, w155d — the converse of `MGC_NO_MC1_TOKEN_OWNER_TAG`):
 /// set `MGC_NO_MC1_TOKEN_TAG_FIRST` to restore the pre-dig
-/// `mc1_token_is_players`, which ran a class-12 token's human arm only
+/// `mc1_token_seat`, which ran a class-12 token's human arm only
 /// while `player.owned[spell]` named it. Every retail token machine
 /// resolves its caster from the token's own `+42` and never reads the
 /// `+676` register — `sub_56380` (speed, dispatch row 0x06 :4964)
@@ -5900,52 +6137,54 @@ impl Gen {
             mob_chains: MobChains::default(),
             mc2_recycle: Mc2Recycle::default(),
             m27_v34_slot: M27V34Slot(None, false, None, None),
-            mc2_pinned: Mc2Pinned(0),
-            mc1_pinned: Mc1Pinned(0),
+            mc2_pinned: Seats::one(Mc2Pinned(0)),
+            mc1_pinned: Seats::one(Mc1Pinned(0)),
             mc1_guard_reg: Mc1GuardReg::default(),
             mc1_balloon_reg: Mc1BalloonReg::default(),
-            human_seat: HumanSeat::default(),
+            human_seat: Seats::one(HumanSeat::default()),
+            human_tag: Seats::one(HumanTag::default()),
             rand: seed,
             pseudo,
             crt_rand: CrtRand(1),
             spawn_count: [0; 20],
-            player_mail: [(0, 0); 6],
-            player_damage: 0,
+            player_mail: Seats::one([(0, 0); 6]),
+            player_damage: Seats::one(0),
             erupting: 0,
             plume: 0,
-            player_knock: (0, 0),
+            player_knock: Seats::one((0, 0)),
             mc1_buffet_post: HashSilent((0, 0)),
-            player_spin: PlayerSpin::default(),
-            player_whirl: PlayerWhirl::default(),
-            ww_walk_published: HashSilent(false),
+            player_spin: Seats::one(PlayerSpin::default()),
+            player_whirl: Seats::one(PlayerWhirl::default()),
+            ww_walk_published: Seats::one(HashSilent(false)),
+            seat_view: Seats::one(HashSilent(SeatView::default())),
             m22_seg_residue: HashSilent(None),
-            player_hurl: PlayerHurl::default(),
-            player_flood_pull: PlayerFloodPull::default(),
-            player_deflect_debit: DeflectDebit::default(),
-            mc2_debuffs: Mc2PlayerDebuffs::default(),
+            player_hurl: Seats::one(PlayerHurl::default()),
+            player_flood_pull: Seats::one(PlayerFloodPull::default()),
+            player_deflect_debit: Seats::one(DeflectDebit::default()),
+            mc2_debuffs: Seats::one(Mc2PlayerDebuffs::default()),
             rival_ents: [0; 8],
             castle_reg: CastleReg::default(),
             mc2_life_scale: Mc2LifeScale::default(),
-            player_aggro: 0,
+            player_aggro: Seats::one(0),
             rival_wanted: [0; 8],
-            player_invisible: false,
+            player_invisible: Seats::one(false),
             player_ghost: HashSilent(false),
-            player_vel: HashSilent((0, 0)),
+            player_vel: Seats::one(HashSilent((0, 0))),
             mc2_flyers_clear: HashSilent(false),
             skeletons_convert_traders: HashSilent(false),
-            human_roll_0x20: HashSilent(0),
-            player_rebound: false,
-            player_chain: PlayerChain::default(),
-            kills: 0,
+            human_roll_0x20: Seats::one(HashSilent(0)),
+            player_rebound_reg: Seats::one(false),
+            player_chain: Seats::one(PlayerChain::default()),
+            kills: Seats::one(0),
             stats: HashSilent(Default::default()),
-            shots: 0,
-            hits: 0,
-            player_danger: 0,
-            banked_houses: 0,
+            shots: Seats::one(0),
+            hits: Seats::one(0),
+            player_danger: Seats::one(0),
+            banked_houses: Seats::one(0),
             rival_banked_houses: RivalHouses::default(),
-            castle_alert: 0,
-            player_alert: 0,
-            balloon_alert: 0,
+            castle_alert: Seats::one(0),
+            player_alert: Seats::one(0),
+            balloon_alert: Seats::one(0),
             pal_flash: PalFlash::default(),
             exhausted: 0,
             castle_watchdog_fired: HashSilent((0, 0)),
@@ -5957,10 +6196,10 @@ impl Gen {
             misfits: Vec::new(),
             mc2_night_shade: NightShade(false),
             mc2_spawn_ord: Mc2Ord::default(),
-            mc2_player_drain: Mc2Quiet::default(),
+            mc2_player_drain: Seats::one(Mc2Quiet::default()),
             mc2_rival_leech: Mc2Quiet::default(),
-            mc2_scrolls: Mc2Quiet::default(),
-            mc2_spell_tokens: Mc2Quiet::default(),
+            mc2_scrolls: Seats::one(Mc2Quiet::default()),
+            mc2_spell_tokens: Seats::one(Mc2Quiet::default()),
             mc2_cast_xp: Mc2XpMail::default(),
             mc2_ladder_sync: Mc2LadderMail::default(),
             mc2_castle_lock_mail: Mc2LockMail::default(),
@@ -5973,10 +6212,10 @@ impl Gen {
             mc2_aura_claim: Mc2SlotMap::default(),
             mc2_wanted: Mc2SlotMap::default(),
             mc2_allied: Mc2SlotMap::default(),
-            mc2_rebound_precise: Mc2Quiet::default(),
+            mc2_rebound_precise: Seats::one(Mc2Quiet::default()),
             mc2_castle_research: Mc2CastleResearch::default(),
-            mc2_mobilize: Mc2Quiet::default(),
-            mc2_slow: Mc2Echo::default(),
+            mc2_mobilize: Seats::one(Mc2Quiet::default()),
+            mc2_slow: Seats::one(Mc2Echo::default()),
         }
     }
 
@@ -6029,7 +6268,7 @@ impl Gen {
     /// Emit a player-entity sound request (the original's calls
     /// against the wizard's own entity — full volume, center pan).
     #[track_caller]
-    pub(crate) fn snd_player(&mut self, id: u8) {
+    pub(crate) fn snd_player(&mut self, hx: Hx, id: u8) {
         if snd_trace_on() {
             eprintln!(
                 "SNDREQ id={id} site={} emitter=PLAYER",
@@ -6039,7 +6278,7 @@ impl Gen {
         self.sounds.push(SoundEvent {
             id,
             pos: (0, 0, 0),
-            tag: crate::mc1::mobs::PLAYER_TARGET,
+            tag: self.human_tag[hx].0,
             player: true,
         });
     }
@@ -6371,7 +6610,8 @@ impl Gen {
     /// record is a zeroed husk in our pool but a LIVE wizard in
     /// retail's — it must never be handed out (0 = native MC2, where
     /// the human owns no pool slot at all).
-    pub(crate) fn mc2_rebuild_free(&mut self, pinned: u16) {
+    /// `pinned`: every human seat's carpet record slot.
+    pub(crate) fn mc2_rebuild_free(&mut self, pinned: &[u16]) {
         // `sub_49F90`'s FIRST loop (Level.cpp:1277-80): every pending
         // GHOST — disabled (byte[1]&4 → our 0x400) but not yet
         // reaped — is freed NOW (`sub_57F20`: unlink, recycle-list
@@ -6385,7 +6625,7 @@ impl Gen {
         // takes pin its allocation receipts.
         if matches!(self.verbs.movement, crate::verbs::MovementVerb::Mc2) {
             for s in 1..self.ent.len() {
-                if s != pinned as usize
+                if !pinned.contains(&(s as u16))
                     && self.ent[s].class64 != 0
                     && self.ent[s].flags & 0x400 != 0
                 {
@@ -6402,7 +6642,7 @@ impl Gen {
         }
         self.free = (1..self.ent.len() as u16)
             .rev()
-            .filter(|&s| s != pinned && self.ent[s as usize].class64 == 0)
+            .filter(|&s| !pinned.contains(&s) && self.ent[s as usize].class64 == 0)
             .collect();
         // ⭐⭐⭐ AND THE VICTIM HALF OF THE SAME SCAN (round 98, dig
         // 98-Q29). `sub_49F90` is ONE descending 999→1 loop with TWO
@@ -6478,7 +6718,12 @@ impl Gen {
     /// share equal), where an unclamped `spill/1000` would have minted
     /// 32 of 3,983.
     pub(crate) fn mc2_eject_gc(&mut self) -> i32 {
-        self.mc2_rebuild_free(self.mc2_pinned.0);
+        let pinned: Vec<u16> = self
+            .mc2_pinned
+            .ixs()
+            .map(|hx| self.mc2_pinned[hx].0)
+            .collect();
+        self.mc2_rebuild_free(&pinned);
         // `mov dword [edx+0x11e6],-1` — the victim stack the rebuild
         // just re-ranked is dropped on the floor before a single
         // sphere is minted. (This is the EIGHTH of the nine
@@ -6505,10 +6750,12 @@ impl Gen {
     /// `pinned` is the conformance import's human-carpet slot — a
     /// zeroed husk in our pool, a live wizard in retail's, and never
     /// allocatable (0 = native play, where the human owns no slot).
-    pub(crate) fn mc1_rebuild_free(&mut self, pinned: u16) {
+    /// `pinned`: every human seat's carpet record slot (held out of the
+    /// stack whatever its class).
+    pub(crate) fn mc1_rebuild_free(&mut self, pinned: &[u16]) {
         self.free = (1..self.ent.len() as u16)
             .rev()
-            .filter(|&s| s != pinned && self.ent[s as usize].class64 == 0)
+            .filter(|&s| !pinned.contains(&s) && self.ent[s as usize].class64 == 0)
             .collect();
     }
 
@@ -6580,6 +6827,445 @@ impl Gen {
         self.wiz_chain.cut == 0 && !no_trigger_roster_blank()
     }
 
+    /// The record slot homing the MC2 human's `@0x20` target-yaw word —
+    /// his (3,0) carpet record ([`no_human_roll_on_record`]).
+    fn human_roll_home(&self, hx: Hx) -> Option<usize> {
+        if no_human_roll_on_record() || crate::engine::world::no_human_record_mirror() {
+            return None;
+        }
+        let hr = self.mc2_pinned[hx].0 as usize;
+        (hr != 0
+            && self
+                .ent
+                .get(hr)
+                .is_some_and(|e| e.class64 == 3 && e.model65 == 0))
+        .then_some(hr)
+    }
+
+    /// The MC2 human's `@0x20` target-yaw word (see `human_roll_0x20`).
+    pub(crate) fn human_roll(&self, hx: Hx) -> u16 {
+        match self.human_roll_home(hx) {
+            Some(hr) => self.ent[hr].f32,
+            None => self.human_roll_0x20[hx].0,
+        }
+    }
+
+    /// Seat the MC2 human's `@0x20` — his record when it is the home,
+    /// the register through.
+    pub(crate) fn set_human_roll(&mut self, hx: Hx, v: u16) {
+        if let Some(hr) = self.human_roll_home(hx) {
+            self.ent[hr].f32 = v;
+        }
+        self.human_roll_0x20[hx] = HashSilent(v);
+    }
+
+    /// The human's carpet record slot (MC1 `mc1_pinned` / MC2
+    /// `mc2_pinned`; only one is ever set), 0 when the world has none.
+    /// Since the multiplayer stage 2 the record is a live (3,0) wizard
+    /// record mirroring the human ([`crate::engine::world::World`]'s
+    /// `mirror_human_record`), so pool sweeps that still carry their
+    /// own human arm skip this slot.
+    /// The human seat flying the carpet that owns `tag` — `None` for
+    /// any other owner. ⚠ One seat: the identity slice keys it per seat.
+    /// ⭐ RETAIL'S LOCAL PLAYER (`playerIndex`) — the seat the world's
+    /// own machinery answers to where retail reads
+    /// `Entities[playerIndex]` (the doomsday pyramid's target, the MC2
+    /// stage engine, the level-start checkpoint, the cave drip). Seat 0.
+    pub(crate) fn local_seat(&self) -> Hx {
+        Hx::FIRST
+    }
+
+    pub(crate) fn hx_of_tag(&self, tag: u16) -> Option<Hx> {
+        self.human_tag.ixs().find(|&hx| self.human_tag[hx].0 == tag)
+    }
+
+    /// Is `tag` some human seat's owner tag?
+    pub(crate) fn is_human_tag(&self, tag: u16) -> bool {
+        self.hx_of_tag(tag).is_some()
+    }
+
+    /// The human seat flying from wizard seat `slot`, if a human does.
+    pub(crate) fn hx_at_wizard(&self, slot: u8) -> Option<Hx> {
+        self.human_seat
+            .ixs()
+            .find(|&hx| self.human_seat[hx].0 == slot)
+    }
+
+    pub(crate) fn human_rec(&self, hx: Hx) -> usize {
+        self.mc1_pinned[hx].0.max(self.mc2_pinned[hx].0) as usize
+    }
+
+    /// Is the human's record the live holder of his seat — linked, so
+    /// a walk meets it in its chain ([`human_seat_at_record`])?
+    fn human_seat_on_record(&self, hx: Hx) -> bool {
+        let hr = self.human_rec(hx);
+        human_seat_at_record() && hr != 0 && self.ent.get(hr).is_some_and(|e| e.flags & 4 != 0)
+    }
+
+    /// Does a chain walk whose cursor is on `j` stand at the human's
+    /// seat? On his own linked record; without one, in front of the
+    /// virtual successor [`PlayerChain::next`] (0 = the tail pass).
+    pub(crate) fn human_seat_at(&self, j: usize) -> bool {
+        self.mc1_pinned
+            .ixs()
+            .any(|hx| self.human_seat_at_for(hx, j))
+    }
+
+    /// [`Self::human_seat_at`] for seat `hx` alone.
+    pub(crate) fn human_seat_at_for(&self, hx: Hx, j: usize) -> bool {
+        if self.human_seat_on_record(hx) {
+            j != 0 && j == self.human_rec(hx)
+        } else {
+            j == self.player_chain[hx].next as usize
+        }
+    }
+
+    /// Is his seat the chain's TAIL, met only after the walk falls off
+    /// the end? Never with a linked record — the walk meets the record.
+    pub(crate) fn human_seat_is_tail(&self, hx: Hx) -> bool {
+        !self.human_seat_on_record(hx) && self.player_chain[hx].next == 0
+    }
+
+    /// The record homing the human's rebound bit
+    /// ([`no_human_rebound_on_record`]): his (3,0) carpet record.
+    pub(crate) fn human_rebound_home(&self, hx: Hx) -> Option<usize> {
+        let hr = self.human_rec(hx);
+        (!no_human_rebound_on_record()
+            && hr != 0
+            && self
+                .ent
+                .get(hr)
+                .is_some_and(|e| e.class64 == 3 && e.model65 == 0))
+        .then_some(hr)
+    }
+
+    /// The human's Rebound deflection bit — his record's `0x8000`, else
+    /// the register.
+    pub(crate) fn player_rebound(&self, hx: Hx) -> bool {
+        match self.human_rebound_home(hx) {
+            Some(hr) => self.ent[hr].flags & 0x8000 != 0,
+            None => self.player_rebound_reg[hx],
+        }
+    }
+
+    /// Set the human's Rebound bit — the record when it is the home,
+    /// the register through.
+    pub(crate) fn set_player_rebound(&mut self, hx: Hx, on: bool) {
+        if let Some(hr) = self.human_rebound_home(hx) {
+            let e = &mut self.ent[hr];
+            e.flags = if on {
+                e.flags | 0x8000
+            } else {
+                e.flags & !0x8000
+            };
+        }
+        self.player_rebound_reg[hx] = on;
+    }
+
+    /// Is the human's record an ordinary probe victim — (3,0), linked
+    /// in its tile chain and carrying the damageable bit
+    /// ([`no_human_pool_victim`])? Then every chain walk gated on
+    /// `+16 & 8` meets him there and the out-of-pool arms stand down.
+    pub(crate) fn human_pool_victim(&self, hx: Hx) -> bool {
+        let hr = self.human_rec(hx);
+        !no_human_pool_victim()
+            && self.human_seat_on_record(hx)
+            && self.ent[hr].class64 == 3
+            && self.ent[hr].model65 == 0
+            && self.ent[hr].flags & 8 != 0
+            // …and linked in the tile it STANDS in. Retail's pose
+            // writers all relink (`CopyEntityPosition_57CF0`); a port
+            // path that moves him without one (a pinned-pose tick with
+            // no mover) keeps the out-of-pool arms until his next relink.
+            && self.player_chain[hx].cell
+                == crate::engine::features::tile((self.ent[hr].x >> 8) as u8, (self.ent[hr].y >> 8) as u8)
+    }
+
+    /// Where a write aimed at the human lands: his record as an ordinary
+    /// pool victim ([`Self::human_pool_victim`]), else the out-of-pool
+    /// player arm.
+    pub(crate) fn human_target(&self, hx: Hx) -> crate::mc1::combat::MailTarget {
+        if self.human_pool_victim(hx) {
+            crate::mc1::combat::MailTarget::Pool(self.human_rec(hx))
+        } else {
+            crate::mc1::combat::MailTarget::Player(hx)
+        }
+    }
+
+    /// [`Self::human_target`] for the human's tag, `Pool(tag)` for any
+    /// other.
+    pub(crate) fn target_of_tag(&self, tag: u16) -> crate::mc1::combat::MailTarget {
+        if let Some(hx) = self.hx_of_tag(tag) {
+            self.human_target(hx)
+        } else {
+            crate::mc1::combat::MailTarget::Pool(tag as usize)
+        }
+    }
+
+    /// Is the human cloaked for the pool-side gates? His (3,0) record's
+    /// `+16 & 0x20` — the Invisibility latch with the ghost cheat ORed
+    /// in, retail's one storage ([`crate::engine::world::no_human_wide_on_record`])
+    /// — else the [`Self::player_invisible`] mirror.
+    pub(crate) fn player_cloaked(&self, hx: Hx) -> bool {
+        use crate::engine::world::{no_human_mirror_wide, no_human_wide_on_record};
+        match self.human_record_home(hx) {
+            Some(hr) if !no_human_wide_on_record() && !no_human_mirror_wide() => {
+                self.ent[hr].flags & 0x20 != 0
+            }
+            _ => self.player_invisible[hx],
+        }
+    }
+
+    /// The human's (3,0) record when it is the home of his state — the
+    /// Gen face of `World::human_pose_home` (the mirror on, the pose on
+    /// the record, the record flipped to class 3).
+    pub(crate) fn human_record_home(&self, hx: Hx) -> Option<usize> {
+        use crate::engine::world::{no_human_pose_on_record, no_human_record_mirror};
+        let hr = self.human_rec(hx);
+        (hr != 0
+            && !no_human_pose_on_record()
+            && !no_human_record_mirror()
+            && self
+                .ent
+                .get(hr)
+                .is_some_and(|e| e.class64 == 3 && e.model65 == 0))
+        .then_some(hr)
+    }
+
+    /// The record homing the human's purse for the walkers' LIVE reads
+    /// ([`no_human_live_purse`]).
+    fn human_purse_home(&self, hx: Hx) -> Option<usize> {
+        if no_human_live_purse() || crate::engine::world::no_human_mana_on_record() {
+            return None;
+        }
+        self.human_record_home(hx)
+    }
+
+    /// The human's purse (+140) as a walker reads it: his record's LIVE
+    /// word, else the tick-top `ctx` copy.
+    pub(crate) fn human_purse(&self, ctx: &crate::mc1::mobs::MobCtx) -> u32 {
+        let hx = ctx.phx;
+        match self.human_purse_home(hx) {
+            Some(hr) => self.ent[hr].f140 as u32,
+            None => self.view(ctx.phx).mana,
+        }
+    }
+
+    /// The purse the deflection afford gates read (:62706/:62859 read
+    /// the DEFLECTOR's live `+140` at the projectile's walk slot): his
+    /// record's live word ([`Self::human_purse`]); under
+    /// [`no_human_roster_read`] the tick-top `ctx` copy they read before.
+    pub(crate) fn human_purse_read(&self, ctx: &crate::mc1::mobs::MobCtx) -> u32 {
+        if no_human_roster_read() {
+            self.view(ctx.phx).mana
+        } else {
+            self.human_purse(ctx)
+        }
+    }
+
+    /// The human's mana ceiling (+136) as a walker reads it (see
+    /// [`Self::human_purse`]).
+    pub(crate) fn human_ceiling(&self, ctx: &crate::mc1::mobs::MobCtx) -> u32 {
+        let hx = ctx.phx;
+        match self.human_purse_home(hx) {
+            Some(hr) => self.ent[hr].f136 as u32,
+            None => self.view(ctx.phx).mana_max,
+        }
+    }
+
+    /// The record a walker reads the human `ctx` describes off
+    /// ([`no_human_roster_read`]): his (3,0) carpet record once it is
+    /// the home of his pose; `None` in a record-less world (unit rigs)
+    /// or under a switch, where the published `ctx` copy stands.
+    fn human_read_home(&self, ctx: &crate::mc1::mobs::MobCtx) -> Option<usize> {
+        if no_human_roster_read() {
+            return None;
+        }
+        self.human_record_home(ctx.phx)
+    }
+
+    /// The human's pose (+72/+74/+76) as a walker reads it at its own
+    /// slot: his record, else the `ctx` copy.
+    pub(crate) fn human_at(&self, ctx: &crate::mc1::mobs::MobCtx) -> (u16, u16, i16) {
+        match self.human_read_home(ctx) {
+            Some(hr) => {
+                let e = &self.ent[hr];
+                (e.x, e.y, e.z)
+            }
+            None => (
+                self.view(ctx.phx).x,
+                self.view(ctx.phx).y,
+                self.view(ctx.phx).z,
+            ),
+        }
+    }
+
+    /// Seat `hx`'s pose as a walker at this slot reads it: the ctx's
+    /// own seat exactly as [`Self::human_at`]; any other seat off his
+    /// record (every real world seats one per human).
+    pub(crate) fn seat_at(&self, ctx: &crate::mc1::mobs::MobCtx, hx: Hx) -> (u16, u16, i16) {
+        if hx == ctx.phx {
+            return self.human_at(ctx);
+        }
+        let e = &self.ent[self.human_rec(hx)];
+        (e.x, e.y, e.z)
+    }
+
+    /// Seat `hx`'s heading (see [`Self::seat_at`] / [`Self::hpyaw`]).
+    pub(crate) fn seat_yaw(&self, ctx: &crate::mc1::mobs::MobCtx, hx: Hx) -> u16 {
+        if hx == ctx.phx {
+            return self.hpyaw(ctx);
+        }
+        self.ent[self.human_rec(hx)].f30
+    }
+
+    /// Seat `hx`'s live life sign (see [`Self::seat_at`] / [`Self::hpdead`]).
+    pub(crate) fn seat_dead(&self, ctx: &crate::mc1::mobs::MobCtx, hx: Hx) -> bool {
+        if hx == ctx.phx {
+            return self.hpdead(ctx);
+        }
+        self.ent[self.human_rec(hx)].act_life < 0
+    }
+
+    /// Seat `hx`'s TICK-TOP death latch.
+    pub(crate) fn seat_dead_top(&self, hx: Hx) -> bool {
+        self.view(hx).dead_top
+    }
+
+    /// Seat `hx`'s walk view ([`SeatView`]).
+    pub(crate) fn view(&self, hx: Hx) -> &SeatView {
+        &self.seat_view[hx].0
+    }
+
+    pub(crate) fn view_mut(&mut self, hx: Hx) -> &mut SeatView {
+        &mut self.seat_view[hx].0
+    }
+
+    /// Seat `hx`'s live purse (`+140`; see [`Self::seat_at`] /
+    /// [`Self::human_purse`]).
+    pub(crate) fn seat_purse(&self, ctx: &crate::mc1::mobs::MobCtx, hx: Hx) -> u32 {
+        if hx == ctx.phx {
+            return self.human_purse(ctx);
+        }
+        self.ent[self.human_rec(hx)].f140 as u32
+    }
+
+    /// [`Self::seat_purse`] as the deflection afford gates read it
+    /// ([`Self::human_purse_read`] for the ctx's own seat).
+    pub(crate) fn seat_purse_read(&self, ctx: &crate::mc1::mobs::MobCtx, hx: Hx) -> u32 {
+        if hx == ctx.phx {
+            return self.human_purse_read(ctx);
+        }
+        self.ent[self.human_rec(hx)].f140 as u32
+    }
+
+    /// The human's heading (+28/`f30`) as a walker reads it: the record
+    /// when it homes the heading (MC2's mover turns it in place; MC1's
+    /// is the cast echo's stamp), else the `ctx` copy.
+    pub(crate) fn hpyaw(&self, ctx: &crate::mc1::mobs::MobCtx) -> u16 {
+        use crate::engine::world::{no_human_heading_on_record, no_mc1_cast_aim_on_record};
+        let mc2 = self.mc2_pinned[ctx.phx].0 != 0;
+        match self.human_read_home(ctx) {
+            Some(hr)
+                if (mc2 && !no_human_heading_on_record())
+                    || (!mc2 && !no_mc1_cast_aim_on_record()) =>
+            {
+                self.ent[hr].f30
+            }
+            _ => self.view(ctx.phx).yaw,
+        }
+    }
+
+    /// Is the human dead or death-falling — his record's LIVE life sign
+    /// (`+12 < 0`, :21658-61), else the `ctx` copy. Roster-membership
+    /// reads keep the tick-top `view.dead_top`.
+    pub(crate) fn hpdead(&self, ctx: &crate::mc1::mobs::MobCtx) -> bool {
+        match self.human_read_home(ctx) {
+            Some(hr) if !crate::engine::world::no_human_life_on_record() => {
+                self.ent[hr].act_life < 0
+            }
+            _ => self.view(ctx.phx).dead,
+        }
+    }
+
+    /// Do area writers meet the human at his linked record (whose
+    /// `mail` is his mailbox) rather than through a player arm?
+    pub(crate) fn human_area_at_record(&self, hx: Hx) -> bool {
+        human_area_at_record()
+            && self.human_seat_on_record(hx)
+            && self.human_mail_home(hx) == Some(self.human_rec(hx))
+    }
+
+    /// The slot whose `mail` is the human's mailbox block — his carpet
+    /// record (the class-0 husk at import, the (3,0) record after the
+    /// first mirror) — or `None` for the out-of-pool `player_mail`
+    /// ([`human_mail_in_record`] off, or a world with no record).
+    pub(crate) fn human_mail_home(&self, hx: Hx) -> Option<usize> {
+        let hr = self.human_rec(hx);
+        (human_mail_in_record()
+            && hr != 0
+            && self
+                .ent
+                .get(hr)
+                .is_some_and(|e| e.class64 == 0 || (e.class64 == 3 && e.model65 == 0)))
+        .then_some(hr)
+    }
+
+    /// The human's mailbox block (see [`Self::human_mail_home`]).
+    pub(crate) fn pmail(&self, hx: Hx) -> &[(u32, u16); 6] {
+        match self.human_mail_home(hx) {
+            Some(hr) => &self.ent[hr].mail,
+            None => &self.player_mail[hx],
+        }
+    }
+
+    /// The human's mailbox block, writable.
+    pub(crate) fn pmail_mut(&mut self, hx: Hx) -> &mut [(u32, u16); 6] {
+        match self.human_mail_home(hx) {
+            Some(hr) => &mut self.ent[hr].mail,
+            None => &mut self.player_mail[hx],
+        }
+    }
+
+    /// Is chain member `j` the human's own record? Only ever true when
+    /// the record rides `wiz_chain` ([`human_on_wiz_chain`]); every
+    /// reader then evaluates the human AT HIS SLOT — retail's chain
+    /// order — with the same inputs its old out-of-chain arm used.
+    pub(crate) fn chain_human(&self, j: usize) -> bool {
+        self.hx_of_rec(j).is_some()
+    }
+
+    /// The seat whose carpet record is slot `j` (never slot 0).
+    pub(crate) fn hx_of_rec(&self, j: usize) -> Option<Hx> {
+        if j == 0 {
+            return None;
+        }
+        self.mc1_pinned.ixs().find(|&hx| j == self.human_rec(hx))
+    }
+
+    /// Does the human ride the class-3 roster in THIS world? Only when
+    /// the switch is on AND his (3,0) record exists — a world with no
+    /// carpet record (a bare test world, an MC2 level with no start
+    /// marker) keeps every reader's out-of-roster human arm.
+    pub(crate) fn human_rides_chain(&self, hx: Hx) -> bool {
+        let hr = self.human_rec(hx);
+        human_on_wiz_chain()
+            && hr != 0
+            && self
+                .ent
+                .get(hr)
+                .is_some_and(|e| e.class64 == 3 && e.model65 == 0)
+    }
+
+    /// The MC1 human's bucket[0] visibility for the readers that test
+    /// it as a whole (the learn clock, the ball guard, the election,
+    /// the jar walk): on the roster it is the record's membership
+    /// alone; off it, the reader's own liveness stand-in `legacy_live`
+    /// (`human_bucket_alive`) AND the out-of-pool seat test.
+    pub(crate) fn mc1_human_roster_seen(&self, hx: Hx, legacy_live: bool) -> bool {
+        (self.human_rides_chain(hx) || legacy_live) && self.mc1_human_on_wiz_chain(hx)
+    }
+
     /// ⭐⭐⭐ **THE OUT-OF-POOL HUMAN'S SEAT ON BUCKET[0] IS THE CHAIN'S
     /// VISIBLE PREFIX — FOR EVERY READER, NOT ONLY THE WIZARD PICK.**
     ///
@@ -6610,11 +7296,16 @@ impl Gen {
     /// either side (14741 → creature 25, 14749 → the human) acquire in
     /// both engines, because no seizure ran below them those ticks.
     /// `MGC_NO_MC1_HUMAN_SEAT_CUT=1` reverts.
-    pub(crate) fn mc1_human_on_wiz_chain(&self) -> bool {
+    pub(crate) fn mc1_human_on_wiz_chain(&self, hx: Hx) -> bool {
         if no_mc1_human_seat_cut() {
             return true;
         }
-        let hs = self.mc1_pinned.0;
+        let hs = self.mc1_pinned[hx].0;
+        // On the roster his record IS the seat: a member of the visible
+        // prefix, admitted by the tick-top gate like any wizard.
+        if self.human_rides_chain(hx) {
+            return self.wiz_chain.list[..self.wiz_chain.visible_len()].contains(&hs);
+        }
         let hpos = self.wiz_chain.list.partition_point(|&s| s < hs);
         hpos < self.wiz_chain.cut
     }
@@ -6732,12 +7423,108 @@ impl Gen {
     /// chain's head, so his successor becomes whatever the head was;
     /// staying inside a tile leaves his seat untouched. See
     /// [`PlayerChain`].
-    pub(crate) fn player_relink(&mut self, x: u16, y: u16) {
+    ///
+    /// ⭐ MULTIPLAYER STAGE 2: the human's (3,0) record now takes the
+    /// seat FOR REAL — unlinked from the old cell and head-inserted
+    /// into the new one, so `next` is simply the record's own `+20`.
+    /// The relink never touches the record's x/y/z (the mirror owns
+    /// them, and they move at points where retail does not relink),
+    /// which is why `cell` stays the bookkeeping of WHICH chain holds
+    /// him. Every generic chain walker skips the record
+    /// ([`Gen::human_rec`]); the seat arms meet him AT the record
+    /// ([`Gen::human_seat_at`]), `next` serving only the record-less
+    /// virtual seat.
+    /// `MGC_NO_HUMAN_TILE_LINK=1` keeps the virtual seat alone.
+    pub(crate) fn player_relink(&mut self, hx: Hx, x: u16, y: u16) {
         let t = tile((x >> 8) as u8, (y >> 8) as u8);
-        if self.player_chain.cell != t {
-            self.player_chain.cell = t;
-            self.player_chain.next = self.map_entity[t];
+        let hr = self.human_rec(hx);
+        let real = hr != 0 && hr < self.ent.len() && human_tile_link();
+        if self.player_chain[hx].cell != t || (real && self.ent[hr].flags & 4 == 0) {
+            if real {
+                self.unlink(hr);
+            }
+            self.player_chain[hx].cell = t;
+            self.player_chain[hx].next = self.map_entity[t];
+            if real {
+                self.link_head_at(hr, t);
+            }
         }
+    }
+
+    /// Splice the human's record into the chain at the seat
+    /// [`PlayerChain`] names — just before `next`, or at the tail when
+    /// `next` is 0. The importers seed the seat from retail's own
+    /// carpet `+20`, so this is retail's recorded chain position.
+    pub(crate) fn seat_human_link(&mut self, hx: Hx) {
+        let hr = self.human_rec(hx);
+        let (cell, next) = (
+            self.player_chain[hx].cell,
+            self.player_chain[hx].next as usize,
+        );
+        if hr == 0 || hr >= self.ent.len() || !human_tile_link() || cell >= self.map_entity.len() {
+            return;
+        }
+        self.unlink(hr);
+        let prev = if next != 0 {
+            self.ent[next].prev22 as usize
+        } else {
+            let mut p = 0usize;
+            let mut s = self.map_entity[cell] as usize;
+            let mut guard = 0;
+            while s != 0 && guard <= self.ent.len() {
+                p = s;
+                s = self.ent[s].next20 as usize;
+                guard += 1;
+            }
+            p
+        };
+        self.ent[hr].prev22 = prev as u16;
+        self.ent[hr].next20 = next as u16;
+        if prev != 0 {
+            self.ent[prev].next20 = hr as u16;
+        } else {
+            self.map_entity[cell] = hr as u16;
+        }
+        if next != 0 {
+            self.ent[next].prev22 = hr as u16;
+        }
+        self.ent[hr].flags |= 4;
+    }
+
+    /// After a snapshot restore: the saved pool carries the human
+    /// record's links but not the [`PlayerChain`] bookkeeping, so find
+    /// the cell whose chain holds him (walk `+22` to the head, then the
+    /// head table) and take his successor off his own `+20`.
+    pub(crate) fn rederive_player_chain(&mut self, hx: Hx) {
+        let hr = self.human_rec(hx);
+        if hr == 0 || hr >= self.ent.len() || !human_tile_link() || self.ent[hr].flags & 4 == 0 {
+            return;
+        }
+        let mut h = hr;
+        let mut guard = 0;
+        while self.ent[h].prev22 != 0 && guard <= self.ent.len() {
+            h = self.ent[h].prev22 as usize;
+            guard += 1;
+        }
+        if let Some(t) = self.map_entity.iter().position(|&s| s as usize == h) {
+            self.player_chain[hx] = PlayerChain {
+                cell: t,
+                next: self.ent[hr].next20,
+            };
+        }
+    }
+
+    /// A bare head insert into tile `t`'s chain that leaves the
+    /// record's position alone (the human record's relink, above).
+    fn link_head_at(&mut self, i: usize, t: usize) {
+        let head = self.map_entity[t];
+        self.ent[i].prev22 = 0;
+        self.ent[i].next20 = head;
+        if head != 0 {
+            self.ent[head as usize].prev22 = i as u16;
+        }
+        self.map_entity[t] = i as u16;
+        self.ent[i].flags |= 4;
     }
 
     /// sub_41DD0 (:52486).
@@ -6750,13 +7537,22 @@ impl Gen {
         // record holding it hands the seat on when it leaves — exactly
         // what retail's doubly-linked splice does to the carpet's own
         // `+20` (:52490-96) when its successor unlinks.
-        if self.player_chain.next == i as u16 {
-            self.player_chain.next = next;
+        for hx in self.player_chain.ixs() {
+            if self.player_chain[hx].next == i as u16 {
+                self.player_chain[hx].next = next;
+            }
         }
         if prev != 0 {
             self.ent[prev as usize].next20 = next;
         } else {
-            let t = tile((self.ent[i].x >> 8) as u8, (self.ent[i].y >> 8) as u8);
+            // The human's record heads the chain of the cell it was
+            // LINKED in, which its mirrored pose may already have left.
+            let t = match self.hx_of_rec(i) {
+                Some(hx) if self.player_chain[hx].cell < self.map_entity.len() => {
+                    self.player_chain[hx].cell
+                }
+                _ => tile((self.ent[i].x >> 8) as u8, (self.ent[i].y >> 8) as u8),
+            };
             self.map_entity[t] = next;
         }
         if next != 0 {
@@ -9782,16 +10578,43 @@ impl Gen {
     }
 
     /// The human's wizard seat — see [`Gen::human_seat`].
-    pub(crate) fn human_seat(&self) -> u8 {
-        self.human_seat.0
+    pub(crate) fn human_seat(&self, hx: Hx) -> u8 {
+        self.human_seat[hx].0
+    }
+
+    /// ⭐ THE HUMAN'S OWNER TAG IS HIS CARPET'S POOL SLOT — retail's
+    /// own convention for every wizard (a class-3 carpet's `+24` is
+    /// its slot, and owner/target fields hold that word). Called
+    /// wherever the human's carpet record is seated (native spawn,
+    /// conformance import, save resume). Slot 0 — no carpet record (a
+    /// bare test world, the record A/B switches) — keeps the old
+    /// out-of-pool sentinel. `MGC_NO_HUMAN_SLOT_TAG=1` keeps the
+    /// sentinel everywhere (the A/B for the multiplayer stage 1).
+    ///
+    /// The record itself carries the tag too: a carpet's `+24` is its
+    /// own slot in retail (the allocator default every wizard keeps),
+    /// and resolvers that follow a source tag to its record and read
+    /// THAT record's `+24` (a fire inheriting its poster's owner) must
+    /// land back on the human. The record otherwise stays the zeroed
+    /// class-0 husk ([`crate::engine::world::World::mc1_spawn_human_record`]).
+    pub(crate) fn set_human_tag_slot(&mut self, hx: Hx, slot: u16) {
+        let slot_tag = slot != 0 && !no_human_slot_tag() && (slot as usize) < self.ent.len();
+        self.human_tag[hx] = HumanTag(if slot_tag {
+            slot
+        } else {
+            crate::mc1::mobs::PLAYER_TARGET
+        });
+        if slot_tag {
+            self.ent[slot as usize].id24 = slot;
+        }
     }
 
     /// A wizard owner tag's team slot: PLAYER_TARGET = the human's
     /// seat ([`Gen::human_seat`], 0 in retail single-player), a rival's
     /// entity slot = its player slot (wizext var_48 in the original).
     pub(crate) fn owner_team(&self, owner: u16) -> Option<u8> {
-        if owner == crate::mc1::mobs::PLAYER_TARGET {
-            return Some(self.human_seat.0);
+        if let Some(hx) = self.hx_of_tag(owner) {
+            return Some(self.human_seat[hx].0);
         }
         (owner != 0)
             .then(|| self.rival_ents.iter().position(|&e| e == owner))
@@ -9807,11 +10630,12 @@ impl Gen {
     /// [`no_mc1_owner_house_tally`] every castle reads the human's.
     pub(crate) fn owner_houses(&self, owner: u16) -> i32 {
         if no_mc1_owner_house_tally() {
-            return self.banked_houses;
+            // The pre-dig arm: every castle read THE (one) human's.
+            return self.banked_houses[Hx::FIRST];
         }
-        match self.owner_team(owner) {
-            Some(t) if t == self.human_seat.0 => self.banked_houses,
-            Some(t) => self.rival_banked_houses[t as usize],
+        match self.owner_team(owner).map(|t| (t, self.hx_at_wizard(t))) {
+            Some((_, Some(hx))) => self.banked_houses[hx],
+            Some((t, None)) => self.rival_banked_houses[t as usize],
             None => 0,
         }
     }
@@ -10289,10 +11113,10 @@ impl Gen {
             // therefore dead in retail and the port arms it only under
             // `MGC_NO_MC1_BALLOON_ALERT_SINK` — see
             // `crate::mc1::combat::no_mc1_balloon_alert_sink`.
-            if self.ent[i].id24 == crate::mc1::mobs::PLAYER_TARGET
+            if let Some(hx) = self.hx_of_tag(self.ent[i].id24)
                 && crate::mc1::combat::no_mc1_balloon_alert_sink()
             {
-                self.balloon_alert = 4;
+                self.balloon_alert[hx] = 4;
             }
             if self.ent[i].act_life < 0 {
                 // :56829 — stamp the killer and leave. ⚠ Unlike the
@@ -10781,9 +11605,9 @@ impl Gen {
                     lethal = true;
                 } else {
                     self.ent[i].mail[0].0 = 0; // :56703
-                    if self.ent[i].id24 == crate::mc1::mobs::PLAYER_TARGET {
+                    if let Some(hx) = self.hx_of_tag(self.ent[i].id24) {
                         // "Castle under attack" flash (Type_160+391=4).
-                        self.castle_alert = 4;
+                        self.castle_alert[hx] = 4;
                     }
                 }
             }
@@ -11311,8 +12135,8 @@ impl Gen {
                 // per-call-site gate mis-read, see mgc-audio's
                 // policy_mc1 notes). A rival's possession-claim is
                 // audible when you are near the claimant.
-                if src == crate::mc1::mobs::PLAYER_TARGET {
-                    self.snd_player(4);
+                if let Some(hx) = self.hx_of_tag(src) {
+                    self.snd_player(hx, 4);
                 } else if (src as usize) < self.ent.len() && self.ent[src as usize].class64 != 0 {
                     self.snd(4, src as usize);
                 }
@@ -11445,7 +12269,7 @@ impl Gen {
                 // port's model-only gate armed the human's wanted off
                 // the (10,0) fire and the 45231/45249 pack militia
                 // acquired a carpet retail's scan, wanted 0, never saw.
-                if src == crate::mc1::mobs::PLAYER_TARGET
+                if self.is_human_tag(src)
                     || self
                         .ent
                         .get(src as usize)
@@ -12641,6 +13465,8 @@ impl Gen {
             player_whirl: _,
             // A within-walk register — see the field doc.
             ww_walk_published: _,
+            // A per-tick walk view — see the field doc.
+            seat_view: _,
             // A within-walk register — see the field doc.
             m22_seg_residue: _,
             // A per-tick transient the carpet's walk slot drains — see
@@ -12670,7 +13496,7 @@ impl Gen {
             // from the recorded carpet, on the `player_chain`
             // precedent below.
             human_roll_0x20: _,
-            player_rebound,
+            player_rebound_reg: player_rebound,
             // Bookkeeping the SAVE does not carry, on the
             // `player_deflect_debit` precedent: `cell` restores as
             // `usize::MAX`, so the first mover tick after a restore
@@ -12762,6 +13588,8 @@ impl Gen {
             mc1_guard_reg,
             mc1_balloon_reg,
             human_seat,
+            // Load-static — see the field doc.
+            human_tag: _,
             // Rebuilt at every tick top — never saved.
             ball_chain: _,
             wiz_chain: _,
@@ -12782,26 +13610,56 @@ impl Gen {
         w.put(rand);
         w.put(pseudo);
         w.put(spawn_count);
-        w.put(player_mail);
-        w.put(player_damage);
+        for hx in player_mail.ixs() {
+            w.put(&player_mail[hx]);
+        }
+        for hx in player_damage.ixs() {
+            w.put(&player_damage[hx]);
+        }
         w.put(erupting);
         w.put(plume);
-        w.put(player_knock);
-        w.put(mc2_debuffs);
+        for hx in player_knock.ixs() {
+            w.put(&player_knock[hx]);
+        }
+        for hx in mc2_debuffs.ixs() {
+            w.put(&mc2_debuffs[hx]);
+        }
         w.put(rival_ents);
         w.put(mc2_life_scale);
-        w.put(player_aggro);
+        for hx in player_aggro.ixs() {
+            w.put(&player_aggro[hx]);
+        }
         w.put(rival_wanted);
-        w.put(player_invisible);
-        w.put(player_rebound);
-        w.put(kills);
-        w.put(shots);
-        w.put(hits);
-        w.put(player_danger);
-        w.put(banked_houses);
-        w.put(castle_alert);
-        w.put(player_alert);
-        w.put(balloon_alert);
+        for hx in player_invisible.ixs() {
+            w.put(&player_invisible[hx]);
+        }
+        for hx in player_rebound.ixs() {
+            w.put(&player_rebound[hx]);
+        }
+        for hx in kills.ixs() {
+            w.put(&kills[hx]);
+        }
+        for hx in shots.ixs() {
+            w.put(&shots[hx]);
+        }
+        for hx in hits.ixs() {
+            w.put(&hits[hx]);
+        }
+        for hx in player_danger.ixs() {
+            w.put(&player_danger[hx]);
+        }
+        for hx in banked_houses.ixs() {
+            w.put(&banked_houses[hx]);
+        }
+        for hx in castle_alert.ixs() {
+            w.put(&castle_alert[hx]);
+        }
+        for hx in player_alert.ixs() {
+            w.put(&player_alert[hx]);
+        }
+        for hx in balloon_alert.ixs() {
+            w.put(&balloon_alert[hx]);
+        }
         w.put(pal_flash);
         w.put(exhausted);
         w.put(verb_fallbacks);
@@ -12810,21 +13668,31 @@ impl Gen {
         w.put(terrain_dirty);
         w.put(mc2_night_shade);
         w.put(mc2_spawn_ord);
-        w.put(mc2_player_drain);
+        for hx in mc2_player_drain.ixs() {
+            w.put(&mc2_player_drain[hx]);
+        }
         w.put(mc2_rival_leech);
-        w.put(mc2_scrolls);
-        w.put(mc2_spell_tokens);
+        for hx in mc2_scrolls.ixs() {
+            w.put(&mc2_scrolls[hx]);
+        }
+        for hx in mc2_spell_tokens.ixs() {
+            w.put(&mc2_spell_tokens[hx]);
+        }
         w.put(mc2_cast_xp);
         w.put(mc2_ladder_sync);
         w.put(mc2_steal_mail);
         w.put(mc2_aura_claim);
         w.put(mc2_wanted);
-        w.put(mc2_rebound_precise);
+        for hx in mc2_rebound_precise.ixs() {
+            w.put(&mc2_rebound_precise[hx]);
+        }
         w.put(mc2_allied);
         w.put(mc2_castle_research);
         w.put(&mc1_guard_reg.0);
         w.put(&mc1_balloon_reg.0);
-        w.put(&human_seat.0);
+        for hx in human_seat.ixs() {
+            w.put(&human_seat[hx].0);
+        }
     }
 
     pub(crate) fn snap_apply(&mut self, r: &mut Reader) -> Result<(), SnapshotError> {
@@ -12836,26 +13704,56 @@ impl Gen {
         self.rand = r.get()?;
         self.pseudo = r.get()?;
         self.spawn_count = r.get()?;
-        self.player_mail = r.get()?;
-        self.player_damage = r.get()?;
+        for hx in self.player_mail.ixs() {
+            self.player_mail[hx] = r.get()?;
+        }
+        for hx in self.player_damage.ixs() {
+            self.player_damage[hx] = r.get()?;
+        }
         self.erupting = r.get()?;
         self.plume = r.get()?;
-        self.player_knock = r.get()?;
-        self.mc2_debuffs = r.get()?;
+        for hx in self.player_knock.ixs() {
+            self.player_knock[hx] = r.get()?;
+        }
+        for hx in self.mc2_debuffs.ixs() {
+            self.mc2_debuffs[hx] = r.get()?;
+        }
         self.rival_ents = r.get()?;
         self.mc2_life_scale = r.get()?;
-        self.player_aggro = r.get()?;
+        for hx in self.player_aggro.ixs() {
+            self.player_aggro[hx] = r.get()?;
+        }
         self.rival_wanted = r.get()?;
-        self.player_invisible = r.get()?;
-        self.player_rebound = r.get()?;
-        self.kills = r.get()?;
-        self.shots = r.get()?;
-        self.hits = r.get()?;
-        self.player_danger = r.get()?;
-        self.banked_houses = r.get()?;
-        self.castle_alert = r.get()?;
-        self.player_alert = r.get()?;
-        self.balloon_alert = r.get()?;
+        for hx in self.player_invisible.ixs() {
+            self.player_invisible[hx] = r.get()?;
+        }
+        for hx in self.player_rebound_reg.ixs() {
+            self.player_rebound_reg[hx] = r.get()?;
+        }
+        for hx in self.kills.ixs() {
+            self.kills[hx] = r.get()?;
+        }
+        for hx in self.shots.ixs() {
+            self.shots[hx] = r.get()?;
+        }
+        for hx in self.hits.ixs() {
+            self.hits[hx] = r.get()?;
+        }
+        for hx in self.player_danger.ixs() {
+            self.player_danger[hx] = r.get()?;
+        }
+        for hx in self.banked_houses.ixs() {
+            self.banked_houses[hx] = r.get()?;
+        }
+        for hx in self.castle_alert.ixs() {
+            self.castle_alert[hx] = r.get()?;
+        }
+        for hx in self.player_alert.ixs() {
+            self.player_alert[hx] = r.get()?;
+        }
+        for hx in self.balloon_alert.ixs() {
+            self.balloon_alert[hx] = r.get()?;
+        }
         self.pal_flash = r.get()?;
         self.exhausted = r.get()?;
         self.verb_fallbacks = r.get()?;
@@ -12864,21 +13762,31 @@ impl Gen {
         self.terrain_dirty = r.get()?;
         self.mc2_night_shade = r.get()?;
         self.mc2_spawn_ord = r.get()?;
-        self.mc2_player_drain = r.get()?;
+        for hx in self.mc2_player_drain.ixs() {
+            self.mc2_player_drain[hx] = r.get()?;
+        }
         self.mc2_rival_leech = r.get()?;
-        self.mc2_scrolls = r.get()?;
-        self.mc2_spell_tokens = r.get()?;
+        for hx in self.mc2_scrolls.ixs() {
+            self.mc2_scrolls[hx] = r.get()?;
+        }
+        for hx in self.mc2_spell_tokens.ixs() {
+            self.mc2_spell_tokens[hx] = r.get()?;
+        }
         self.mc2_cast_xp = r.get()?;
         self.mc2_ladder_sync = r.get()?;
         self.mc2_steal_mail = r.get()?;
         self.mc2_aura_claim = r.get()?;
         self.mc2_wanted = r.get()?;
-        self.mc2_rebound_precise = r.get()?;
+        for hx in self.mc2_rebound_precise.ixs() {
+            self.mc2_rebound_precise[hx] = r.get()?;
+        }
         self.mc2_allied = r.get()?;
         self.mc2_castle_research = r.get()?;
         self.mc1_guard_reg.0 = r.get()?;
         self.mc1_balloon_reg.0 = r.get()?;
-        self.human_seat.0 = r.get()?;
+        for hx in self.human_seat.ixs() {
+            self.human_seat[hx].0 = r.get()?;
+        }
         // Presentation feed — never saved, never inherited across a
         // load.
         self.bolt_fx.0.clear();
@@ -14231,7 +15139,7 @@ mod tests {
         g.ent[castle].id24 = 7; // someone else's, so the +24 gate opens
         let (cx, cy, cz) = (g.ent[castle].x, g.ent[castle].y, g.ent[castle].z);
         let fire = g.spawn_effect(0, cx, cy, cz).unwrap();
-        let ctx = ctx_at(0x7F00, 0x7F00, 0);
+        let ctx = ctx_at(&mut g, 0x7F00, 0x7F00, 0);
 
         // Dead at the TICK TOP → out of the roster → no ch0 at all.
         g.ent[castle].act_life = -1;
@@ -14279,8 +15187,8 @@ mod tests {
             g.ent[rival].f136 = 5_000;
             g.ent[a].f144 = PLAYER_TARGET; // survivor: the human's
             g.ent[b].f144 = rival as u16; // absorbed: the rival's
-            let mut ctx = ctx_at(0x7F00, 0x7F00, 0);
-            ctx.pmana_max = human_ceiling;
+            let ctx = ctx_at(&mut g, 0x7F00, 0x7F00, 0);
+            g.view_mut(ctx.phx).mana_max = human_ceiling;
             g.mc1_ball_owner_contest(a, b, &ctx);
             (g.ent[a].f144, rival as u16)
         };
@@ -14341,7 +15249,7 @@ mod tests {
         };
         let hit = mk(&mut g, 23);
         let steal = mk(&mut g, 25);
-        let ctx = ctx_at(0x8000, 0x8000, 0);
+        let ctx = ctx_at(&mut g, 0x8000, 0x8000, 0);
 
         g.effect_tick(hit, &ctx);
         g.effect_tick(steal, &ctx);
@@ -14561,7 +15469,7 @@ mod tests {
         g.rival_ents[2] = rival;
         // The resolve: human → `banked_houses`, rival → its row, a tag
         // that names no wizard → 0.
-        g.banked_houses = 9000;
+        g.banked_houses[Hx::FIRST] = 9000;
         g.rival_banked_houses[2] = 700;
         assert_eq!(g.owner_houses(crate::mc1::mobs::PLAYER_TARGET), 9000);
         assert_eq!(g.owner_houses(rival), 700);
@@ -14597,7 +15505,7 @@ mod tests {
 
         // The HUMAN's tally is over the cap, the rival's is not: the
         // rival's balloon hunts the ball (retail: 0 + 5000 < 10000).
-        g.banked_houses = 9000;
+        g.banked_houses[Hx::FIRST] = 9000;
         g.rival_banked_houses[2] = 0;
         g.rebuild_ball_chain();
         g.castle_balloons(c);
@@ -14609,7 +15517,7 @@ mod tests {
         // The rival's SNAPSHOT says full while the pool holds no
         // (10,45) of his at all: the balloon homes — the read is the
         // census snapshot, not a live sum.
-        g.banked_houses = 0;
+        g.banked_houses[Hx::FIRST] = 0;
         g.rival_banked_houses[2] = 6000;
         g.ent[b].f146 = 0;
         g.rebuild_ball_chain();
@@ -14642,10 +15550,10 @@ mod tests {
         let balls_before = (1..g.ent.len())
             .filter(|&j| g.ent[j].class64 == 10 && g.ent[j].model65 == 39)
             .count();
-        g.banked_houses = 9000;
+        g.banked_houses[Hx::FIRST] = 9000;
         g.rival_banked_houses[2] = 0;
         g.castle_eject(c);
-        g.banked_houses = 0;
+        g.banked_houses[Hx::FIRST] = 0;
         g.rival_banked_houses[2] = 9000;
         g.castle_eject(c);
         let balls_after = (1..g.ent.len())
@@ -14866,7 +15774,7 @@ mod tests {
     fn the_dry_ejector_s_gc_never_hands_out_the_pinned_carpet_slot() {
         let mut g = mc2_gen();
         let husk = 7usize;
-        g.mc2_pinned = Mc2Pinned(husk as u16);
+        g.mc2_pinned[Hx::FIRST] = Mc2Pinned(husk as u16);
         g.free.clear();
         assert_eq!(g.ent[husk].class64, 0, "the imported husk is class 0");
         let depth = g.mc2_eject_gc();
@@ -14877,16 +15785,22 @@ mod tests {
         );
     }
 
-    fn ctx_at(px: u16, py: u16, pz: i16) -> crate::mc1::mobs::MobCtx {
+    fn ctx_at(
+        g: &mut crate::engine::features::Gen,
+        px: u16,
+        py: u16,
+        pz: i16,
+    ) -> crate::mc1::mobs::MobCtx {
+        *g.view_mut(crate::engine::world::Hx::FIRST) = crate::engine::features::SeatView {
+            x: px,
+            y: py,
+            z: pz,
+            mana: 1000,
+            mana_max: 1000,
+            ..Default::default()
+        };
         crate::mc1::mobs::MobCtx {
-            px,
-            py,
-            pz,
-            pyaw: 0,
-            pmana: 1000,
-            pmana_max: 1000,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: crate::patches::WorldPatches::RETAIL,
             mc2_turn: 0,
@@ -15288,7 +16202,8 @@ mod tests {
             g.ent[5].act_life = 10;
             g.ent[5].x = 40 * 256;
             g.ent[5].y = 0;
-            g.mob_awake_pass(&ctx_at(0, 0, 0));
+            let rig_ctx = ctx_at(&mut g, 0, 0, 0);
+            g.mob_awake_pass(&rig_ctx);
             g.ent[5].f58
         };
         assert_eq!(run(0x240_0000), 0, "40 tiles out stays asleep (faithful)");
@@ -15333,10 +16248,11 @@ mod tests {
         g.ent[s].tick70 = 120;
         g.ent[s].x = 0;
         g.ent[s].y = 900;
+        let rig_ctx = ctx_at(&mut g, 300, 0, 0);
 
         // Carpet at (300, 0): the creature's planar distance is
         // isqrt(300² + 1000²) = 1044; retail stamps |0 − 1000| = 1000.
-        g.mob_awake_pass(&ctx_at(300, 0, 0));
+        g.mob_awake_pass(&rig_ctx);
         assert_eq!(g.ent[c].f58, 16, "the creature woke");
         assert_eq!(g.ent[c].raw48, Raw48(1000), "the Y-leg, not the distance");
         assert_eq!(g.ent[s].f58, 18, "the follower is armed +2");
@@ -15348,7 +16264,8 @@ mod tests {
         // re-arm re-samples it from the carpet's NEW y (the sign
         // folds: carpet above the creature reads the same magnitude).
         for _ in 0..16 {
-            g.mob_awake_pass(&ctx_at(0, 1500, 0));
+            let rig_ctx = ctx_at(&mut g, 0, 1500, 0);
+            g.mob_awake_pass(&rig_ctx);
         }
         assert_eq!(g.ent[c].f58, 0, "drained");
         assert_eq!(
@@ -15356,7 +16273,8 @@ mod tests {
             Raw48(1000),
             "the countdown never rewrites +48"
         );
-        g.mob_awake_pass(&ctx_at(0, 1500, 0));
+        let rig_ctx = ctx_at(&mut g, 0, 1500, 0);
+        g.mob_awake_pass(&rig_ctx);
         assert_eq!(g.ent[c].f58, 16);
         assert_eq!(
             g.ent[c].raw48,
@@ -15369,7 +16287,8 @@ mod tests {
         // carpet at y = 100 are 136 apart across the seam, not 65400.
         g.ent[c].y = 65500;
         g.ent[c].f58 = 0;
-        g.mob_awake_pass(&ctx_at(0, 100, 0));
+        let rig_ctx = ctx_at(&mut g, 0, 100, 0);
+        g.mob_awake_pass(&rig_ctx);
         assert_eq!(g.ent[c].f58, 16, "136 apart through the seam is in radius");
         assert_eq!(g.ent[c].raw48, Raw48(136), "wraps through the map seam");
 
@@ -15377,7 +16296,8 @@ mod tests {
         g.ent[c].y = 0;
         g.ent[c].f58 = 0;
         g.ent[c].raw48 = Raw48(0);
-        g.mob_awake_pass(&ctx_at(0, 7000, 0));
+        let rig_ctx = ctx_at(&mut g, 0, 7000, 0);
+        g.mob_awake_pass(&rig_ctx);
         assert_eq!(g.ent[c].f58, 0, "27 tiles out stays asleep");
         assert_eq!(g.ent[c].raw48, Raw48(0), "and is never stamped");
     }
@@ -15399,19 +16319,22 @@ mod tests {
         );
         let b = g.spawn_mana_ball(0, 0, 0).unwrap();
         g.ent[b].f58 = 0; // settled (128 ticks elapsed)
+        let rig_ctx = ctx_at(&mut g, 6144, 0, 0);
 
         // Boundary exactness: exactly 6144 units = NOT eligible.
-        g.mob_awake_pass(&ctx_at(6144, 0, 0));
+        g.mob_awake_pass(&rig_ctx);
         assert_eq!(g.ent[b].f58, 0, "24.0 tiles exactly stays frozen");
+        let rig_ctx = ctx_at(&mut g, 6143, 0, 32767);
         // One unit inside re-arms to 16 (altitude never gates).
-        g.mob_awake_pass(&ctx_at(6143, 0, 32767));
+        g.mob_awake_pass(&rig_ctx);
         assert_eq!(g.ent[b].f58, 16, "inside the radius re-arms 16");
 
         // Cadence: with the player parked nearby, the value returns
         // to 16 every 17 passes — 16 decrements, one zero-observe.
         let mut rearms = Vec::new();
         for t in 1..=34 {
-            g.mob_awake_pass(&ctx_at(100, 0, 0));
+            let rig_ctx = ctx_at(&mut g, 100, 0, 0);
+            g.mob_awake_pass(&rig_ctx);
             if g.ent[b].f58 == 16 {
                 rearms.push(t);
             }
@@ -15420,7 +16343,8 @@ mod tests {
 
         // Far away again: the countdown drains and never re-arms.
         for _ in 0..40 {
-            g.mob_awake_pass(&ctx_at(0x7000, 0x7000, 0));
+            let rig_ctx = ctx_at(&mut g, 0x7000, 0x7000, 0);
+            g.mob_awake_pass(&rig_ctx);
         }
         assert_eq!(g.ent[b].f58, 0, "out of radius, frozen for good");
     }
@@ -15572,7 +16496,7 @@ mod tests {
         assert!(accel != 0 && accel < max, "m7 carries a live accel step");
 
         // In CHASE, on the cadence tick, with the wizard in reach.
-        let ctx = ctx_at(0x4080, 0x4000, 0);
+        let ctx = ctx_at(&mut g, 0x4080, 0x4000, 0);
         g.ent[i].tick70 = 44;
         g.ent[i].f146 = crate::mc1::mobs::PLAYER_TARGET;
         g.ent[i].f63 = 0;
@@ -15617,7 +16541,8 @@ mod tests {
         g.ent[i].f146 = crate::mc1::mobs::PLAYER_TARGET;
         g.ent[i].f63 = 0;
         g.ent[i].f26 = 0;
-        g.creature_tick(i, &ctx_at(0x4080, 0x4000, 0));
+        let rig_ctx = ctx_at(&mut g, 0x4080, 0x4000, 0);
+        g.creature_tick(i, &rig_ctx);
         assert_eq!(g.ent[i].type86, 198, "planted");
         let inflated = max + 4 * accel;
         g.ent[i].f126 = inflated;
@@ -15626,7 +16551,8 @@ mod tests {
         // Now the wizard steps out of range: the shared chase drops to
         // WANDER on the cadence tick and the trailer fires.
         g.ent[i].f63 = 0;
-        g.creature_tick(i, &ctx_at(0x7F00, 0x7F00, 0));
+        let rig_ctx = ctx_at(&mut g, 0x7F00, 0x7F00, 0);
+        g.creature_tick(i, &rig_ctx);
         assert_eq!(g.ent[i].tick70, 43, "dropped back to WANDER");
         assert_eq!(
             (g.ent[i].type86, g.ent[i].f126),
@@ -15660,7 +16586,8 @@ mod tests {
         g.ent[follower].f52 = leader as u16;
         g.ent[follower].f126 = 1;
         g.ent[follower].f63 = 0; // on the v_26 cadence
-        g.creature_tick(follower, &ctx_at(0x7F00, 0x7F00, 0));
+        let rig_ctx = ctx_at(&mut g, 0x7F00, 0x7F00, 0);
+        g.creature_tick(follower, &rig_ctx);
         assert_eq!(
             g.ent[follower].f126,
             g.ent[leader].f126 + accel,
@@ -15689,7 +16616,7 @@ mod tests {
             let follower = g.spawn_creature(1, 0x4010, 0x4000, 0).unwrap();
             let (max, accel) = (g.ent[follower].f128, g.ent[follower].f130);
             assert!(accel > 0 && max > 0, "a vulture has a real speed triple");
-            let mut ctx = ctx_at(0x7F00, 0x7F00, 0);
+            let mut ctx = ctx_at(&mut g, 0x7F00, 0x7F00, 0);
             ctx.patches.mc1_pack_speed_restore = patched;
             // Following a wandering leader already at its own max
             // (a vulture spawns below it): the catch-up write puts
@@ -15748,12 +16675,12 @@ mod tests {
 
         // Standing in the village (state 25) with the wizard in reach,
         // on the 4*v_26 acquisition tick and village-wanted.
-        let ctx = ctx_at(0x4200, 0x4000, 0);
+        let ctx = ctx_at(&mut g, 0x4200, 0x4000, 0);
         g.ent[i].tick70 = 25;
         g.ent[i].f58 = 16;
         g.ent[i].f63 = 0;
-        g.ent[i].f30 = Gen::angle_between(0x4000, 0x4000, ctx.px, ctx.py);
-        g.player_aggro = 200; // the +528 hostility gate
+        g.ent[i].f30 = Gen::angle_between(0x4000, 0x4000, g.view(ctx.phx).x, g.view(ctx.phx).y);
+        g.player_aggro[Hx::FIRST] = 200; // the +528 hostility gate
         g.creature_tick(i, &ctx);
         assert_eq!(g.ent[i].tick70, 26, "promoted to CHASE");
         assert_eq!(
@@ -15764,7 +16691,8 @@ mod tests {
 
         // The wizard leaves: the chase breaks and the trailer disarms.
         g.ent[i].f63 = 0;
-        g.creature_tick(i, &ctx_at(0x7F00, 0x7F00, 0));
+        let rig_ctx = ctx_at(&mut g, 0x7F00, 0x7F00, 0);
+        g.creature_tick(i, &rig_ctx);
         assert_eq!(g.ent[i].tick70, 25, "back to the village walk");
         assert_eq!(
             (g.ent[i].f126, g.ent[i].type86, g.ent[i].f66, g.ent[i].f67),
@@ -15782,12 +16710,12 @@ mod tests {
         let mut g = mob_gen();
         let i = g.spawn_creature(9, 0x4000, 0x4000, 0).unwrap();
         let max = g.ent[i].f128;
-        let ctx = ctx_at(0x4200, 0x4000, 0);
+        let ctx = ctx_at(&mut g, 0x4200, 0x4000, 0);
         g.ent[i].tick70 = 55;
         g.ent[i].f26 = 200;
         g.ent[i].f63 = 0;
         g.ent[i].f58 = 16;
-        g.ent[i].f30 = Gen::angle_between(0x4000, 0x4000, ctx.px, ctx.py);
+        g.ent[i].f30 = Gen::angle_between(0x4000, 0x4000, g.view(ctx.phx).x, g.view(ctx.phx).y);
         g.creature_tick(i, &ctx);
         assert_eq!(g.ent[i].tick70, 56, "surfaced into CHASE");
         assert_eq!(
@@ -15797,7 +16725,8 @@ mod tests {
         );
 
         g.ent[i].f63 = 0;
-        g.creature_tick(i, &ctx_at(0x7F00, 0x7F00, 0));
+        let rig_ctx = ctx_at(&mut g, 0x7F00, 0x7F00, 0);
+        g.creature_tick(i, &rig_ctx);
         assert_eq!(g.ent[i].tick70, 55, "back to lurking");
         assert_eq!(
             (g.ent[i].f126, g.ent[i].type86, g.ent[i].f67),
@@ -15827,7 +16756,8 @@ mod tests {
             // A lethal mail item, delivered the way combat does.
             g.ent[i].f58 = 16;
             g.ent[i].mail[0] = (g.ent[i].max_life + 1000, 1);
-            g.creature_tick(i, &ctx_at(0x4080, 0x4000, 0));
+            let rig_ctx = ctx_at(&mut g, 0x4080, 0x4000, 0);
+            g.creature_tick(i, &rig_ctx);
             assert_eq!(
                 g.ent[i].tick70,
                 chase + 2,
@@ -15849,7 +16779,8 @@ mod tests {
         g.ent[i].f126 = 3 * max;
         g.ent[i].f58 = 16;
         g.ent[i].mail[0] = (g.ent[i].max_life + 1000, 1);
-        g.creature_tick(i, &ctx_at(0x4080, 0x4000, 0));
+        let rig_ctx = ctx_at(&mut g, 0x4080, 0x4000, 0);
+        g.creature_tick(i, &rig_ctx);
         assert_eq!(g.ent[i].f126, max, "the lunge does not outlive the bee");
     }
 
@@ -15870,7 +16801,8 @@ mod tests {
         g.ent[follower].tick70 = 39; // PACK
         g.ent[follower].f52 = head as u16;
         g.ent[follower].f63 = 0;
-        g.creature_tick(follower, &ctx_at(0x7F00, 0x7F00, 0));
+        let rig_ctx = ctx_at(&mut g, 0x7F00, 0x7F00, 0);
+        g.creature_tick(follower, &rig_ctx);
         assert_eq!(
             g.ent[follower].f126, 30,
             "the kraken's tail write outlives the catch-up"
@@ -15916,7 +16848,7 @@ mod tests {
         // is the arm this test is about.
         let castle = g.spawn_castle(0x6000, 0x4000).unwrap();
         g.ent[castle].id24 = 7; // a rival's — the mound may hunt it
-        let away = ctx_at(0x7F00, 0x7F00, 0);
+        let away = ctx_at(&mut g, 0x7F00, 0x7F00, 0);
         g.ent[mound].tick70 = 55;
         g.ent[mound].f26 = 200;
         g.ent[mound].f58 = 0; // asleep: no wizard scan, castle arm only
@@ -15970,7 +16902,7 @@ mod tests {
         let mound = g.spawn_creature(9, 0x4000, 0x4000, 0).unwrap();
         let castle = g.spawn_castle(0x4100, 0x4000).unwrap();
         g.ent[castle].id24 = 7; // a rival's, so the mound will take it
-        let away = ctx_at(0x7F00, 0x7F00, 0);
+        let away = ctx_at(&mut g, 0x7F00, 0x7F00, 0);
 
         // Lurking, on the castle-hunt cadence: it surfaces into CHASE
         // and the entry trailer narrows the filter on that tick.
@@ -16027,7 +16959,8 @@ mod tests {
             for phase in 0..40u8 {
                 g.ent[i].f63 = phase;
                 g.ent[i].f34 = 0;
-                g.creature_tick(i, &ctx_at(0x4100, 0x4100, 0));
+                let rig_ctx = ctx_at(&mut g, 0x4100, 0x4100, 0);
+                g.creature_tick(i, &rig_ctx);
                 if g.ent[i].f34 != 0 {
                     n += 1;
                 }
@@ -16063,7 +16996,8 @@ mod tests {
             g.ent[i].f146 = held;
             g.ent[i].f126 = max;
             g.ent[i].mail[0] = (250, m as u16);
-            g.creature_tick(i, &ctx_at(0x4080, 0x4000, 0));
+            let rig_ctx = ctx_at(&mut g, 0x4080, 0x4000, 0);
+            g.creature_tick(i, &rig_ctx);
             (g.ent[i].tick70, g.ent[i].f146, g.ent[i].f126, m as u16, max)
         };
 
@@ -16100,12 +17034,12 @@ mod tests {
                 crate::verbs::VerbSet::MC1,
             );
             let i = g.spawn_creature(9, 0x4000, 0x4000, 0).unwrap();
-            let ctx = ctx_at(0x4200, 0x4000, 0); // 2 tiles east, in v_28
+            let ctx = ctx_at(&mut g, 0x4200, 0x4000, 0); // 2 tiles east, in v_28
             g.ent[i].tick70 = 55; // surfaced mound (state 55)
             g.ent[i].f26 = 200; // burrow timer armed, no bury edge
             g.ent[i].f63 = 0; // on the v_26 scan tick
             g.ent[i].f58 = f58;
-            g.ent[i].f30 = Gen::angle_between(0x4000, 0x4000, ctx.px, ctx.py);
+            g.ent[i].f30 = Gen::angle_between(0x4000, 0x4000, g.view(ctx.phx).x, g.view(ctx.phx).y);
             g.creature_tick(i, &ctx);
             (g.ent[i].tick70, g.ent[i].f146)
         };
@@ -16147,7 +17081,7 @@ mod tests {
             // roster (:23887-98) — rebuild it the way the tick head
             // does, or the scan sees an empty chain.
             g.rebuild_mob_chains();
-            let ctx = ctx_at(0x7F00, 0x7F00, 0); // player far away
+            let ctx = ctx_at(&mut g, 0x7F00, 0x7F00, 0); // player far away
             g.creature_tick(i, &ctx);
             assert_ne!(
                 g.ent[v].flags & 0x400,
@@ -16207,7 +17141,7 @@ mod tests {
             crate::verbs::VerbSet::MC1,
         );
         let i = g.spawn_creature(9, 0x4000, 0x4000, 0).unwrap();
-        let ctx = ctx_at(0x4200, 0x4000, 0);
+        let ctx = ctx_at(&mut g, 0x4200, 0x4000, 0);
         g.ent[i].tick70 = 55;
         g.ent[i].f71 = 1; // buried
         g.ent[i].f26 = 0;
@@ -16242,11 +17176,11 @@ mod tests {
                 crate::verbs::VerbSet::MC1,
             );
             let i = g.spawn_creature(model, 0x4000, 0x4000, 0).unwrap();
-            let ctx = ctx_at(0x4200, 0x4000, 0); // 2 tiles east, in v_28
+            let ctx = ctx_at(&mut g, 0x4200, 0x4000, 0); // 2 tiles east, in v_28
             assert_eq!(g.ent[i].tick70, wander, "m{model} spawns wandering");
             assert!(g.ent[i].f58 != 0, "m{model} spawns awake");
             g.ent[i].f63 = 0; // on the v_26 scan tick
-            let facing = Gen::angle_between(0x4000, 0x4000, ctx.px, ctx.py);
+            let facing = Gen::angle_between(0x4000, 0x4000, g.view(ctx.phx).x, g.view(ctx.phx).y);
             g.ent[i].f30 = facing;
             g.ent[i].f34 = facing; // no turn-away before the scan
             g.creature_tick(i, &ctx);
@@ -16285,7 +17219,7 @@ mod tests {
         // idle (no aggro) and simply wanders.
         g.ent[i].z = ground + 400;
         let (x0, y0) = (g.ent[i].x, g.ent[i].y);
-        let ctx = ctx_at(0xC000, 0xC000, 0);
+        let ctx = ctx_at(&mut g, 0xC000, 0xC000, 0);
         for _ in 0..500 {
             g.creature_tick(i, &ctx);
         }
@@ -16322,7 +17256,7 @@ mod tests {
         g.ent[i].z = ground + 400;
         g.ent[i].tick70 = 26; // chase
         g.ent[i].f146 = crate::mc1::mobs::PLAYER_TARGET;
-        let ctx = ctx_at(0x4200, 0x4000, ground); // 2 tiles east, in range
+        let ctx = ctx_at(&mut g, 0x4200, 0x4000, ground); // 2 tiles east, in range
         for _ in 0..500 {
             g.creature_tick(i, &ctx);
         }
@@ -16358,7 +17292,7 @@ mod tests {
         let b = g.spawn_creature(4, 0x4300, 0x4000, 0).unwrap();
         assert_eq!(g.ent[a].tick70, 25, "m4 spawns idle");
         assert_eq!(g.ent[b].tick70, 25, "m4 spawns idle");
-        let ctx = ctx_at(0xC000, 0xC000, 0);
+        let ctx = ctx_at(&mut g, 0xC000, 0xC000, 0);
         for _ in 0..400 {
             // The pair-up scan walks the TICK-TOP per-model chain, so a
             // test that drives `creature_tick` by hand has to rebuild it
@@ -16421,7 +17355,7 @@ mod tests {
             ChassisParams::MC1,
             crate::verbs::VerbSet::MC1,
         );
-        let ctx = ctx_at(0xC000, 0xC000, 0);
+        let ctx = ctx_at(&mut g, 0xC000, 0xC000, 0);
         // Two militia born together, close enough and facing each other
         // — everything the pair-up needs EXCEPT chain membership.
         let a = g.spawn_creature(4, 0x4000, 0x4000, 0).unwrap();
@@ -16480,7 +17414,7 @@ mod tests {
         // Force the trap regardless of which slot the fixture hands out.
         g.ent[i].f26 = 37;
         // One idle tick with nothing to fight: retail zeroes +26 here.
-        let ctx = ctx_at(0xC000, 0xC000, 0);
+        let ctx = ctx_at(&mut g, 0xC000, 0xC000, 0);
         g.creature_tick(i, &ctx);
         // Kill him: the inbox death routes idle to the death slot (28).
         g.ent[i].tick70 = 28;
@@ -16512,7 +17446,7 @@ mod tests {
         let i = g.spawn_creature(4, 0x4000, 0x4000, 0).unwrap();
         g.ent[i].f26 = 1; // the house-branch walk-in mark
         g.ent[i].tick70 = 28;
-        let ctx = ctx_at(0xC000, 0xC000, 0);
+        let ctx = ctx_at(&mut g, 0xC000, 0xC000, 0);
         g.creature_tick(i, &ctx);
         assert!(
             g.ent[i].flags & 0x400 != 0,
@@ -16548,8 +17482,8 @@ mod tests {
             g.ent[i].id24 = owner;
             g.ent[i].f58 = 16; // awake
             g.ent[i].f63 = 15; // on the v_26 scan tick, NOT the heading-vote tick
-            let ctx = ctx_at(0x4200, 0x4000, 0); // 2 tiles east, well inside v_28
-            g.ent[i].f30 = Gen::angle_between(0x4000, 0x4000, ctx.px, ctx.py); // in cone
+            let ctx = ctx_at(&mut g, 0x4200, 0x4000, 0); // 2 tiles east, well inside v_28
+            g.ent[i].f30 = Gen::angle_between(0x4000, 0x4000, g.view(ctx.phx).x, g.view(ctx.phx).y); // in cone
             g.creature_tick(i, &ctx);
             (g.ent[i].tick70, g.ent[i].f146, g.ent[i].f126)
         };
@@ -16678,13 +17612,16 @@ mod tests {
         g.ent[i].tick70 = 210; // M26_BASE + 2, the drain state
         g.ent[i].f146 = crate::mc1::mobs::PLAYER_TARGET;
         g.ent[i].f63 = 0;
-        let near = ctx_at(0x4100, 0x4000, 300); // 256 away, avatar
-        let drained0 = g.mc2_player_drain.0;
+        let near = ctx_at(&mut g, 0x4100, 0x4000, 300); // 256 away, avatar
+        let drained0 = g.mc2_player_drain[Hx::FIRST].0;
         g.m26_tick(i, &near);
         assert_eq!(g.ent[i].tick70, 210, "in-range avatar: stay draining");
-        assert!(g.mc2_player_drain.0 > drained0, "the drain landed");
+        assert!(
+            g.mc2_player_drain[Hx::FIRST].0 > drained0,
+            "the drain landed"
+        );
         // Far target: the one authentic exit.
-        let far = ctx_at(0x4000u16.wrapping_add(0x7000), 0x4000, 300);
+        let far = ctx_at(&mut g, 0x4000u16.wrapping_add(0x7000), 0x4000, 300);
         g.ent[i].f63 = 0;
         g.m26_tick(i, &far);
         assert_eq!(g.ent[i].tick70, 209, "out of range: back to approach");
@@ -16984,7 +17921,7 @@ mod tests {
             e.class64 = 10;
             e.model65 = 39;
         }
-        let ctx = ctx_at(0x4000, 0x4000, 300);
+        let ctx = ctx_at(&mut g, 0x4000, 0x4000, 300);
         let bolt = |g: &mut Gen, act: u8| {
             let i = g.new_event().unwrap();
             let e = &mut g.ent[i];
@@ -17078,7 +18015,7 @@ mod tests {
         // Precondition (and the cone/convention calibration): with
         // both alive the distance-dominated scorer takes the nearer.
         assert_eq!(
-            g.mc2_aim_scan(&probe, None),
+            g.mc2_aim_scan(&probe, &[]),
             Some(near as u16),
             "both live: the nearer sphere wins on score"
         );
@@ -17093,7 +18030,7 @@ mod tests {
             e.flags |= 0x400;
         }
         assert_eq!(
-            g.mc2_aim_scan(&probe, None),
+            g.mc2_aim_scan(&probe, &[]),
             Some(near as u16),
             "the walk re-asks model/owner/awake only — a sphere freed \
              mid-tick is still the best candidate"
@@ -17158,7 +18095,7 @@ mod tests {
         }
         g.rebuild_wiz_chain(); // the tick-top case-3 sweep
         // ...and the human twice as far, straight past it.
-        let ctx = ctx_at(0x4000, 0x4000 - 80, 0);
+        let ctx = ctx_at(&mut g, 0x4000, 0x4000 - 80, 0);
 
         assert_eq!(
             g.mc2_wizard_scan(creature, &ctx, false),
@@ -17223,7 +18160,7 @@ mod tests {
     /// the pair itself is dirty on `field:10,0:z`, a family the law
     /// never touches. Measured both ways before falling back here.
     ///
-    /// Non-vacuous: drop the `ctx.pdead` term and the scan returns the
+    /// Non-vacuous: drop the `view.dead` term and the scan returns the
     /// corpse.
     #[test]
     fn a_dead_wizard_is_not_in_the_tick_top_class_3_roster() {
@@ -17253,7 +18190,7 @@ mod tests {
 
         // The human stands NEARER, at 40. Alive, it wins outright —
         // the scorer is nearest-in-cone.
-        let mut ctx = ctx_at(0x4000, 0x4000 - 40, 0);
+        let ctx = ctx_at(&mut g, 0x4000, 0x4000 - 40, 0);
         assert_eq!(
             g.mc2_wizard_scan(creature, &ctx, false),
             Some(crate::mc1::mobs::PLAYER_TARGET),
@@ -17262,7 +18199,7 @@ mod tests {
 
         // Dead, retail's sweep never linked it, so the scan cannot see
         // it however near it stands — and the FAR wizard wins.
-        ctx.pdead = true;
+        g.view_mut(ctx.phx).dead = true;
         assert_eq!(
             g.mc2_wizard_scan(creature, &ctx, false),
             Some(far as u16),
@@ -17356,7 +18293,7 @@ mod tests {
         }
         g.rebuild_wiz_chain();
         g.ent[dying].act_life = -500; // …knocked dead mid-tick
-        let ctx = ctx_at(0x4000, 0x4000 - 4000, 0); // human far out of range
+        let ctx = ctx_at(&mut g, 0x4000, 0x4000 - 4000, 0); // human far out of range
         assert_eq!(
             g.mc2_class3_scan(creature, &ctx),
             Some(dying as u16),
@@ -17435,13 +18372,14 @@ mod tests {
             e.y = 0x4000;
             e.act_life = 1;
         }
-        let ctx = ctx_at(0x4000, 0x4000, 0);
-        assert_eq!(g.mc2_mobilize.0, 0, "no latch before the stamp");
+        let ctx = ctx_at(&mut g, 0x4000, 0x4000, 0);
+        assert_eq!(g.mc2_mobilize[Hx::FIRST].0, 0, "no latch before the stamp");
 
         g.mc2_debuff_stamp_tick(stamp, &ctx);
 
         assert_eq!(
-            g.mc2_mobilize.0, 1,
+            g.mc2_mobilize[Hx::FIRST].0,
+            1,
             "the stamp itself latches the mirror — a creature dispatching \
              later in this same walk must read it, as it does off retail's \
              single str_164 storage"
@@ -17449,7 +18387,8 @@ mod tests {
         // The ext still gets its hit through the queue: the mirror is a
         // read window, not a second owner of the counter/decay.
         assert_eq!(
-            g.mc2_debuffs.stun, 1,
+            g.mc2_debuffs[Hx::FIRST].stun,
+            1,
             "and the drain still arms the flight ext's own counter"
         );
     }
@@ -17494,11 +18433,11 @@ mod tests {
             e.act_life = 1;
             stamp
         };
-        let ctx = ctx_at(0x4000, 0x4000, 0);
+        let ctx = ctx_at(&mut g, 0x4000, 0x4000, 0);
 
         // Level 0: the whole arm runs — one draw, and the mirror steps.
         let a = mk(&mut g);
-        assert_eq!(g.mc2_slow.0, 0, "an unwebbed wizard");
+        assert_eq!(g.mc2_slow[Hx::FIRST].0, 0, "an unwebbed wizard");
         g.mc2_debuff_stamp_tick(a, &ctx);
         // ⚠ `mc2_gen()` builds on `ChassisParams::MC1`, whose
         // `ent_rand_width` is `U32` — so the harness steps the
@@ -17509,8 +18448,16 @@ mod tests {
             g.ent[a].rand, 45595,
             "the level-0 landing takes its 9377x+9439 grunt draw"
         );
-        assert_eq!(g.mc2_slow.0, 1, "…and steps the level the next stamp reads");
-        assert_eq!(g.mc2_debuffs.slow, 1, "the ext's own hit is still queued");
+        assert_eq!(
+            g.mc2_slow[Hx::FIRST].0,
+            1,
+            "…and steps the level the next stamp reads"
+        );
+        assert_eq!(
+            g.mc2_debuffs[Hx::FIRST].slow,
+            1,
+            "the ext's own hit is still queued"
+        );
 
         // Level 1: retail's `test dh,dh / jne` skips the kick, the draw
         // and the sound — only the level and the 8-tick counter move.
@@ -17520,19 +18467,20 @@ mod tests {
             g.ent[b].rand, 45595,
             "a stamp on an ALREADY-slowed wizard steps NOTHING"
         );
-        assert_eq!(g.mc2_slow.0, 2, "but the level still climbs");
+        assert_eq!(g.mc2_slow[Hx::FIRST].0, 2, "but the level still climbs");
 
         // …and saturates at 3 (`if (moveSpeed < 3u)`, 0x5d6b4), so a
         // fourth landing leaves the mirror alone and still draws nothing.
         let c = mk(&mut g);
         g.mc2_debuff_stamp_tick(c, &ctx);
-        assert_eq!(g.mc2_slow.0, 3, "level 3 is the ceiling");
+        assert_eq!(g.mc2_slow[Hx::FIRST].0, 3, "level 3 is the ceiling");
         let d = mk(&mut g);
         g.mc2_debuff_stamp_tick(d, &ctx);
-        assert_eq!(g.mc2_slow.0, 3, "…and it holds there");
+        assert_eq!(g.mc2_slow[Hx::FIRST].0, 3, "…and it holds there");
         assert_eq!(g.ent[d].rand, 45595, "no draw at the ceiling either");
         assert_eq!(
-            g.mc2_debuffs.slow, 4,
+            g.mc2_debuffs[Hx::FIRST].slow,
+            4,
             "the counter refresh (`moveSpeedCounter = 8`, 0x5d74d) is \
              OUTSIDE the `< 3` gate, so every landing still queues a hit"
         );
@@ -17558,7 +18506,7 @@ mod tests {
         let spare = g.new_event().unwrap();
         while g.new_event().is_some() {}
         g.free.push(spare as u16); // exactly one slot: <= 1 = exhausted
-        let ctx = ctx_at(0x1000, 0x1000, 300);
+        let ctx = ctx_at(&mut g, 0x1000, 0x1000, 300);
         g.m25_tick(i, &ctx);
         assert_eq!(g.ent[i].tick70, 205, "the split advanced past itself");
         assert!(
@@ -17686,7 +18634,7 @@ mod tests {
             ChassisParams::MC1,
             crate::verbs::VerbSet::MC1,
         );
-        let ctx = ctx_at(0xC000, 0xC000, 0);
+        let ctx = ctx_at(&mut g, 0xC000, 0xC000, 0);
         let ring = g.spawn_effect(17, 0x4000, 0x4000, 0).expect("ring slot");
         {
             let e = &mut g.ent[ring];
@@ -17733,7 +18681,7 @@ mod tests {
             ChassisParams::MC1,
             crate::verbs::VerbSet::MC1,
         );
-        let ctx = ctx_at(0xC000, 0xC000, 0);
+        let ctx = ctx_at(&mut g, 0xC000, 0xC000, 0);
         // The attacker is another CREATURE, so the wizard-only arm of
         // the intake cannot be what keeps the mover still.
         let biter = g.spawn_creature(4, 0x5000, 0x5000, 0).expect("biter slot");
@@ -17791,7 +18739,7 @@ mod tests {
             ChassisParams::MC1,
             crate::verbs::VerbSet::MC1,
         );
-        let ctx = ctx_at(0xC000, 0xC000, 0);
+        let ctx = ctx_at(&mut g, 0xC000, 0xC000, 0);
         let bird = g.spawn_creature(1, 0x4000, 0x4000, 0).expect("m1 slot");
         g.ent[bird].tick70 = 6; // (1,0), the idle state
         let before = (g.ent[bird].x, g.ent[bird].y);
@@ -17846,7 +18794,7 @@ mod tests {
         // One tile away: inside any behavior row's v_28 keep-chasing
         // radius, so the cadence tick takes the growl arm and not the
         // drop-out to WANDER.
-        let ctx = ctx_at(0x4180, 0x4080, 0);
+        let ctx = ctx_at(&mut g, 0x4180, 0x4080, 0);
         // Mid-tile, because `flat_land` is dry and row 18's v_20 is
         // water-only: a kraken that crosses a tile boundary here fails
         // all four candidates and `creature_move` kills it (:21293).

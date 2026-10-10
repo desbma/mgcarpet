@@ -79,6 +79,7 @@ use super::behavior::BEHAVIOR;
 use super::morph::{auto_flat, dist2d};
 use super::sin_lut::SIN_DB750;
 use crate::engine::features::{Gen, tile};
+use crate::engine::world::Hx;
 use crate::mc1::combat::MailTarget;
 use crate::mc1::mobs::MobCtx;
 
@@ -427,6 +428,10 @@ impl Gen {
     /// [`F_TOSSED`] — and the test must read BOTH
     /// ([`flood_held_bit0_law`]).
     fn flood_shovable(&self, i: usize, j: usize) -> bool {
+        // (the human's linked (3,0) record: his own arm handles him: `flood_shove_human` at his seat)
+        if self.chain_human(j) {
+            return false;
+        }
         let e = &self.ent[j];
         let bit0 = if flood_held_bit0_law() { 1 } else { 0 };
         let held = e.flags & (F_TOSSED | bit0 | 0x20) != 0;
@@ -542,7 +547,7 @@ impl Gen {
                 self.ent[j].mail[0].1 = id;
             }
             // +1 per near-guaranteed kill (EF:29437).
-            if id == crate::mc1::mobs::PLAYER_TARGET {
+            if self.is_human_tag(id) {
                 self.mc2_cast_xp.0.push((id, 20, 1));
             }
         }
@@ -569,8 +574,10 @@ impl Gen {
         let cy = (ey.wrapping_add(128) >> 8) as u8;
         let mut steps = 0usize;
         let human_seat = !crate::engine::features::no_mc2_flood_human_seat();
-        let mut hp = (ctx.px, ctx.py, ctx.pz);
-        let mut hmoved = false;
+        // Every human seat's pose in this walk, and whether it moved.
+        let seats: Vec<Hx> = self.human_tag.ixs().collect();
+        let mut hps: Vec<(u16, u16, i16)> = seats.iter().map(|&h| self.seat_at(ctx, h)).collect();
+        let mut hmoved = vec![false; seats.len()];
         for row in 0..26u8 {
             let ty = cy.wrapping_sub(13).wrapping_add(row);
             for col in 0..26u8 {
@@ -592,16 +599,19 @@ impl Gen {
                 let mut headed = false;
                 'cell: loop {
                     let mut resume = 0usize;
-                    let mut seat_matched = false;
+                    let mut seat_matched: Option<usize> = None;
                     while j != 0 {
-                        if human_seat
-                            && seat_block != j
-                            && self.player_chain.next as usize == j
-                            && self.player_chain.cell == tile((hp.0 >> 8) as u8, (hp.1 >> 8) as u8)
-                        {
-                            resume = j;
-                            seat_matched = true;
-                            break;
+                        if human_seat && seat_block != j {
+                            let at = (0..seats.len()).find(|&k| {
+                                self.human_seat_at_for(seats[k], j)
+                                    && self.player_chain[seats[k]].cell
+                                        == tile((hps[k].0 >> 8) as u8, (hps[k].1 >> 8) as u8)
+                            });
+                            if let Some(k) = at {
+                                resume = j;
+                                seat_matched = Some(k);
+                                break;
+                            }
                         }
                         seat_block = usize::MAX;
                         let next = self.ent[j].next20 as usize;
@@ -749,28 +759,49 @@ impl Gen {
                     // ── THE HUMAN'S VISIT ── at his seat (`resume`), or as
                     // the TAIL of the chain the cursor is on when his seat
                     // is that tail (`next == 0`) or is not a live seat.
-                    let htile = tile((hp.0 >> 8) as u8, (hp.1 >> 8) as u8);
-                    let seat_live = self.player_chain.cell == htile;
-                    if resume != 0
-                        || (!seat_matched
-                            && !headed
-                            && cur == htile
-                            && (!seat_live || self.player_chain.next == 0))
-                    {
-                        self.flood_shove_human(i, &mut hp, &mut hmoved);
+                    // The seat met (`resume`), else every seat whose own
+                    // seat is this chain's tail, in seat order.
+                    let visits: Vec<usize> = match seat_matched {
+                        Some(k) => vec![k],
+                        None => (0..seats.len())
+                            .filter(|&k| {
+                                let hx = seats[k];
+                                let htile = tile((hps[k].0 >> 8) as u8, (hps[k].1 >> 8) as u8);
+                                let seat_live = self.player_chain[hx].cell == htile;
+                                !headed
+                                    && cur == htile
+                                    && (!seat_live || self.human_seat_is_tail(hx))
+                            })
+                            .collect(),
+                    };
+                    let mut rewalk = None;
+                    for k in visits {
+                        let hx = seats[k];
+                        let htile = tile((hps[k].0 >> 8) as u8, (hps[k].1 >> 8) as u8);
+                        let (hp, moved) = (&mut hps[k], &mut hmoved[k]);
+                        self.flood_shove_human(i, hx, hp, moved);
+                        let hp = hps[k];
                         // `CopyEntityPosition_57CF0` (0x5e592) relinks
                         // HIM: a new tile makes him its chain head, and the
                         // cursor (0x5e5e6) carries on down THAT chain from
                         // the head he displaced.
-                        self.player_relink(hp.0, hp.1);
+                        self.player_relink(hx, hp.0, hp.1);
                         let ntile = tile((hp.0 >> 8) as u8, (hp.1 >> 8) as u8);
-                        if ntile != htile && flood_chain_rewalk_law() {
-                            cur = ntile;
-                            headed = true;
-                            j = self.map_entity[ntile] as usize;
-                            seat_block = j;
-                            continue 'cell;
+                        if ntile != htile && flood_chain_rewalk_law() && rewalk.is_none() {
+                            rewalk = Some(ntile);
                         }
+                    }
+                    if let Some(ntile) = rewalk {
+                        cur = ntile;
+                        headed = true;
+                        j = self.map_entity[ntile] as usize;
+                        // (His linked record now heads that chain; the
+                        // cursor reads HIS `+20`, the head he displaced.)
+                        if self.chain_human(j) {
+                            j = self.ent[j].next20 as usize;
+                        }
+                        seat_block = j;
+                        continue 'cell;
                     }
                     if resume != 0 {
                         seat_block = resume;
@@ -786,13 +817,18 @@ impl Gen {
             // Publish the accumulated delta. Several quakes in one walk
             // ADD (each one's `ctx` is the pose the previous ones left,
             // via the walk hook's re-adoption).
-            if hmoved {
-                let f = &mut self.player_flood_pull;
+            for (k, &hx) in seats.iter().enumerate() {
+                if !hmoved[k] {
+                    continue;
+                }
+                let hp = hps[k];
+                let (cx, cy, cz) = self.seat_at(ctx, hx);
+                let f = &mut self.player_flood_pull[hx];
                 f.armed = true;
                 f.fresh = true;
-                f.dx += hp.0.wrapping_sub(ctx.px) as i16 as i32;
-                f.dy += hp.1.wrapping_sub(ctx.py) as i16 as i32;
-                f.pull += ctx.pz as i32 - hp.2 as i32;
+                f.dx += hp.0.wrapping_sub(cx) as i16 as i32;
+                f.dy += hp.1.wrapping_sub(cy) as i16 as i32;
+                f.pull += cz as i32 - hp.2 as i32;
             }
             return;
         }
@@ -802,43 +838,46 @@ impl Gen {
         // `flood_shovable` already ports it; the special-cased human
         // arm was missing it): your OWN Gravity Well never pulls
         // you in, and can never roll the 32000 kill on your cast.
-        let pd = dist2d(ex, ey, ctx.px as i32, ctx.py as i32);
-        let pv5 = ctx.pz as i32 - refz;
-        if pd < 3328 && pv5 < 4096 && id != crate::mc1::mobs::PLAYER_TARGET {
-            if pd <= 32 || pv5 <= 96 {
-                if !crate::engine::features::no_mc2_flood_human_spin() {
-                    self.player_flood_pull.spin = true;
-                }
-                if self.ent_rand(i) % 7 == 0 {
-                    self.mail_write(MailTarget::Player, 0, 32000, id);
-                }
-            } else {
-                let mut v6 = (((3328 - pd) << 8) / 3328) << 7 >> 8;
-                v6 = v6.clamp(4, 128).min(pd);
-                let toward = Self::angle_between(ctx.px, ctx.py, ex, ey);
-                self.player_knock = (toward, v6 as i16);
-                // ⭐⭐ AND THE VERTICAL LEG, which the pool arm forty
-                // lines above has had since round 98. Retail runs ONE
-                // body for every victim (`sub_39B60`); its class-3
-                // model-0 arm is `predicted.z -= pull` + the stepped
-                // point's terrain floor. The human's out-of-pool seat
-                // means the horizontal rides `player_knock` and this
-                // rides its own one-shot, drained by the carpet's
-                // dispatch — the `player_hurl` transport.
-                //
-                // ⚠ The terrain floor is NOT carried here: the mover's
-                // own block-9 resolution raises anything below
-                // `ground + clearance` back to it, and that bound is
-                // STRICTLY ABOVE retail's bare `getTerrainAlt`, so the
-                // clamp is dominated on this seat.
-                if !no_mc2_flood_human_z_pull() {
-                    self.player_flood_pull = crate::engine::features::PlayerFloodPull {
-                        armed: true,
-                        pull: (48 * (((4096 - pv5) << 8) >> 12)) >> 8,
-                        bearing: toward,
-                        dist: v6 as i16,
-                        ..Default::default()
-                    };
+        for &hx in &seats {
+            let (spx, spy, spz) = self.seat_at(ctx, hx);
+            let pd = dist2d(ex, ey, spx as i32, spy as i32);
+            let pv5 = spz as i32 - refz;
+            if pd < 3328 && pv5 < 4096 && id != self.human_tag[hx].0 {
+                if pd <= 32 || pv5 <= 96 {
+                    if !crate::engine::features::no_mc2_flood_human_spin() {
+                        self.player_flood_pull[hx].spin = true;
+                    }
+                    if self.ent_rand(i) % 7 == 0 {
+                        self.mail_write(self.human_target(hx), 0, 32000, id);
+                    }
+                } else {
+                    let mut v6 = (((3328 - pd) << 8) / 3328) << 7 >> 8;
+                    v6 = v6.clamp(4, 128).min(pd);
+                    let toward = Self::angle_between(spx, spy, ex, ey);
+                    self.player_knock[hx] = (toward, v6 as i16);
+                    // ⭐⭐ AND THE VERTICAL LEG, which the pool arm forty
+                    // lines above has had since round 98. Retail runs ONE
+                    // body for every victim (`sub_39B60`); its class-3
+                    // model-0 arm is `predicted.z -= pull` + the stepped
+                    // point's terrain floor. The human's out-of-pool seat
+                    // means the horizontal rides `player_knock` and this
+                    // rides its own one-shot, drained by the carpet's
+                    // dispatch — the `player_hurl` transport.
+                    //
+                    // ⚠ The terrain floor is NOT carried here: the mover's
+                    // own block-9 resolution raises anything below
+                    // `ground + clearance` back to it, and that bound is
+                    // STRICTLY ABOVE retail's bare `getTerrainAlt`, so the
+                    // clamp is dominated on this seat.
+                    if !no_mc2_flood_human_z_pull() {
+                        self.player_flood_pull[hx] = crate::engine::features::PlayerFloodPull {
+                            armed: true,
+                            pull: (48 * (((4096 - pv5) << 8) >> 12)) >> 8,
+                            bearing: toward,
+                            dist: v6 as i16,
+                            ..Default::default()
+                        };
+                    }
                 }
             }
         }
@@ -852,12 +891,12 @@ impl Gen {
     /// (`NETHERW.EXE` 0x5e4ef..0x5e592): `MoveEntity_57FA0` toward the
     /// quake, `z -= pull`, floored at the stepped point's
     /// `getTerrainAlt`, written to `predictedAxis` and the record.
-    fn flood_shove_human(&mut self, i: usize, hp: &mut (u16, u16, i16), moved: &mut bool) {
+    fn flood_shove_human(&mut self, i: usize, hx: Hx, hp: &mut (u16, u16, i16), moved: &mut bool) {
         let (ex, ey, id, refz) = {
             let e = &self.ent[i];
             (e.x, e.y, e.id24, e.f44 as i32)
         };
-        if id == crate::mc1::mobs::PLAYER_TARGET {
+        if id == self.human_tag[hx].0 {
             return;
         }
         let pd = dist2d(ex, ey, hp.0 as i32, hp.1 as i32);
@@ -869,10 +908,10 @@ impl Gen {
             // `sub_3A200`'s class-3 model-0 arm (0x5ea49..0x5ea62),
             // ahead of the roll: `pitch = pitch_acc = 512`.
             if !crate::engine::features::no_mc2_flood_human_spin() {
-                self.player_flood_pull.spin = true;
+                self.player_flood_pull[hx].spin = true;
             }
             if self.ent_rand(i) % 7 == 0 {
-                self.mail_write(MailTarget::Player, 0, 32000, id);
+                self.mail_write(self.human_target(hx), 0, 32000, id);
             }
             return;
         }
@@ -961,7 +1000,7 @@ impl Gen {
         }
         // +2 per grabbed CASTLE (EF:29374 `v8 += 2`; buildings do
         // NOT count).
-        if castles_hit != 0 && id == crate::mc1::mobs::PLAYER_TARGET {
+        if castles_hit != 0 && self.is_human_tag(id) {
             self.mc2_cast_xp.0.push((id, 20, 2 * castles_hit));
         }
         let cx = (self.ent[i].x.wrapping_add(128) >> 8) as u8;
@@ -1339,6 +1378,7 @@ impl Gen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::world::Hx;
 
     /// Flat 100-height MC2 world — enough for the quake's own pass:
     /// the human arm runs AFTER the 26x26 map-chain walk and reads
@@ -1369,16 +1409,15 @@ mod tests {
         )
     }
 
-    fn flood_ctx(px: u16, py: u16, pz: i16) -> MobCtx {
+    fn flood_ctx(g: &mut crate::engine::features::Gen, px: u16, py: u16, pz: i16) -> MobCtx {
+        *g.view_mut(crate::engine::world::Hx::FIRST) = crate::engine::features::SeatView {
+            x: px,
+            y: py,
+            z: pz,
+            ..Default::default()
+        };
         MobCtx {
-            px,
-            py,
-            pz,
-            pyaw: 0,
-            pmana: 0,
-            pmana_max: 0,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: crate::patches::WorldPatches::RETAIL,
             mc2_turn: 0,
@@ -1483,27 +1522,31 @@ mod tests {
         }
         // Inside the 3328 disc and above the 96 near-band, so the
         // graded arm is the SHOVE, not the 1-in-7 kill roll.
-        let ctx = flood_ctx((50 << 8) + 1000, 50 << 8, 110 + 500);
+        let ctx = flood_ctx(&mut g, (50 << 8) + 1000, 50 << 8, 110 + 500);
         g.flood_shove(q, &ctx);
 
         // The horizontal leg (ported since the quake landed): on the
         // knock register before the seat law, in the record-write delta
         // after it (`no_mc2_flood_human_seat`).
-        let bearing = Gen::angle_between(ctx.px, ctx.py, 50 << 8, 50 << 8);
+        let bearing = Gen::angle_between(g.view(ctx.phx).x, g.view(ctx.phx).y, 50 << 8, 50 << 8);
         if crate::engine::features::no_mc2_flood_human_seat() {
-            let (kb, dist) = g.player_knock;
+            let (kb, dist) = g.player_knock[Hx::FIRST];
             assert_eq!(dist, 89, "((3328-1000)<<8)/3328 <<7 >>8, clamped 4..128");
             assert_eq!(kb, bearing, "the knock bears TOWARD the fissure");
         } else {
-            assert_eq!(g.player_knock, (0, 0), "retail never writes moveBoost here");
-            let mut q = (ctx.px, ctx.py, ctx.pz);
+            assert_eq!(
+                g.player_knock[Hx::FIRST],
+                (0, 0),
+                "retail never writes moveBoost here"
+            );
+            let mut q = (g.view(ctx.phx).x, g.view(ctx.phx).y, g.view(ctx.phx).z);
             Gen::polar_step(&mut q, bearing, 0, 89);
-            let f = g.player_flood_pull;
+            let f = g.player_flood_pull[Hx::FIRST];
             assert_eq!(
                 (f.dx, f.dy),
                 (
-                    q.0.wrapping_sub(ctx.px) as i16 as i32,
-                    q.1.wrapping_sub(ctx.py) as i16 as i32
+                    q.0.wrapping_sub(g.view(ctx.phx).x) as i16 as i32,
+                    q.1.wrapping_sub(g.view(ctx.phx).y) as i16 as i32
                 ),
                 "one 89-step TOWARD the fissure"
             );
@@ -1511,7 +1554,7 @@ mod tests {
 
         // THE LAW: the vertical leg, armed on the same victim.
         // pv5 = 500, pull = (48 * (((4096 - 500) << 8) >> 12)) >> 8.
-        let pull = std::mem::take(&mut g.player_flood_pull);
+        let pull = std::mem::take(&mut g.player_flood_pull[Hx::FIRST]);
         assert!(pull.armed, "the human takes the quake's z pull");
         assert_eq!(pull.pull, (48 * (((4096 - 500) << 8) >> 12)) >> 8);
         assert_eq!(pull.pull, 42, "…and that is 42 at pv5 = 500");
@@ -1531,9 +1574,13 @@ mod tests {
             e.id24 = crate::mc1::mobs::PLAYER_TARGET;
         }
         g.flood_shove(q, &ctx);
-        assert_eq!(g.player_knock, (0, 0), "your own well never shoves you");
+        assert_eq!(
+            g.player_knock[Hx::FIRST],
+            (0, 0),
+            "your own well never shoves you"
+        );
         assert!(
-            !g.player_flood_pull.armed,
+            !g.player_flood_pull[Hx::FIRST].armed,
             "…and never pulls you down either"
         );
     }
@@ -1570,8 +1617,8 @@ mod tests {
         let (px, py, pz) = (29841u16, 11775u16, 2279i16);
         // His seat: the (empty) chain of his own tile, as the carpet's
         // walk slot seeds it.
-        g.player_relink(px, py);
-        let ctx = flood_ctx(px, py, pz);
+        g.player_relink(Hx::FIRST, px, py);
+        let ctx = flood_ctx(&mut g, px, py, pz);
         let shove = |g: &Gen, p: (u16, u16, i16)| {
             let d = dist2d(28800, 12160, p.0 as i32, p.1 as i32);
             let v5 = p.2 as i32 - 110;
@@ -1600,7 +1647,7 @@ mod tests {
             "rig: shove 2 stays in row 46 (no third visit)"
         );
         g.flood_shove(q, &ctx);
-        let f = g.player_flood_pull;
+        let f = g.player_flood_pull[Hx::FIRST];
         assert!(f.armed);
         let got = (
             px.wrapping_add(f.dx as u16),
@@ -1610,7 +1657,7 @@ mod tests {
         assert_ne!(got, once, "POSITIVE CONTROL: not the single pre-law shove");
         assert_eq!(got, twice, "two shoves, the second from the moved pose");
         assert_eq!(
-            g.player_chain.cell,
+            g.player_chain[Hx::FIRST].cell,
             tile((twice.0 >> 8) as u8, (twice.1 >> 8) as u8)
         );
     }
@@ -1643,18 +1690,20 @@ mod tests {
         g.t.height.fill(0);
         let q = quake(&mut g);
         let (px, py) = (29000u16, 12160u16);
-        g.player_relink(px, py);
-        g.flood_shove(q, &flood_ctx(px, py, 200));
-        let f = g.player_flood_pull;
+        g.player_relink(Hx::FIRST, px, py);
+        let rig_ctx = flood_ctx(&mut g, px, py, 200);
+        g.flood_shove(q, &rig_ctx);
+        let f = g.player_flood_pull[Hx::FIRST];
         assert!(f.spin, "the close band seizes the pitch");
         assert!(!f.armed, "…and moves nothing");
         // POSITIVE CONTROL: the same seat 500 above `refz` is shoved.
         let mut g = flood_gen();
         g.t.height.fill(0);
         let q = quake(&mut g);
-        g.player_relink(px, py);
-        g.flood_shove(q, &flood_ctx(px, py, 610));
-        let f = g.player_flood_pull;
+        g.player_relink(Hx::FIRST, px, py);
+        let rig_ctx = flood_ctx(&mut g, px, py, 610);
+        g.flood_shove(q, &rig_ctx);
+        let f = g.player_flood_pull[Hx::FIRST];
         assert!(f.armed && !f.spin, "the shove band never seizes");
 
         // The pooled wizard (a rival) and a creature, both in the band.
@@ -1675,7 +1724,8 @@ mod tests {
         };
         let w = victim(&mut g, 3, 0);
         let c = victim(&mut g, 5, 1);
-        g.flood_shove(q, &flood_ctx(0x8000, 0x8000, 5000));
+        let rig_ctx = flood_ctx(&mut g, 0x8000, 0x8000, 5000);
+        g.flood_shove(q, &rig_ctx);
         assert_ne!(
             g.ent[w].flags & F_TOSSED,
             0,
@@ -1739,9 +1789,9 @@ mod tests {
             q
         };
         // The human parks far outside the 26×26 sweep.
-        let ctx = flood_ctx(0xF000, 0xF000, 0);
 
         let mut g = flood_gen();
+        let ctx = flood_ctx(&mut g, 0xF000, 0xF000, 0);
         g.t.height.fill(0);
         let hidden = mark(&mut g, true);
         let q = rig(&mut g);
@@ -1753,6 +1803,7 @@ mod tests {
         );
 
         let mut g = flood_gen();
+        let ctx = flood_ctx(&mut g, 0xF000, 0xF000, 0);
         g.t.height.fill(0);
         let shown = mark(&mut g, false);
         let q = rig(&mut g);

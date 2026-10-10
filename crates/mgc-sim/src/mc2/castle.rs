@@ -28,6 +28,7 @@
 //! membership, no per-slot indices).
 
 use crate::engine::features::{Gen, tile};
+use crate::engine::world::Hx;
 
 /// `MGC_NO_CASTLE_SCRATCH_ARG=1` restores the pre-dig behaviour, where
 /// `sub_605E0`'s stage-removal operand was passed as a plain argument
@@ -770,8 +771,8 @@ impl Gen {
             // = 4): retail latches it for ANY owner (EF:61752); ours
             // is a single player-side HUD latch (deliberate; per-owner
             // records await a rival defense-AI consumer).
-            if self.ent[i].id24 == crate::mc1::mobs::PLAYER_TARGET {
-                self.castle_alert = 4;
+            if let Some(hx) = self.hx_of_tag(self.ent[i].id24) {
+                self.castle_alert[hx] = 4;
             }
         }
         // word_0x80_128 == own id (EF:61753): the UPGRADE request —
@@ -870,7 +871,7 @@ impl Gen {
         if let Some(team) = self.owner_team(own) {
             self.castle_reg[team as usize] = i as u16;
         }
-        if own == crate::mc1::mobs::PLAYER_TARGET {
+        if self.is_human_tag(own) {
             self.mc2_cast_xp.0.push((own, 2, 1));
         }
     }
@@ -2310,8 +2311,8 @@ impl Gen {
             self.ent[i].act_life -= amt as i32;
             // Retail sets byte_0x197_407 for ANY owner (EF:61947);
             // ours is the player-side HUD latch (deliberate).
-            if self.ent[i].id24 == crate::mc1::mobs::PLAYER_TARGET {
-                self.balloon_alert = 4;
+            if let Some(hx) = self.hx_of_tag(self.ent[i].id24) {
+                self.balloon_alert[hx] = 4;
             }
             if self.ent[i].act_life < 0 {
                 // `word_0x24_36` → `f38`; see
@@ -3134,7 +3135,9 @@ impl Gen {
     /// `byte_0x3E_62` → f63. `player` = the human pose (retail scans
     /// the pooled wizard; ours lives outside — None while dead).
     /// Dead or ownerless → despawn (retail's first two gates).
-    pub(crate) fn mc2_castle_piece_tick(&mut self, i: usize, player: Option<(u16, u16, i16)>) {
+    /// `player`: every LIVE human seat's pose (a dead one is off the
+    /// tick-top roster the piece scans).
+    pub(crate) fn mc2_castle_piece_tick(&mut self, i: usize, player: &[(Hx, (u16, u16, i16))]) {
         // `sub_3AF00` owns both hydra `v34` dwords as LOCALS and writes
         // them only on its case-3 scan tick — see
         // [`crate::engine::features::no_mc2_m27_v34_piece_transparent`].
@@ -3338,39 +3341,41 @@ impl Gen {
     /// ahead of whatever the chain there holds. (Only a RIVAL castle's
     /// piece can reach it at all — a piece never targets its own
     /// owner.)
-    fn mc2_piece_scan(&self, i: usize, player: Option<(u16, u16, i16)>) -> Option<u16> {
+    fn mc2_piece_scan(&self, i: usize, player: &[(Hx, (u16, u16, i16))]) -> Option<u16> {
         // Ghost mode: retail turrets see through a cloak; the cheat's
         // own gate takes the human off the scan.
-        let player = if self.player_ghost.0 { None } else { player };
+        let player: &[(Hx, (u16, u16, i16))] = if self.player_ghost.0 { &[] } else { player };
         let (px, py, own) = {
             let e = &self.ent[i];
             (e.x, e.y, e.id24)
         };
         let tx = (px.wrapping_add(128) >> 8) as u8;
         let ty = (py.wrapping_add(128) >> 8) as u8;
-        let human = if own == crate::mc1::mobs::PLAYER_TARGET {
-            None
-        } else {
-            player.map(|(hx, hy, _)| {
+        // Every human seat but the piece's own owner, by his cell.
+        let human: Vec<(Hx, (u8, u8))> = player
+            .iter()
+            .filter(|&&(seat, _)| self.human_tag[seat].0 != own)
+            .map(|&(seat, (hx, hy, _))| {
                 // ⭐ THE CHAIN INDEX IS UNROUNDED. The centre above
                 // takes `sub_3AF00`'s own `+128` rounding; the
                 // human's CELL is the one `AddEventToMap_57D70`
                 // would have stamped for a pooled carpet — a plain
                 // `>> 8`. See [`no_mc2_piece_scan_chain_tile`].
-                if no_mc2_piece_scan_chain_tile() {
+                let cell = if no_mc2_piece_scan_chain_tile() {
                     (
                         (hx.wrapping_add(128) >> 8) as u8,
                         (hy.wrapping_add(128) >> 8) as u8,
                     )
                 } else {
                     ((hx >> 8) as u8, (hy >> 8) as u8)
-                }
+                };
+                (seat, cell)
             })
-        };
+            .collect();
         for (dx, dy) in self.ring_cells(3, 12) {
             let (gx, gy) = (tx.wrapping_add(dx), ty.wrapping_add(dy));
-            if human == Some((gx, gy)) {
-                return Some(crate::mc1::mobs::PLAYER_TARGET);
+            if let Some(&(seat, _)) = human.iter().find(|h| h.1 == (gx, gy)) {
+                return Some(self.human_tag[seat].0);
             }
             let mut j = self.map_entity[tile(gx, gy)] as usize;
             while j != 0 {
@@ -3379,7 +3384,8 @@ impl Gen {
                 // ⚠ NO REAP TEST — EF:30355-84 asks class, model and
                 // the owner word and nothing else, and a soft-killed
                 // record keeps its tile link until the tick-top reaper.
-                if j != i && e.id24 != own {
+                // (the human's linked (3,0) record: his own arm handles him: the head-of-cell arm above)
+                if j != i && e.id24 != own && !self.chain_human(j) {
                     let hostile = match e.class64 {
                         3 => e.model65 <= 1 || e.model65 == 3,
                         // ⭐⭐ THE OWN-PARENT ALLIANCE EXEMPTION
@@ -3408,26 +3414,29 @@ impl Gen {
     /// the latched target, map the mode to (spell, tier), launch via
     /// the shared `sub_6DCA0` dispatch aimed dead-on (no lead), and
     /// step the burst/recoil bookkeeping.
-    fn mc2_piece_fire(&mut self, i: usize, player: Option<(u16, u16, i16)>) {
+    fn mc2_piece_fire(&mut self, i: usize, player: &[(Hx, (u16, u16, i16))]) {
         let tgt = self.ent[i].f28;
         // Target gone/dead (EF:30253-57) → re-dwell.
         let tpos: Option<(u16, u16, i16)> = if tgt == 0 {
             None
-        } else if tgt == crate::mc1::mobs::PLAYER_TARGET {
+        } else if let Some(seat) = self.hx_of_tag(tgt) {
             // ⭐ THE `sub_65580` RAISE IS NOT POOL-ONLY — IT LIFTS THE
             // HUMAN TOO (the RESIDUAL below, now paid).
             // `MGC_NO_MC2_PIECE_HUMAN_RAISE=1` for A/B.
-            player.map(|(hx, hy, hz)| {
-                (
-                    hx,
-                    hy,
-                    if no_mc2_piece_human_raise() {
-                        hz
-                    } else {
-                        hz.wrapping_add(crate::mc1::combat::PLAYER_HH as i16)
-                    },
-                )
-            })
+            player
+                .iter()
+                .find(|p| p.0 == seat)
+                .map(|&(_, (hx, hy, hz))| {
+                    (
+                        hx,
+                        hy,
+                        if no_mc2_piece_human_raise() {
+                            hz
+                        } else {
+                            hz.wrapping_add(crate::mc1::combat::PLAYER_HH as i16)
+                        },
+                    )
+                })
         } else {
             let e = &self.ent[tgt as usize];
             // ⭐ THE AIM MEASURES THE TARGET AT ITS Z-BOX CENTRE.
@@ -3527,8 +3536,9 @@ impl Gen {
                 let lift = self.ent[i].f78 as i16;
                 self.ent[p].z = self.ent[p].z.wrapping_add(lift);
                 // The local player's castle FIREBALL swaps to the
-                // star muzzle sprite 42 (EF:30290-91).
-                if own == crate::mc1::mobs::PLAYER_TARGET && spell == 0 {
+                // star muzzle sprite 42 (EF:30290-91) — `playerIndex`'s
+                // castle only, not every human's.
+                if own == self.human_tag[self.local_seat()].0 && spell == 0 {
                     let e = &mut self.ent[p];
                     e.type86 = 42;
                     e.frame88 = 0;
@@ -3698,7 +3708,7 @@ mod tests {
         // y=6686 -> cell 26 under BOTH readings, so x is the only
         // variable under test.
         assert_eq!(
-            g.mc2_piece_scan(i, Some((2005, 6686, 0))),
+            g.mc2_piece_scan(i, &[(crate::engine::world::Hx::FIRST, (2005, 6686, 0))]),
             None,
             "the human's chain cell is (7,26), outside the (3,12) disc — \
              the turret must not latch"
@@ -3708,7 +3718,7 @@ mod tests {
         // so the rig really can see the human and the assert above is
         // about the TILE, not about the scan being dead.
         assert_eq!(
-            g.mc2_piece_scan(i, Some((2100, 6686, 0))),
+            g.mc2_piece_scan(i, &[(crate::engine::world::Hx::FIRST, (2100, 6686, 0))]),
             Some(crate::mc1::mobs::PLAYER_TARGET),
             "cell (8,26) is in the disc under either reading"
         );
@@ -3801,7 +3811,7 @@ mod tests {
         g.mc2_allied.0.insert(j as u16, 91); // parentId_0x28_40 = the turret's owner
 
         assert_eq!(
-            g.mc2_piece_scan(i, None),
+            g.mc2_piece_scan(i, &[]),
             None,
             "a StageVar2==14 creature parented to the turret's own owner is not hostile"
         );
@@ -3811,7 +3821,7 @@ mod tests {
         // EXEMPTION and not about the record being unreachable.
         g.mc2_allied.0.remove(&(j as u16));
         assert_eq!(
-            g.mc2_piece_scan(i, None),
+            g.mc2_piece_scan(i, &[]),
             Some(j as u16),
             "with no alliance parent the same (5,16) is hostile"
         );
@@ -3913,14 +3923,7 @@ mod tests {
         g.mc2_balloon_tick(
             bal,
             &crate::mc1::mobs::MobCtx {
-                px: 0,
-                py: 0,
-                pz: 0,
-                pyaw: 0,
-                pmana: 0,
-                pmana_max: 0,
-                pdead: false,
-                pdead_top: false,
+                phx: crate::engine::world::Hx::FIRST,
                 strict: false,
                 patches: crate::patches::WorldPatches::RETAIL,
                 mc2_turn: 0,
@@ -3997,14 +4000,7 @@ mod tests {
         g.mc2_balloon_tick(
             bal,
             &crate::mc1::mobs::MobCtx {
-                px: 0,
-                py: 0,
-                pz: 0,
-                pyaw: 0,
-                pmana: 0,
-                pmana_max: 0,
-                pdead: false,
-                pdead_top: false,
+                phx: crate::engine::world::Hx::FIRST,
                 strict: false,
                 patches: crate::patches::WorldPatches::RETAIL,
                 mc2_turn: 0,
@@ -4287,7 +4283,7 @@ mod tests {
         let mut shot = None;
         for _ in 0..300 {
             g.ent[p].f63 = 0;
-            g.mc2_castle_piece_tick(p, None);
+            g.mc2_castle_piece_tick(p, &[]);
             shot = (1..g.ent.len()).find(|&j| g.ent[j].class64 == 9);
             if shot.is_some() {
                 break;
@@ -4340,7 +4336,7 @@ mod tests {
         let mut shot = None;
         for _ in 0..300 {
             g.ent[p].f63 = 0;
-            g.mc2_castle_piece_tick(p, None);
+            g.mc2_castle_piece_tick(p, &[]);
             shot = (1..g.ent.len()).find(|&j| g.ent[j].class64 == 9);
             if shot.is_some() {
                 break;
@@ -5418,14 +5414,7 @@ mod tests {
 
     fn w6_ctx(patches: crate::patches::WorldPatches, strict: bool) -> crate::mc1::mobs::MobCtx {
         crate::mc1::mobs::MobCtx {
-            px: 0,
-            py: 0,
-            pz: 0,
-            pyaw: 0,
-            pmana: 0,
-            pmana_max: 0,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict,
             patches,
             mc2_turn: 0,

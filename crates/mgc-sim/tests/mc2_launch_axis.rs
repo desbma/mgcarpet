@@ -32,6 +32,7 @@
 //!
 //! Self-skips without baked mc2 data (game data is optional).
 
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
 use mgc_sim::ids::GameId;
@@ -124,12 +125,12 @@ fn the_basic_possession_bolt_carries_the_launch_aim_point_and_the_ctor_payload()
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w);
     let pose = pose_at(&w, cx, cy);
 
     // Possession tier 0 = the BASIC bolt, `sub_69900`'s (9,1).
-    w.mc2_select_spell(1, 0, 0);
+    w.mc2_select_spell(Hx::FIRST, 1, 0, 0);
     w.tick(
         pose,
         PlayerCommand {
@@ -247,13 +248,13 @@ fn the_terrain_tail_arms_aim_4096_at_pitch_zero_and_snap_the_z_to_the_ground() {
         eprintln!("skipping: level-000 has no terrain");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let (cx, cy) = open_spot(&w);
     let pose = pose_at(&w, cx, cy);
 
     // Spell 20 = GRAVITY WELL (`sub_6C3E0`), the `(9,22)` carrier —
     // the witness's own arm.
-    w.mc2_select_spell(20, 0, 0);
+    w.mc2_select_spell(Hx::FIRST, 20, 0, 0);
     let mut slot = None;
     for _ in 0..8 {
         w.tick(

@@ -24,6 +24,7 @@
 //! drops the cloak/immunity. `--patch` arms `mc1_pack_speed_restore`
 //! (the fix this probe measured); `--dump-model M` lists that model's
 //! leader chains at every census.
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
 use mgc_sim::ids::GameId;
@@ -203,7 +204,7 @@ fn main() {
     let baked = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../baked");
     let mut w = build_world(&baked, &game, level, awake);
     if !flag("--no-ghost") {
-        w.set_ghost(true);
+        w.set_ghost(Hx::FIRST, true);
         w.set_invincible(true);
     }
     // `--patch`: the `mc1_pack_speed_restore` arm (default = retail).

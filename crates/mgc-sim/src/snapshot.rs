@@ -161,7 +161,13 @@ const MAGIC: u32 = 0x5343_474D;
 /// 29: `Gen::human_seat` — the wizard seat the human flies (0 in
 ///     every retail single-player world; a nonzero seat makes seat 0
 ///     a rival). Joins the Gen stream after `mc1_balloon_reg`.
-pub const SNAPSHOT_VERSION: u32 = 29;
+/// 30: EVERY HUMAN SEAT (multiplayer stage 3, slice 5c). The world's
+///     identity gains its seat count, and every per-seat lane — the
+///     flight tier here, the `Player` block, the books, the per-seat
+///     Gen registers — is written once per seat, field by field in
+///     seat order. A one-seat stream differs from 29 only by that
+///     count.
+pub const SNAPSHOT_VERSION: u32 = 30;
 
 /// Why a snapshot could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -596,16 +602,36 @@ impl Simulation {
         }
 
         w.put(tick);
-        w.put(flyer);
-        w.put(thrust_model);
-        w.put(altitude_model);
-        w.put(carpet);
-        w.put(carpet_mc2);
-        w.put(accel_was_active);
-        w.put(turn_rate);
-        w.put(aim_lead);
-        w.put(lift_desired);
-        w.put(broll);
+        for hx in flyer.ixs() {
+            w.put(&flyer[hx]);
+        }
+        for hx in thrust_model.ixs() {
+            w.put(&thrust_model[hx]);
+        }
+        for hx in altitude_model.ixs() {
+            w.put(&altitude_model[hx]);
+        }
+        for hx in carpet.ixs() {
+            w.put(&carpet[hx]);
+        }
+        for hx in carpet_mc2.ixs() {
+            w.put(&carpet_mc2[hx]);
+        }
+        for hx in accel_was_active.ixs() {
+            w.put(&accel_was_active[hx]);
+        }
+        for hx in turn_rate.ixs() {
+            w.put(&turn_rate[hx]);
+        }
+        for hx in aim_lead.ixs() {
+            w.put(&aim_lead[hx]);
+        }
+        for hx in lift_desired.ixs() {
+            w.put(&lift_desired[hx]);
+        }
+        for hx in broll.ixs() {
+            w.put(&broll[hx]);
+        }
         w.put(terrain_height);
         // The world is written inline rather than through `Snap`: it
         // has no `get` side (it cannot be built from the stream, only
@@ -657,16 +683,36 @@ impl Simulation {
         }
 
         self.tick = r.get()?;
-        self.flyer = r.get()?;
-        self.thrust_model = r.get()?;
-        self.altitude_model = r.get()?;
-        self.carpet = r.get()?;
-        self.carpet_mc2 = r.get()?;
-        self.accel_was_active = r.get()?;
-        self.turn_rate = r.get()?;
-        self.aim_lead = r.get()?;
-        self.lift_desired = r.get()?;
-        self.broll = r.get()?;
+        for hx in self.flyer.ixs() {
+            self.flyer[hx] = r.get()?;
+        }
+        for hx in self.thrust_model.ixs() {
+            self.thrust_model[hx] = r.get()?;
+        }
+        for hx in self.altitude_model.ixs() {
+            self.altitude_model[hx] = r.get()?;
+        }
+        for hx in self.carpet.ixs() {
+            self.carpet[hx] = r.get()?;
+        }
+        for hx in self.carpet_mc2.ixs() {
+            self.carpet_mc2[hx] = r.get()?;
+        }
+        for hx in self.accel_was_active.ixs() {
+            self.accel_was_active[hx] = r.get()?;
+        }
+        for hx in self.turn_rate.ixs() {
+            self.turn_rate[hx] = r.get()?;
+        }
+        for hx in self.aim_lead.ixs() {
+            self.aim_lead[hx] = r.get()?;
+        }
+        for hx in self.lift_desired.ixs() {
+            self.lift_desired[hx] = r.get()?;
+        }
+        for hx in self.broll.ixs() {
+            self.broll[hx] = r.get()?;
+        }
         self.terrain_height = r.get()?;
         // The world applies onto itself, keeping assets and retile.
         if r.get::<u8>()? != 0 {

@@ -13,6 +13,7 @@
 //! copy the printed array, and say in the commit that the behavior
 //! change was deliberate. Self-skips when the baked tree is absent.
 
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::World;
 use mgc_sim::{AltitudeModel, FlightInput, Simulation, ThrustModel};
@@ -53,9 +54,9 @@ fn build_world(root: &std::path::Path) -> World {
 
 fn sim(root: &std::path::Path, thrust: ThrustModel) -> Simulation {
     let mut s = Simulation::with_world(build_world(root));
-    s.thrust_model = thrust;
-    s.altitude_model = AltitudeModel::Faithful;
-    s.sync_carpet_from_flyer();
+    s.thrust_model[Hx::FIRST] = thrust;
+    s.altitude_model[Hx::FIRST] = AltitudeModel::Faithful;
+    s.sync_carpet_from_flyer(Hx::FIRST);
     s
 }
 
@@ -295,10 +296,28 @@ fn flight_tier_golden_state_hashes() {
     // `MGC_NO_MC1_NATIVE_HUMAN_RECORD=1` the previous eight return
     // byte-for-byte.
     const FAITHFUL: [u64; 4] = [
-        0xa37bf0ce9572b02b, // post-init
-        0x3109bd422f1ffcdc, // A: 40 ticks of forward thrust
-        0xef71bca5aa398c86, // B: 30 ticks of banked turn + strafe
-        0xd1edb03e84e5b325, // C: 40 ticks of coast
+        // ⭐ RE-PINNED 2026-10-10 for THE HUMAN'S SLOT TAG (multiplayer stage 1):
+        // the human's owner tag is his carpet record's pool slot (retail's
+        // convention), no longer the out-of-pool 0xFFFF, and the record's own
+        // `+24` carries it. `MGC_NO_HUMAN_SLOT_TAG=1` restores every old pin.
+        // ⭐ RE-PINNED 2026-10-10 for THE HUMAN'S CARPET RECORD (multiplayer
+        // stage 2): the record at his slot is a live (3,0) wizard record mirroring
+        // him, a member of the tick-top class-3 roster and linked into his tile
+        // chain — the record's own bytes and its neighbours' `+20/+22` are hashed.
+        // Behaviour-neutral by measurement: under `MGC_HASH_EXCLUDE_CARPET=1` (the
+        // record spliced out and blanked before hashing) every checkpoint is
+        // identical with the stage on and off. `MGC_NO_HUMAN_RECORD_MIRROR=1`
+        // restores every old pin.
+        0xd14880ecee6fe61c, // post-init
+        // Re-pinned 2026-10-13 (the first checkpoint holds) for MP STAGE 3 CH. 2:
+        // the human's (3,0) carpet record carries retail's probe-victim bit
+        // (`+16 & 8`, the recorded 0x20D) — `MGC_NO_HUMAN_POOL_VICTIM=1`
+        // reproduces the previous pins exactly, and under
+        // `MGC_HASH_EXCLUDE_CARPET=1` the values are identical switch on/off
+        // (the record's own word is the whole move).
+        0x7ebf776b60153d10, // A: 40 ticks of forward thrust
+        0x720b57b41c0b278e, // B: 30 ticks of banked turn + strafe
+        0xee3fe92ecee1ce1b, // C: 40 ticks of coast
     ];
     // Re-pinned for the enhanced-bank strafe fix (2026-07-27): the
     // proportional camera bank no longer gates off while strafing — it
@@ -322,10 +341,10 @@ fn flight_tier_golden_state_hashes() {
     // the duel grip, the carpet LCG — and the integer carpet is the
     // authority. FAITHFUL holds byte-for-byte, as does the corpus.
     const ENHANCED: [u64; 4] = [
-        0xaa7db5a0faa4bb22, // post-init
-        0xdc4f67b3a55f9730, // A
-        0x23a3b46417e2241d, // B
-        0x66d0f688639ac536, // C
+        0x137e22e1378e0059, // post-init
+        0xde98342437355850, // A
+        0xfe33e52b93fbf054, // B
+        0x29d824e4dd882961, // C
     ];
     assert_eq!(
         (faithful, enhanced),
@@ -349,7 +368,7 @@ fn hash_sees_the_carpet_when_the_world_cannot() {
     let base = sim(&root, ThrustModel::Mc1);
 
     let mut moving = sim(&root, ThrustModel::Mc1);
-    moving.carpet.act_speed = 80;
+    moving.carpet[Hx::FIRST].act_speed = 80;
     assert_eq!(
         base.world.as_ref().unwrap().state_hash(),
         moving.world.as_ref().unwrap().state_hash(),
@@ -362,7 +381,7 @@ fn hash_sees_the_carpet_when_the_world_cannot() {
     );
 
     let mut aimed = sim(&root, ThrustModel::Mc1);
-    aimed.carpet.aim_pitch = 200;
+    aimed.carpet[Hx::FIRST].aim_pitch = 200;
     assert_ne!(
         base.state_hash(),
         aimed.state_hash(),
@@ -370,9 +389,9 @@ fn hash_sees_the_carpet_when_the_world_cannot() {
     );
 
     let mut drifting = sim(&root, ThrustModel::Enhanced);
-    drifting.flyer.vx = 1.0;
+    drifting.flyer[Hx::FIRST].vx = 1.0;
     let mut still = sim(&root, ThrustModel::Enhanced);
-    still.flyer.vx = 0.0;
+    still.flyer[Hx::FIRST].vx = 0.0;
     assert_ne!(
         still.state_hash(),
         drifting.state_hash(),
@@ -382,7 +401,7 @@ fn hash_sees_the_carpet_when_the_world_cannot() {
     // Sign-of-zero must not alias: the float fields hash by bit
     // pattern, not by value.
     let mut neg_zero = sim(&root, ThrustModel::Enhanced);
-    neg_zero.flyer.vx = -0.0;
+    neg_zero.flyer[Hx::FIRST].vx = -0.0;
     assert_ne!(
         still.state_hash(),
         neg_zero.state_hash(),
@@ -423,7 +442,7 @@ fn hash_sees_the_model_selectors() {
     );
 
     let mut lifted = sim(&root, ThrustModel::Mc1);
-    lifted.altitude_model = AltitudeModel::ExtendedLift;
+    lifted.altitude_model[Hx::FIRST] = AltitudeModel::ExtendedLift;
     assert_ne!(
         faithful.state_hash(),
         lifted.state_hash(),

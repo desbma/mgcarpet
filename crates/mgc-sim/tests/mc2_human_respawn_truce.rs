@@ -65,6 +65,7 @@
 //! Self-skips without baked mc2 data (game data is optional).
 
 use mgc_formats::LevelPackage;
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::World;
 use mgc_sim::ids::GameId;
@@ -197,11 +198,11 @@ fn the_human_respawn_raises_every_rival_hate_toward_colour_zero() {
 
     // Kill the human and ride the death fall out — `player_dead()`
     // only latches once the corpse lands and `sub_5C950` can run.
-    sim.world.as_mut().unwrap().debug_kill_player();
+    sim.world.as_mut().unwrap().debug_kill_player(Hx::FIRST);
     let mut landed = false;
     for _ in 0..4000 {
         sim.step(&FlightInput::default());
-        if sim.world.as_ref().unwrap().player_dead() {
+        if sim.world.as_ref().unwrap().player_dead(Hx::FIRST) {
             landed = true;
             break;
         }
@@ -215,7 +216,7 @@ fn the_human_respawn_raises_every_rival_hate_toward_colour_zero() {
         ..FlightInput::default()
     });
     assert!(
-        !sim.world.as_ref().unwrap().player_dead(),
+        !sim.world.as_ref().unwrap().player_dead(Hx::FIRST),
         "the respawn key revived the human"
     );
 

@@ -2,6 +2,7 @@
 //! dbg032chain, then park and report per-model altitude above ground
 //! and dispersal — identifying which entities fly/spread.
 
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
 use std::collections::HashSet;
@@ -51,7 +52,7 @@ fn main() {
                 PlayerPose::from_tiles(x, alt, z, 0.0, 0.0, 0.0),
                 PlayerCommand::default(),
             );
-            w.take_teleport();
+            w.take_teleport(Hx::FIRST);
         }
     }
 
@@ -63,13 +64,13 @@ fn main() {
             PlayerPose::from_tiles(x, alt, z, 0.0, 0.0, 0.0),
             PlayerCommand::default(),
         );
-        w.take_teleport();
+        w.take_teleport(Hx::FIRST);
     }
 
     // Per (class, model): count, altitude-above-ground stats, spread.
     use std::collections::BTreeMap;
     let mut groups: BTreeMap<(u8, u8), Vec<(f32, f32, f32, u16)>> = BTreeMap::new();
-    let poses = w.live_poses();
+    let poses = w.live_poses(Hx::FIRST);
     let (_, ev) = w.debug_pool();
     let states: BTreeMap<(u8, u8), Vec<u8>> = {
         let mut m: BTreeMap<(u8, u8), Vec<u8>> = BTreeMap::new();

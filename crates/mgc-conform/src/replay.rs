@@ -39,6 +39,7 @@ use mgc_formats::mgcr::{
     RetailWizardMc1, decode_retail_mc1, decode_retail_mc2,
 };
 use mgc_formats::recover::{self, consumed_knock};
+use mgc_sim::Hx;
 use mgc_sim::engine::world::conformance::{
     PinnedMc1, PinnedMc2, emit_pose_window, integer_pose, mc1_state_from_retail,
     mc2_state_from_retail, pose_all_mc1, pose_all_mc2, pose_lanes_mc1, pose_lanes_mc2, pose_window,
@@ -328,8 +329,8 @@ fn volcano_guard_probe(world: &mut World) {
 fn step_mc1(world: &mut World, ch: &mut Chain, inp: Mc1Input, cmd: PlayerCommand) {
     building_patches_probe(world);
     volcano_guard_probe(world);
-    let falling = world.player_falling();
-    let dead = world.player_dead();
+    let falling = world.player_falling(Hx::FIRST);
+    let dead = world.player_dead(Hx::FIRST);
     // Only the COMMAND handler stops at death (sub_46840 is skipped
     // from state 2 on): casts, thrust and strafe die with it, but the
     // STICK lives in the input pass and keeps feeding the filters all
@@ -359,7 +360,7 @@ fn step_mc1(world: &mut World, ch: &mut Chain, inp: Mc1Input, cmd: PlayerCommand
     } else {
         0.0
     };
-    world.thrust_cancel(thrust);
+    world.thrust_cancel(Hx::FIRST, thrust);
     // The Accelerate token writes the speed columns ITSELF at its
     // own walk slot (sub_56380 :65167-78) — a BELOW-carpet token's
     // mail is consumed by step_player_flight before the mover, an
@@ -378,7 +379,7 @@ fn step_mc1(world: &mut World, ch: &mut Chain, inp: Mc1Input, cmd: PlayerCommand
         mc2: None,
     };
     world.tick_flight(&mut drive, cmd);
-    if let Some(base) = world.take_speed_base() {
+    if let Some(base) = world.take_speed_base(Hx::FIRST) {
         ch.s.tgt_speed = base;
         ch.s.act_speed = base;
     }
@@ -392,7 +393,7 @@ fn step_mc1(world: &mut World, ch: &mut Chain, inp: Mc1Input, cmd: PlayerCommand
     // 90, 91, 92 straight through. A full `from_tiles` reset restarted
     // the counter and the LCG (retail 810782015, ours 0) and snapped
     // the speed to zero a tick early.
-    if let Some((x, z, alt)) = world.take_respawn() {
+    if let Some((x, z, alt)) = world.take_respawn(Hx::FIRST) {
         ch.s.x = (x.rem_euclid(256.0) * 256.0) as u16;
         ch.s.y = (z.rem_euclid(256.0) * 256.0) as u16;
         // ...AT THE SEAT'S OWN Z, not a tile above it. mc1l42 t=17398
@@ -408,14 +409,14 @@ fn step_mc1(world: &mut World, ch: &mut Chain, inp: Mc1Input, cmd: PlayerCommand
         ch.s.tgt_speed = 0;
         ch.s.strafe = 0;
     }
-    if let Some((x, z, alt)) = world.take_teleport() {
+    if let Some((x, z, alt)) = world.take_teleport(Hx::FIRST) {
         ch.s.x = (x.rem_euclid(256.0) * 256.0) as u16;
         ch.s.y = (z.rem_euclid(256.0) * 256.0) as u16;
         if let Some(alt) = alt {
             ch.s.z = (alt * 256.0) as i16;
         }
     }
-    if world.take_speed_zero() {
+    if world.take_speed_zero(Hx::FIRST) {
         ch.s.tgt_speed = 0;
     }
 }
@@ -439,9 +440,9 @@ fn book_cheat(world: &World, cheat: Option<recover::Cheat>, stats: &mut RStats) 
 fn step_mc2(world: &mut World, ch: &mut Chain, inp: Mc1Input, cmd: PlayerCommand) {
     building_patches_probe(world);
     volcano_guard_probe(world);
-    let falling = world.player_falling();
-    let dead = world.player_dead();
-    let end_seized = world.mc2_end_pose().is_some();
+    let falling = world.player_falling(Hx::FIRST);
+    let dead = world.player_dead(Hx::FIRST);
+    let end_seized = world.mc2_end_pose(Hx::FIRST).is_some();
     // ⭐ THE STICK OUTLIVES THE COMMAND HANDLER ON THE DEATH FALL —
     // MC2's `sub_5F380`/`sub_5D530` split is MC1's `sub_46840`/
     // `sub_455D0` split (see `step_mc1`), and this arm had asserted the
@@ -486,13 +487,13 @@ fn step_mc2(world: &mut World, ch: &mut Chain, inp: Mc1Input, cmd: PlayerCommand
     } else {
         0.0
     };
-    world.thrust_cancel(thrust);
+    world.thrust_cancel(Hx::FIRST, thrust);
     // The whole move — Accelerate restore edge, knock, debuff drain,
     // `sub_5D530`, the death fall and the grey-screen turn — runs
     // INSIDE the turn now, at the carpet's own walk slot, exactly as
     // the MC1 driver above does (`World::step_player_flight_mc2`).
     // The tick-head sample here is only the input gate and the row.
-    let over = world.accel_override();
+    let over = world.accel_override(Hx::FIRST);
     let mut drive = FlightDrive {
         propel: None,
         s: &mut ch.s,
@@ -511,11 +512,11 @@ fn step_mc2(world: &mut World, ch: &mut Chain, inp: Mc1Input, cmd: PlayerCommand
     // is recorded at this boundary but first MOVES the carpet next
     // tick. (Below-carpet tokens are consumed inside the walk, at the
     // carpet's own dispatch, and this take finds nothing.)
-    if let Some(base) = world.take_speed_base() {
+    if let Some(base) = world.take_speed_base(Hx::FIRST) {
         ch.s.tgt_speed = base;
         ch.s.act_speed = base;
     }
-    if let Some((x, z, alt)) = world.take_respawn() {
+    if let Some((x, z, alt)) = world.take_respawn(Hx::FIRST) {
         // ⭐ A RESPAWN MOVES THE CARPET, IT DOES NOT REBUILD IT — the
         // MC1 arm's law (`step_mc1`: position, then EXACTLY the target
         // speed and strafe cleared) one game over. Rebuilding through
@@ -531,14 +532,14 @@ fn step_mc2(world: &mut World, ch: &mut Chain, inp: Mc1Input, cmd: PlayerCommand
         ch.s.tgt_speed = 0;
         ch.s.strafe = 0;
     }
-    if let Some((x, z, alt)) = world.take_teleport() {
+    if let Some((x, z, alt)) = world.take_teleport(Hx::FIRST) {
         ch.s.x = (x.rem_euclid(256.0) * 256.0) as u16;
         ch.s.y = (z.rem_euclid(256.0) * 256.0) as u16;
         if let Some(alt) = alt {
             ch.s.z = (alt * 256.0) as i16;
         }
     }
-    if world.take_speed_zero() {
+    if world.take_speed_zero(Hx::FIRST) {
         ch.s.tgt_speed = 0;
     }
     // The ending sequence used to be mirrored onto the carpet HERE,
@@ -1389,7 +1390,7 @@ impl KnockTrace {
     /// Sample the armed knock BEFORE the driver steps the pair.
     fn arm(&mut self, world: &World) {
         if self.window.is_some() {
-            self.pre = world.debug_player_knock();
+            self.pre = world.debug_player_knock(Hx::FIRST);
         }
     }
 
@@ -1400,7 +1401,7 @@ impl KnockTrace {
         if pt < t0 || pt > t1 {
             return;
         }
-        let post = world.debug_player_knock();
+        let post = world.debug_player_knock(Hx::FIRST);
         println!(
             "KNOCK pair {pt}->{t}  port consumed=({},{}) armed=({},{})  \
              retail rec@{pt}=({},{}) @{t}=({},{})",
@@ -2587,7 +2588,11 @@ fn run_mc1(
                 // the corpus witnesses.
                 world.tick_paused();
                 if rec.equip_left.is_some() || rec.equip_right.is_some() {
-                    world.equip_hands(rec.equip_left.map(SpellId), rec.equip_right.map(SpellId));
+                    world.equip_hands(
+                        Hx::FIRST,
+                        rec.equip_left.map(SpellId),
+                        rec.equip_right.map(SpellId),
+                    );
                 }
                 stats.paused += 1;
             } else {
@@ -4250,8 +4255,9 @@ fn render_port_dump(
         };
         if slot == human_slot {
             println!(
-                "  ⚠ slot {slot} is the HUMAN CARPET: the port carries it out-of-pool, \
-                 so the port column below is the reserved hole, not the player"
+                "  ⚠ slot {slot} is the HUMAN CARPET: the port's column is the (3,0) \
+                 record MIRRORED from the out-of-pool flight state (pose, life, mana, \
+                 state, flag bits), not an independently simulated record"
             );
         }
         // The MC2 twin's law, same shape (see `render_port_dump_mc2`):
@@ -4408,8 +4414,9 @@ fn render_port_dump_mc2(
         };
         if slot == human_slot {
             println!(
-                "  ⚠ slot {slot} is the HUMAN CARPET: the port carries it out-of-pool, \
-                 so the port column below is the reserved hole, not the player"
+                "  ⚠ slot {slot} is the HUMAN CARPET: the port's column is the (3,0) \
+                 record MIRRORED from the out-of-pool flight state (pose, life, mana, \
+                 state, flag bits), not an independently simulated record"
             );
         }
         // ⭐⭐⭐ A CLASS-0 SLOT IS RESIDUE, AND RESIDUE IS NOT A

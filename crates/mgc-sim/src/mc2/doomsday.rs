@@ -58,7 +58,7 @@
 
 use crate::engine::features::{Gen, tile};
 use crate::engine::world::World;
-use crate::mc1::mobs::{MobCtx, PLAYER_TARGET};
+use crate::mc1::mobs::MobCtx;
 
 /// The devourable class-9 projectile SUBTYPES (EF:13545-63) — the
 /// pyramid is an anti-magic zone eating incoming spell projectiles;
@@ -500,9 +500,9 @@ impl Gen {
             return;
         }
         let yaw = self.ent[i].f30;
-        let bucket = ((yaw.wrapping_sub(ctx.pyaw) >> 3) & 0xF0) >> 4;
+        let bucket = ((yaw.wrapping_sub(self.seat_yaw(ctx, self.local_seat())) >> 3) & 0xF0) >> 4;
         if bucket <= 2 {
-            self.ent[i].f30 = ctx.pyaw.wrapping_add(384) & 0x7FF;
+            self.ent[i].f30 = self.seat_yaw(ctx, self.local_seat()).wrapping_add(384) & 0x7FF;
             return;
         }
         if bucket >= 0xD {
@@ -534,12 +534,17 @@ impl Gen {
             } else {
                 1536
             };
-            self.ent[i].f30 = ctx.pyaw.wrapping_add(snap) & 0x7FF;
+            self.ent[i].f30 = self.seat_yaw(ctx, self.local_seat()).wrapping_add(snap) & 0x7FF;
             return;
         }
         match self.ent[i].f69 {
             0 => {
-                self.ent[i].f34 = Self::angle_between(x, y, ctx.px, ctx.py);
+                self.ent[i].f34 = Self::angle_between(
+                    x,
+                    y,
+                    self.seat_at(ctx, self.local_seat()).0,
+                    self.seat_at(ctx, self.local_seat()).1,
+                );
             }
             2 => {
                 // ±512 alternating by frame parity, then hold (mode 1).
@@ -580,7 +585,7 @@ impl Gen {
                     ctx.mc2_turn.wrapping_add(1) & 1
                 };
                 let side = if parity == 0 { 512u16 } else { 1536 };
-                self.ent[i].f34 = ctx.pyaw.wrapping_add(side) & 0x7FF;
+                self.ent[i].f34 = self.seat_yaw(ctx, self.local_seat()).wrapping_add(side) & 0x7FF;
                 self.ent[i].f69 = 1;
             }
             3 => {
@@ -665,10 +670,11 @@ impl Gen {
     /// `sub_5EF70` is the avatar's danger poke; it is on all FOUR
     /// cases in retail, and the port had it on 8/9 only.
     pub(crate) fn mc2_pyramid_arm_tail(&mut self, p: usize) {
+        let hx = self.local_seat(); // `playerIndex`
         if !no_mc2_pyramid_proj_no_lock() {
             self.ent[p].f146 = 0;
         }
-        self.mc2_danger_poke(PLAYER_TARGET);
+        self.mc2_danger_poke(self.human_tag[hx].0);
     }
 }
 
@@ -729,8 +735,8 @@ impl World {
         // it without a camera.
         if self.g.ent[i].flags & 0x4000_0000 != 0 {
             let (ex, ey) = (self.g.ent[i].x, self.g.ent[i].y);
-            let dx = (ctx.px as i32 - ex as i32) as i16 as i32;
-            let dy = (ctx.py as i32 - ey as i32) as i16 as i32;
+            let dx = (self.g.seat_at(ctx, self.g.local_seat()).0 as i32 - ex as i32) as i16 as i32;
+            let dy = (self.g.seat_at(ctx, self.g.local_seat()).1 as i32 - ey as i32) as i16 as i32;
             if dx * dx + dy * dy < 0xA00i32.pow(2) {
                 self.g.ent[i].f44 |= 0x40;
             }
@@ -759,7 +765,7 @@ impl World {
                     self.g.ent[i].f44 = 8;
                     self.g.ent[i].f26 = 15;
                     self.g.ent[i].f46 = 22;
-                    self.g.ent[i].f146 = PLAYER_TARGET;
+                    self.g.ent[i].f146 = self.g.human_tag[ctx.phx].0;
                     self.mc2_doom_meter = 60;
                     self.g.mc2_pyramid_wipe(cx, cy, self.g.ent[i].id24);
                     fall = true;
@@ -789,8 +795,10 @@ impl World {
                     } else {
                         self.g.ent[i].f26 -= 1;
                         let (ex, ey) = (self.g.ent[i].x, self.g.ent[i].y);
-                        let dx = (ctx.px as i32 - ex as i32) as i16 as i32;
-                        let dy = (ctx.py as i32 - ey as i32) as i16 as i32;
+                        let dx = (self.g.seat_at(ctx, self.g.local_seat()).0 as i32 - ex as i32)
+                            as i16 as i32;
+                        let dy = (self.g.seat_at(ctx, self.g.local_seat()).1 as i32 - ey as i32)
+                            as i16 as i32;
                         let near = dx * dx + dy * dy < 0x2000i32.pow(2);
                         if near && self.g.ent[i].f26 <= 0 {
                             let d = self.g.ent_rand(i);
@@ -863,7 +871,7 @@ impl World {
                         self.g.ent[s].z = 0;
                         self.g.ent[s].max_life = 70;
                         self.g.ent[s].act_life = 70;
-                        self.g.ent[s].id24 = PLAYER_TARGET;
+                        self.g.ent[s].id24 = self.g.human_tag[ctx.phx].0;
                     }
                     fall = true;
                 }
@@ -969,7 +977,7 @@ impl World {
                         if let Some(d) = self.g.mc2_spawn_dome(x, y, z) {
                             self.g.ent[d].act_life = 32;
                             self.g.ent[d].max_life = 11;
-                            self.g.ent[d].id24 = PLAYER_TARGET;
+                            self.g.ent[d].id24 = self.g.human_tag[ctx.phx].0;
                             self.mc2_apocalypse = true;
                         }
                         // Retail leaves the doom meter AT 1200 here — no
@@ -1036,6 +1044,7 @@ impl World {
     /// Rebound would reflect the pyramid's shots, so it switches to
     /// the un-reboundable beam.
     fn mc2_pyramid_devour(&mut self, i: usize) -> bool {
+        let hx = self.local_seat(); // `playerIndex`: the castle cancel + rebound gate
         let (ex, ey, own) = {
             let e = &self.g.ent[i];
             (e.x, e.y, e.id24)
@@ -1061,7 +1070,7 @@ impl World {
                 // The castle-build projectile: bbox overlap between
                 // the pyramid's (5120,5120) box and the player's
                 // castle extents (else the projectile's own spot).
-                let (tx, ty, hx, hy) = match self.player_castle() {
+                let (tx, ty, hx, hy) = match self.seat_castle(self.local_seat()) {
                     Some(c) => {
                         let e = &self.g.ent[c];
                         (e.x, e.y, e.f80 as i32, e.f82 as i32)
@@ -1081,7 +1090,7 @@ impl World {
             if sub == 10 {
                 // Cancel the Castle spell (EF:13608-09; guarded —
                 // retail writes the entity-0 sentinel unguarded).
-                let m = self.mc2_book.ent[2] as usize;
+                let m = self.mc2_book[hx].ent[2] as usize;
                 if m != 0 {
                     self.g.ent[m].f26 = 0;
                 }
@@ -1115,7 +1124,7 @@ impl World {
         // there is **15** (the record's own @0x10 scratch), so the
         // port tripped bit 0 and carried 0x43 for the rest of the
         // take.
-        let m8 = self.mc2_book.ent[8] as usize;
+        let m8 = self.mc2_book[hx].ent[8] as usize;
         let rebound = m8 != 0 && {
             let e = &self.g.ent[m8];
             let at2e = if no_mc2_devour_rebound_at_2e() {
@@ -1181,8 +1190,8 @@ impl World {
             // The model-10 castle-build shot is measured against the
             // PLAYER'S CASTLE (EF:13580-88), everything else against
             // the projectile itself with the {5120, 5120} default.
-            let (tx, ty, hx, hy) = if sub == 10 {
-                match self.player_castle() {
+            let (tx, ty, half_x, half_y) = if sub == 10 {
+                match self.seat_castle(self.local_seat()) {
                     Some(c) => {
                         let e = &self.g.ent[c];
                         (e.x, e.y, e.f80 as i16 as i32, e.f82 as i16 as i32)
@@ -1196,11 +1205,12 @@ impl World {
             };
             let dx = ((tx.wrapping_sub(ax)) as i16 as i32).abs();
             let dy = ((ty.wrapping_sub(ay)) as i16 as i32).abs();
-            if dx >= sx + hx || dy >= sy + hy {
+            if dx >= sx + half_x || dy >= sy + half_y {
                 continue;
             }
             if sub == 10 {
-                let m = self.mc2_book.ent[2] as usize;
+                let hx = self.local_seat(); // the castle-build shot: `playerIndex`'s castle
+                let m = self.mc2_book[hx].ent[2] as usize;
                 if m != 0 {
                     self.g.ent[m].f26 = 0;
                 }
@@ -1303,8 +1313,9 @@ impl World {
                 // accumulates into a `uint32_t`: two i16 legs can sum
                 // to 2³¹ and the i32 form wrapped negative there.)
                 let (ex, ey) = (self.g.ent[i].x, self.g.ent[i].y);
-                let dx = (_ctx.px as i32 - ex as i32) as i16 as i64;
-                let dy = (_ctx.py as i32 - ey as i32) as i16 as i64;
+                let (px, py, _) = self.g.human_at(_ctx);
+                let dx = (px as i32 - ex as i32) as i16 as i64;
+                let dy = (py as i32 - ey as i32) as i16 as i64;
                 if dx * dx + dy * dy >= 0xA00i64.pow(2) {
                     self.g.ent[i].f44 &= !0x40;
                 } else {
@@ -1509,6 +1520,7 @@ impl World {
     /// along the pyramid yaw at z+768; creatures step 1792 further
     /// at the stride bearing (NOT from the raw center).
     fn mc2_pyramid_do_summon(&mut self, i: usize, ctx: &MobCtx) {
+        let hx = self.local_seat(); // `Entities[playerIndex]` (EF:13413)
         // ⭐⭐⭐ THE WHOLE BARRAGE — THE REPEAT-COUNT DECREMENT
         // INCLUDED — IS GATED ON THE HUMAN WIZARD'S POOL RECORD BEING
         // LIVE. `sub_21AB0` opens by loading `Entities[playerIndex]`
@@ -1538,7 +1550,7 @@ impl World {
         // the action's `case 9`, EF:12791), so this is the whole law.
         //
         // Our human lives outside the pool (and in conformance import
-        // its slot is a zeroed husk), so `ctx.pdead` — the same
+        // its slot is a zeroed husk), so `view.dead` — the same
         // `life_0x8 < 0` read every other follower/leader site takes
         // through the ctx — stands in for the pool read; the pyramid
         // is walked long before the carpet slot, so the mid-walk
@@ -1556,7 +1568,7 @@ impl World {
         // the hub on 214 and the ring on 17..70 (pair 45559->45560,
         // 139 field rows + one extra entity), and at t=45559 the
         // (10,1) death blast took 24 instead of 855.
-        if ctx.pdead && !no_mc2_pyramid_dead_player_gate() {
+        if self.g.seat_dead(ctx, hx) && !no_mc2_pyramid_dead_player_gate() {
             return;
         }
         if self.g.ent[i].f38 == 0 {
@@ -1567,7 +1579,7 @@ impl World {
             let e = &self.g.ent[i];
             (e.x, e.y, e.z, e.id24)
         };
-        let tpos = (ctx.px, ctx.py, ctx.pz);
+        let tpos = self.g.seat_at(ctx, hx);
         // The shared launch point (EF:13321-25).
         let mut lp = (ex, ey, ez);
         Gen::polar_step(&mut lp, self.g.ent[i].f30, 0, 640);
@@ -1582,7 +1594,7 @@ impl World {
                     self.g.ent[p].f68 = 10;
                     self.g.ent[p].f69 = 0;
                     self.g.ent[p].row156 = 62;
-                    self.g.mc2_arm_proj(p, i, PLAYER_TARGET, tpos);
+                    self.g.mc2_arm_proj(p, i, self.g.human_tag[hx].0, tpos);
                     self.g.mc2_pyramid_arm_tail(p);
                     self.g.snd(15, i);
                 }
@@ -1596,7 +1608,7 @@ impl World {
                     self.g.ent[p].f68 = 10;
                     self.g.ent[p].f69 = 23;
                     self.g.ent[p].row156 = 62;
-                    self.g.mc2_arm_proj(p, i, PLAYER_TARGET, tpos);
+                    self.g.mc2_arm_proj(p, i, self.g.human_tag[hx].0, tpos);
                     self.g.mc2_pyramid_arm_tail(p);
                     self.g.snd(23, i);
                 }
@@ -1630,7 +1642,7 @@ impl World {
                     // defaults — written LAST (m0 1→7, m21 169→175,
                     // m25 201→207, m19 153→159).
                     let e = &mut self.g.ent[s];
-                    e.f146 = PLAYER_TARGET;
+                    e.f146 = self.g.human_tag[hx].0;
                     e.id24 = own_id;
                     e.site_z = 17; // StageVar2_0x49_73
                     // `word_0x2E_46 = 250` (EF:13419) — the release
@@ -1695,9 +1707,14 @@ impl World {
                 // full-blast 1024).
                 let f = (self.g.ent[i].f52 as i32 - 80).clamp(10, 1024) as u16;
                 self.g.ent[i].f52 = f;
-                let away = Gen::angle_between(ex, ey, ctx.px, ctx.py);
+                let away = Gen::angle_between(
+                    ex,
+                    ey,
+                    self.g.seat_at(ctx, hx).0,
+                    self.g.seat_at(ctx, hx).1,
+                );
                 if no_mc2_doom_beam_oneshot() {
-                    self.g.player_knock = (away, f as i16);
+                    self.g.player_knock[hx] = (away, f as i16);
                 } else {
                     // The PRE-DIG route is the `else` arm: retail
                     // writes the player's POSITION here (EF:13444-55,
@@ -1708,7 +1725,7 @@ impl World {
                     // decayed −4/tick for twenty ticks past the burst.
                     // Consumed at the carpet's own walk slot — see
                     // `World::step_player_flight_mc2`.
-                    self.g.player_hurl = crate::engine::features::PlayerHurl {
+                    self.g.player_hurl[hx] = crate::engine::features::PlayerHurl {
                         armed: true,
                         bearing: away,
                         dist: f as i16,
@@ -1734,7 +1751,7 @@ impl World {
                         e.f44 = if sel == 8 { 20 } else { 6000 };
                         e.f71 = if sel == 8 { 3 } else { 10 };
                     }
-                    self.g.mc2_arm_proj(p, i, PLAYER_TARGET, tpos);
+                    self.g.mc2_arm_proj(p, i, self.g.human_tag[hx].0, tpos);
                     self.g.mc2_pyramid_arm_tail(p);
                     self.g.snd(15, i);
                 }
@@ -1747,6 +1764,7 @@ impl World {
     /// dies (model 10 = the pyramid spared; model 27's branch heads
     /// get the action-221 teardown instead).
     fn mc2_kill_all_creatures(&mut self) {
+        let hx = self.local_seat(); // `playerIndex`
         let mut hints = Vec::new();
         for (j, e) in self.g.ent.iter_mut().enumerate().skip(1) {
             if e.class64 != 5 || e.model65 == 10 {
@@ -1779,17 +1797,17 @@ impl World {
             }
             if e.model65 == 27 {
                 e.tick70 = 221;
-                e.f38 = PLAYER_TARGET;
+                e.f38 = self.g.human_tag[hx].0;
             } else {
                 e.act_life = -1;
-                e.f38 = PLAYER_TARGET;
+                e.f38 = self.g.human_tag[hx].0;
                 hints.push(j);
             }
         }
         // The victims' next inbox zeroes the latch; the stats ledger
         // keeps retail's PLAYER_TARGET stamp.
         for j in hints {
-            self.g.stats.0.hint(j, PLAYER_TARGET);
+            self.g.stats.0.hint(j, self.g.human_tag[hx].0);
         }
     }
 }

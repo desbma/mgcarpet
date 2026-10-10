@@ -732,10 +732,11 @@ impl ReplayDriver {
             w.terrain_dirty = true;
             w.entities_dirty = true;
             self.human_slot = report.human_slot;
-            sim.carpet = conformance::mc1_state_from_retail(&st, report.human_slot);
-            sim.carpet_mc2 = Mc2Ext::default();
-            sim.clear_accel_edge();
-            sim.sync_flyer_from_carpet();
+            sim.carpet[crate::LOCAL_HX] =
+                conformance::mc1_state_from_retail(&st, report.human_slot);
+            sim.carpet_mc2[crate::LOCAL_HX] = Mc2Ext::default();
+            sim.clear_accel_edge(crate::LOCAL_HX);
+            sim.sync_flyer_from_carpet(crate::LOCAL_HX);
             self.segments += 1;
             self.anchored_flag = true;
             self.update_ghost_mc1(&st);
@@ -779,7 +780,11 @@ impl ReplayDriver {
             let w = sim.world.as_mut().ok_or("no world")?;
             w.tick_paused();
             if rp.equip_left.is_some() || rp.equip_right.is_some() {
-                w.equip_hands(rp.equip_left.map(SpellId), rp.equip_right.map(SpellId));
+                w.equip_hands(
+                    crate::LOCAL_HX,
+                    rp.equip_left.map(SpellId),
+                    rp.equip_right.map(SpellId),
+                );
             }
             self.paused += 1;
             self.update_ghost_mc1(&st);
@@ -790,8 +795,8 @@ impl ReplayDriver {
             self.stick_unrec += 1;
         }
         // The dw==48 strafe-freeze emulation (law in RecoveredPair).
-        if rp.mc1_strafe_freeze() && sim.carpet.strafe != 0 {
-            sim.carpet.strafe += 4 * sim.carpet.strafe.signum();
+        if rp.mc1_strafe_freeze() && sim.carpet[crate::LOCAL_HX].strafe != 0 {
+            sim.carpet[crate::LOCAL_HX].strafe += 4 * sim.carpet[crate::LOCAL_HX].strafe.signum();
         }
         let input = FlightInput {
             stick_x: rp.stick().0,
@@ -870,10 +875,10 @@ impl ReplayDriver {
             let row = w.mc2_carpet_row();
             self.human_slot = report.human_slot;
             let (s, ext) = conformance::mc2_state_from_retail(&st, report.human_slot, row);
-            sim.carpet = s;
-            sim.carpet_mc2 = ext;
-            sim.clear_accel_edge();
-            sim.sync_flyer_from_carpet();
+            sim.carpet[crate::LOCAL_HX] = s;
+            sim.carpet_mc2[crate::LOCAL_HX] = ext;
+            sim.clear_accel_edge(crate::LOCAL_HX);
+            sim.sync_flyer_from_carpet(crate::LOCAL_HX);
             self.segments += 1;
             self.anchored_flag = true;
             self.update_ghost_mc2(&st);
@@ -957,7 +962,7 @@ impl ReplayDriver {
         let (all, extras) = match prev {
             RetailPrev::Mc1(st) => (
                 conformance::pose_all_mc1(
-                    &sim.carpet,
+                    &sim.carpet[crate::LOCAL_HX],
                     &st.ents[self.human_slot as usize],
                     &st.wizards[st.local_player as usize],
                 ),
@@ -967,8 +972,8 @@ impl ReplayDriver {
                 let e = &st.ents[self.human_slot as usize];
                 (
                     conformance::pose_all_mc2(
-                        &sim.carpet,
-                        &sim.carpet_mc2,
+                        &sim.carpet[crate::LOCAL_HX],
+                        &sim.carpet_mc2[crate::LOCAL_HX],
                         e,
                         &st.players[st.local_player as usize],
                     ),
@@ -1271,12 +1276,12 @@ fn apply_live_options(
                 .world
                 .as_mut()
                 .ok_or("live option needs a world")?
-                .set_dev_spells(b()?),
+                .set_dev_spells(crate::LOCAL_HX, b()?),
             "ghost" => sim
                 .world
                 .as_mut()
                 .ok_or("live option needs a world")?
-                .set_ghost(b()?),
+                .set_ghost(crate::LOCAL_HX, b()?),
             "inert" => sim
                 .world
                 .as_mut()
@@ -1286,18 +1291,24 @@ fn apply_live_options(
             // toggle; old port takes still carry it.
             "weightless" | "lift_unclamped" => sim.weightless = b()?,
             "thrust_model" => {
-                sim.set_thrust_model(match v.as_str() {
-                    Some("classic") => ThrustModel::Mc1,
-                    Some("enhanced") => ThrustModel::Enhanced,
-                    other => return Err(format!("unknown thrust_model {other:?}")),
-                });
+                sim.set_thrust_model(
+                    crate::LOCAL_HX,
+                    match v.as_str() {
+                        Some("classic") => ThrustModel::Mc1,
+                        Some("enhanced") => ThrustModel::Enhanced,
+                        other => return Err(format!("unknown thrust_model {other:?}")),
+                    },
+                );
             }
             "altitude_model" => {
-                sim.set_altitude_model(match v.as_str() {
-                    Some("classic") => AltitudeModel::Faithful,
-                    Some("enhanced") => AltitudeModel::ExtendedLift,
-                    other => return Err(format!("unknown altitude_model {other:?}")),
-                });
+                sim.set_altitude_model(
+                    crate::LOCAL_HX,
+                    match v.as_str() {
+                        Some("classic") => AltitudeModel::Faithful,
+                        Some("enhanced") => AltitudeModel::ExtendedLift,
+                        other => return Err(format!("unknown altitude_model {other:?}")),
+                    },
+                );
             }
             other => {
                 return Err(format!(
@@ -1341,11 +1352,11 @@ pub fn replay_check(
     let w = level.world.take().ok_or("level built no world")?;
     let mut sim = Simulation::with_world(w);
     let (thrust, altitude) = file.models()?;
-    sim.thrust_model = thrust;
-    sim.altitude_model = altitude;
+    sim.thrust_model[crate::LOCAL_HX] = thrust;
+    sim.altitude_model[crate::LOCAL_HX] = altitude;
     if let Some(start) = level.start {
-        sim.flyer = start;
-        sim.sync_carpet_from_flyer();
+        sim.flyer[crate::LOCAL_HX] = start;
+        sim.sync_carpet_from_flyer(crate::LOCAL_HX);
     }
     if let Some(snap) = file.snapshot.take() {
         sim.restore(&snap).map_err(|e| format!("snapshot: {e}"))?;
@@ -1364,7 +1375,7 @@ pub fn replay_check(
         if census_path.is_some()
             && let Some(w) = sim.world.as_ref()
         {
-            for p in w.live_poses() {
+            for p in w.live_poses(crate::LOCAL_HX) {
                 if p.map_only {
                     continue;
                 }
@@ -1415,11 +1426,11 @@ pub fn replay_check(
         // HASHED — a take recorded windowed carries post-drain hashes,
         // so the headless check must drain on the same cadence or it
         // desyncs at t=1 on accumulated sounds alone.
-        let f = &sim.flyer;
+        let f = &sim.flyer[crate::LOCAL_HX];
         let pose =
             mgc_sim::engine::world::PlayerPose::from_tiles(f.x, f.y, f.z, f.yaw, f.pitch, 0.0);
         if let Some(w) = sim.world.as_mut() {
-            let _ = w.take_audio(pose);
+            let _ = w.take_audio(crate::LOCAL_HX, pose);
         }
     }
     println!("replay-check: {}", d.summary());
@@ -1497,8 +1508,8 @@ pub fn begin_replay_recording(
             mgc_sim::ids::GameId::Mc2 => "mc2",
         },
         level,
-        sim.thrust_model,
-        sim.altitude_model,
+        sim.thrust_model[crate::LOCAL_HX],
+        sim.altitude_model[crate::LOCAL_HX],
         pool_slots,
         awake_range,
         sim.world
@@ -1949,15 +1960,15 @@ mod tests {
     fn port_record_replay_roundtrip() {
         let path = std::env::temp_dir().join("mgcapp-port-roundtrip.mgcr");
         let mut a = Simulation::with_terrain(Vec::new());
-        a.thrust_model = ThrustModel::Mc1;
-        a.altitude_model = AltitudeModel::Faithful;
+        a.thrust_model[crate::LOCAL_HX] = ThrustModel::Mc1;
+        a.altitude_model[crate::LOCAL_HX] = AltitudeModel::Faithful;
         let mut rec = PortRecorder::begin(
             &path,
             &a,
             "mc1",
             0,
-            a.thrust_model,
-            a.altitude_model,
+            a.thrust_model[crate::LOCAL_HX],
+            a.altitude_model[crate::LOCAL_HX],
             None,
             None,
             ImportPin::default(),
@@ -1983,8 +1994,8 @@ mod tests {
         assert_eq!(file.source, ReplaySource::Port);
         let (thrust, altitude) = file.models().unwrap();
         let mut b = Simulation::with_terrain(Vec::new());
-        b.thrust_model = thrust;
-        b.altitude_model = altitude;
+        b.thrust_model[crate::LOCAL_HX] = thrust;
+        b.altitude_model[crate::LOCAL_HX] = altitude;
         b.restore(&file.snapshot.take().unwrap()).unwrap();
         let mut d = ReplayDriver::install(file, &mut b).unwrap();
         let mut steps = 0;
@@ -2102,8 +2113,8 @@ mod tests {
                 &a,
                 "mc1",
                 0,
-                a.thrust_model,
-                a.altitude_model,
+                a.thrust_model[crate::LOCAL_HX],
+                a.altitude_model[crate::LOCAL_HX],
                 pool,
                 awake,
                 ImportPin::default(),

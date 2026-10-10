@@ -716,13 +716,18 @@ impl ImportCheck {
                 }
             }
         }
-        // Retail's chain with the human spliced out — the port keeps
-        // the carpet out of the pool.
+        // Retail's chain with the human spliced out — unless the port
+        // links his (3,0) record into its chains too (the multiplayer
+        // stage 2), in which case he is graded like any member.
+        let port_links_human = {
+            let (pc, _) = self.world.player_chain_shadow();
+            human != 0 && self.world.map_chain_cell(pc).contains(&(human as u16))
+        };
         let chain_of = |head: u16| -> Vec<u16> {
             let mut out = Vec::new();
             let (mut cur, mut steps) = (head as usize, 0);
             while cur != 0 && cur < n && steps <= n {
-                if cur != human {
+                if cur != human || port_links_human {
                     out.push(cur as u16);
                 }
                 cur = pool.ents[cur].next as usize;

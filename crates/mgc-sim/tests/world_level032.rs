@@ -5,6 +5,7 @@
 //!
 //! Self-skips when the baked tree is absent.
 
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
 use std::path::PathBuf;
@@ -49,7 +50,7 @@ fn level_032_entry_portal_spawns_and_teleports() {
 
     // The portal exists at level start.
     let portals: Vec<_> = w
-        .live_things()
+        .live_things(Hx::FIRST)
         .into_iter()
         .filter(|t| t.class == 10 && t.model == 34)
         .collect();
@@ -68,7 +69,7 @@ fn level_032_entry_portal_spawns_and_teleports() {
         "portal re-ground must flag the pose refresh"
     );
     let pose = w
-        .live_poses()
+        .live_poses(Hx::FIRST)
         .into_iter()
         .find(|p| p.class == 10 && p.model == 34)
         .expect("portal pose");
@@ -85,7 +86,10 @@ fn level_032_entry_portal_spawns_and_teleports() {
         PlayerPose::from_tiles(11.5, ground + 0.5, 254.3, std::f32::consts::PI, 0.0, 0.0);
     for _ in 0..8 {
         w.tick(facing_away, PlayerCommand::default());
-        assert!(w.take_teleport().is_none(), "facing away must not teleport");
+        assert!(
+            w.take_teleport(Hx::FIRST).is_none(),
+            "facing away must not teleport"
+        );
     }
 
     // Flying INTO the vortex (facing north, toward it): teleported to
@@ -94,7 +98,7 @@ fn level_032_entry_portal_spawns_and_teleports() {
     let mut dest = None;
     for _ in 0..8 {
         w.tick(facing_portal, PlayerCommand::default());
-        if let Some(d) = w.take_teleport() {
+        if let Some(d) = w.take_teleport(Hx::FIRST) {
             dest = Some(d);
             break;
         }
@@ -118,7 +122,7 @@ fn level_032_entry_portal_spawns_and_teleports() {
     let mut again = None;
     for _ in 0..8 {
         w.tick(facing_portal, PlayerCommand::default());
-        if let Some(d) = w.take_teleport() {
+        if let Some(d) = w.take_teleport(Hx::FIRST) {
             again = Some(d);
             break;
         }

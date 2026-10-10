@@ -10,11 +10,14 @@
 //! guest addresses are stable, so the behavior-row pointer converts to
 //! a row index anchored on the human carpet's canonical row 7.
 //!
-//! The human player lives OUTSIDE the pool in this port, so the
-//! recorded carpet slot stays a reserved hole: its state routes to
-//! [`Player`]/`human_pose`, every pool field that references the
-//! carpet slot translates to [`PLAYER_TARGET`], and the projection
-//! synthesizes the carpet entity back at the recorded slot. The
+//! The human player's state lives OUTSIDE the pool in this port, so
+//! the recorded carpet slot stays a zeroed class-0 husk: its state
+//! routes to [`Player`]/`human_pose`, and the projection synthesizes
+//! the carpet entity back at the recorded slot. Pool fields that
+//! reference the carpet slot import VERBATIM — the slot IS the human's
+//! owner tag (`Gen::human_tag`, retail's convention); only under
+//! `MGC_NO_HUMAN_SLOT_TAG` do they translate to the old `0xFFFF`
+//! sentinel. The
 //! conformance runner drives the pose per tick (pin-the-human), so
 //! world fidelity verifies with zero dependence on input
 //! reconstruction.
@@ -25,10 +28,9 @@
 //! [`World::restore_planes`]), the retile LCG `pseudoRand`, and the
 //! volcano registers (`gamedata+36/38`).
 
-use super::{LifeState, PLAYER_LIFE_MAX, Player, PlayerPose, World};
+use super::{Hx, LifeState, PLAYER_LIFE_MAX, Player, PlayerPose, World};
 use crate::engine::features::{Ent, Planes};
 use crate::flight::{Mc1State, Mc2Ext, Mc2Row};
-use crate::mc1::mobs::PLAYER_TARGET;
 use crate::mc1::spells::{SPELL_COUNT, SpellId};
 use mgc_formats::mgcr::{
     ControlMc1, ControlMc2, EntObsMc1, EntObsMc2, FlightMc1, FlightMc2, ObsMc1, ObsMc2,
@@ -391,7 +393,8 @@ impl World {
     /// BEFORE the imported one) so a held button does not re-edge on
     /// every imported pair.
     pub fn set_prev_fire(&mut self, left: bool, right: bool) {
-        self.prev_fire = (left, right);
+        let hx = Hx::FIRST; // a take records one human
+        self.prev_fire[hx] = (left, right);
     }
 
     /// Arm the pose channel's mid-tick ground snapshot: the NEXT tick
@@ -427,6 +430,7 @@ impl World {
     /// column; leaves terrain planes alone (see
     /// [`World::restore_planes`]).
     pub fn retail_import_mc1(&mut self, st: &RetailMc1) -> Result<ImportReport, String> {
+        let hx = Hx::FIRST; // a take records one human
         // Replaying retail state means retail law exactly: deliberate
         // gameplay deviations (DEVIATIONS.md) switch off for this world.
         self.strict_retail = true;
@@ -452,28 +456,31 @@ impl World {
         // after the import sees the RECORDED carpet as its previous
         // position (retail pass order — the strict jar poll and its
         // kin read the carpet before its slot runs).
-        self.human_pose = (carpet.x, carpet.y, carpet.z);
-        self.human_pose_prev = self.human_pose;
+        self.set_human_pose(hx, (carpet.x, carpet.y, carpet.z));
+        self.human_pose_prev[hx] = self.human_pose(hx);
         // The wizard pass anchors at the recorded carpet slot (the
         // class-3 dispatch position, sub_45C90) — above the spell
         // tokens, which is the cast-phase law's whole ordering.
-        self.mc1_carpet_slot = human_slot;
+        self.mc1_carpet_slot[hx] = human_slot;
         // …and the Gen-level mirror the bucket[0] human-seat readers
         // consult ([`Gen::mc1_human_on_wiz_chain`]).
-        self.g.mc1_pinned = crate::engine::features::Mc1Pinned(human_slot);
+        self.g.mc1_pinned[hx] = crate::engine::features::Mc1Pinned(human_slot);
         // The cast-arm hand bits (+16 & 0x300, :55886-95) and the
         // carpet pose the token fires measure from (retail reads the
         // wizard entity's own fields at the token's walk position =
         // the closure's settled values).
-        self.hand_bits = carpet.flags & 0x300;
-        self.mc1_cast_pose = crate::engine::world::PlayerPose {
-            x: carpet.x,
-            y: carpet.y,
-            z: carpet.z,
-            heading: carpet.f30,
-            pitch: carpet.f32,
-            speed: carpet.f126,
-        };
+        self.set_human_hands(hx, carpet.flags & 0x300);
+        self.set_mc1_cast_pose(
+            hx,
+            crate::engine::world::PlayerPose {
+                x: carpet.x,
+                y: carpet.y,
+                z: carpet.z,
+                heading: carpet.f30,
+                pitch: carpet.f32,
+                speed: carpet.f126,
+            },
+        );
         // The human's acquisition list (`Type_160+532`) VERBATIM,
         // sentinels included: the entries are a phase-tagged union
         // (alive = pool slot, `<= 0` empty; dead = model, −1 empty —
@@ -481,12 +488,16 @@ impl World {
         // respawn regrant reads back (:54893-95). The old u16 clamp
         // folded −1 into 0 = fireball's model — the exact collision
         // the union is built around avoiding.
-        self.mc1_acq = std::array::from_fn(|i| wiz.spell_list.get(i).copied().unwrap_or(0));
+        self.mc1_acq[hx] = std::array::from_fn(|i| wiz.spell_list.get(i).copied().unwrap_or(0));
         // The carpet's Type_156 is the canonical `&unk_98F38[7]`
         // (retail's own load-fixup anchor) — derive the table base
         // from it instead of hardcoding a per-build guest address.
         let behavior_base = carpet.model_ptr.wrapping_sub(7 * 32);
-        let tr = |v: u16| if v == human_slot { PLAYER_TARGET } else { v };
+        // The recorded carpet slot IS the human's tag (identity unless
+        // `MGC_NO_HUMAN_SLOT_TAG`, which translates it to the sentinel).
+        self.g.set_human_tag_slot(Hx::FIRST, human_slot);
+        let ht = self.g.human_tag[hx].0;
+        let tr = move |v: u16| if v == human_slot { ht } else { v };
 
         let n = pool.min(st.ents.len());
         let mut active = 0usize;
@@ -515,6 +526,10 @@ impl World {
                 // Seed it or the landing throws the wrong offsets and
                 // over-draws the graded rng channel by 15.
                 self.g.ent[slot].rand = r.rand;
+                // …and its own tag (`Gen::set_human_tag_slot`).
+                if self.g.human_tag[hx].0 == human_slot {
+                    self.g.ent[slot].id24 = human_slot;
+                }
                 continue;
             }
             if r.class64 == 0 {
@@ -669,7 +684,9 @@ impl World {
             } else {
                 0
             };
-            self.g.player_chain = crate::engine::features::PlayerChain { cell, next };
+            self.g.player_chain[hx] = crate::engine::features::PlayerChain { cell, next };
+            // …and the record itself takes that seat in the chain.
+            self.g.seat_human_link(hx);
         }
 
         // Free stack: the LIVE recorded order, so port-side spawns land
@@ -802,30 +819,30 @@ impl World {
 
         // The human column: pool-entity state routes to Player, the
         // Type_160 tail to the Gen mirrors.
-        self.g.player_mail = carpet.mail.map(|(a, s)| (a, tr(s)));
-        self.g.player_knock = (wiz.knock_dir, wiz.knock_mag);
-        self.g.player_aggro = wiz.aggro;
-        self.g.player_danger = wiz.danger;
-        self.g.banked_houses = wiz.banked_houses;
-        self.g.castle_alert = wiz.castle_alert;
-        self.g.player_alert = wiz.player_alert;
-        self.g.balloon_alert = wiz.balloon_alert;
+        *self.g.pmail_mut(hx) = carpet.mail.map(|(a, s)| (a, tr(s)));
+        self.g.player_knock[hx] = (wiz.knock_dir, wiz.knock_mag);
+        self.g.player_aggro[hx] = wiz.aggro;
+        self.g.player_danger[hx] = wiz.danger;
+        self.g.banked_houses[hx] = wiz.banked_houses;
+        self.g.castle_alert[hx] = wiz.castle_alert;
+        self.g.player_alert[hx] = wiz.player_alert;
+        self.g.balloon_alert[hx] = wiz.balloon_alert;
         // The HUD alert cadence's clock and gate: the block's frame
         // counter as of THIS boundary (the parity the draw after the
         // next tick blinks on) and whether the panels are drawn at all
         // (view 0/3). See `World::mc1_alert_cadence`.
         self.mc1_frame = wiz.frame;
         self.mc1_hud_drawn = matches!(wiz.view, 0 | 3);
-        self.g.kills = wiz.kills;
-        self.g.shots = wiz.shots;
-        self.g.hits = wiz.hits;
-        self.g.player_invisible = carpet.flags & 0x20 != 0;
-        self.g.player_rebound = carpet.flags & 0x8000 != 0;
+        self.g.kills[hx] = wiz.kills;
+        self.g.shots[hx] = wiz.shots;
+        self.g.hits[hx] = wiz.hits;
+        self.g.player_invisible[hx] = carpet.flags & 0x20 != 0;
+        self.g.set_player_rebound(hx, carpet.flags & 0x8000 != 0);
         // The SHIELD bit (+17 0x40 — our 0x4000) rides the same
         // flags word: without it every pair's damage intake runs
         // unshielded (mc1l3 t=4596: retail life −112/mana −112 on a
         // 450 hit, the port −450/−0).
-        self.player.shield = carpet.flags & 0x4000 != 0;
+        self.set_human_shield(hx, carpet.flags & 0x4000 != 0);
         for i in 1..8 {
             self.g.rival_ents[i] = st.wizards[i].play_index;
             self.g.rival_wanted[i] = st.wizards[i].aggro;
@@ -1042,13 +1059,13 @@ impl World {
             death_owned[s] = dead && wiz.owned_slots[s] != 0;
             death_owned_blue[s] = wiz.blue[s] != 0;
         }
-        self.player = Player {
+        self.players[hx] = Player {
             // BIT-COPY, not a clamp (see the rival seed above): the
             // human corpse holds a wrapped-negative purse too
             // (mc1hwl0 t=23462: 0 − the shield quarter = 4294967196,
             // held 69 ticks to the respawn re-mint).
-            mana: carpet.f140 as u32,
-            mana_max: carpet.f136.max(0) as u32,
+            mana_reg: carpet.f140 as u32,
+            mana_max_reg: carpet.f136.max(0) as u32,
             // The pending regen amount (+132, applied-then-recomputed
             // by the wizard tick :55390/:55415-21 — the port keeps the
             // same one-tick pipeline). Left unseeded, every imported
@@ -1163,14 +1180,14 @@ impl World {
                 // pairs before it.
                 carpet.f132
             },
-            life: carpet.act_life,
+            life_reg: carpet.act_life,
             // The player's life state rides the carpet's TICK-HANDLER
             // byte +70 (`*(_BYTE*)(a1+70) = 3`, :55550) — +66 is
             // sClass (255 on the carpet, so the old read left every
             // dead player Alive-with-negative-life and re-ran the
             // whole death cascade each pair: the HW 33 rng over-draw
             // runs at t=21468.. were exactly this).
-            state: match carpet.f70 {
+            state_reg: match carpet.f70 {
                 2 => LifeState::Falling,
                 3 => LifeState::Dead,
                 _ => LifeState::Alive,
@@ -1234,15 +1251,21 @@ impl World {
             // a pair straddling a rate flip must inherit the stale
             // value (the castle-establish +5-then-+40 staircase).
             life_rate: wiz.life_rate as i32,
-            killer: tr(carpet.f38),
+            killer_reg: tr(carpet.f38),
             fall_speed: carpet.f46,
-            shield: carpet.flags & 0x4000 != 0,
-            invisible: carpet.flags & 0x20 != 0,
+            shield_reg: carpet.flags & 0x4000 != 0,
+            invisible_reg: carpet.flags & 0x20 != 0,
             rebound: carpet.flags & 0x8000 != 0,
             death_owned,
             death_owned_blue,
             ..Player::default()
         };
+        // The block import reset the global lanes it used to carry.
+        self.world_mana = 0;
+        self.lost = false;
+        // The vitals' home is the record once it exists (stage 3,
+        // channel 2): seat the imported registers onto it.
+        self.sync_vitals_to_record(hx);
 
         // The speed-token boost direction: retail keeps the live burst
         // in the token's +48 and the Type_160 speed override; the
@@ -1258,7 +1281,7 @@ impl World {
         // a RIVAL's pre-armed book token for the human's burst (HW l0
         // pre-arms Vodor's whole book: slot 476, model 2, f48=229 at
         // t=1) and the free run flew boosted from the seed.
-        self.player.accel = [(2usize, 1i8), (21, -1)]
+        self.players[hx].accel = [(2usize, 1i8), (21, -1)]
             .into_iter()
             .find_map(|(spell, dir)| {
                 let s = wiz.owned_slots[spell] as usize;
@@ -1272,7 +1295,7 @@ impl World {
         // speed token reads during pair N→N+1 (the pair never runs
         // the carpet dispatch that would recompute it). Unseeded, the
         // resisting-press cancel never fired in pair mode.
-        self.mc1_v14 = wiz.v14 != 0;
+        self.mc1_v14[hx] = wiz.v14 != 0;
 
         // Per-wizard cast-charge meters (Type_160 u8_326) — seeded
         // like the regen stall: unseeded, every bolt spawned inside a
@@ -1282,10 +1305,10 @@ impl World {
         }
         // World-level latches: cleared like retail's load discards its
         // mode block; the tick mailboxes must not leak across pairs.
-        self.human_pose = (carpet.x, carpet.y, carpet.z);
-        self.pending_teleport = None;
-        self.pending_teleport_slot = None;
-        self.pending_respawn = None;
+        self.set_human_pose(hx, (carpet.x, carpet.y, carpet.z));
+        self.pending_teleport[hx] = None;
+        self.pending_teleport_slot[hx] = None;
+        self.pending_respawn[hx] = None;
         self.pending_restart = false;
         // ⭐ THE DUEL LOCK IS IMPORTED STATE, NOT A TICK MAILBOX.
         // `Type_160` +314/+316/+318 (victim / counter / hold distance)
@@ -1296,7 +1319,7 @@ impl World {
         // retail was still dragging. mc1l48's duel on rival 712
         // (t=59119..59839, `duel_count` 200 -> 681) is 720 of that
         // slice's 2,230 pose pairs.
-        self.duel = if crate::engine::world::mc1_duel_yaw_drag_off() || wiz.duel_victim == 0 {
+        self.duel[hx] = if crate::engine::world::mc1_duel_yaw_drag_off() || wiz.duel_victim == 0 {
             None
         } else {
             Some((wiz.duel_victim, wiz.duel_count, wiz.duel_hold))
@@ -1316,14 +1339,14 @@ impl World {
         // lane / 37 takes). `MGC_NO_MC1_WIN_LATCH_IMPORT=1` restores
         // the unseeded pair.
         if no_mc1_win_latch_import() {
-            self.completed = false;
-            self.win_streak = 0;
+            self.completed[hx] = false;
+            self.win_streak[hx] = 0;
         } else {
-            self.completed = wiz.status & 2 != 0;
-            self.win_streak = wiz.win_streak;
+            self.completed[hx] = wiz.status & 2 != 0;
+            self.win_streak[hx] = wiz.win_streak;
         }
-        self.prev_fire = (false, false);
-        self.accel_veto = (false, false);
+        self.prev_fire[hx] = (false, false);
+        self.accel_veto[hx] = (false, false);
         self.rival_deaths.clear();
         self.notifications.clear();
         self.kill_tally = [[0; 8]; 8];
@@ -1372,6 +1395,7 @@ impl World {
     /// Sections rather than one blob because a byte offset into a
     /// 400 KB stream is not an answer; a section name is.
     pub fn debug_state_sections(&self) -> Vec<(&'static str, Vec<u8>)> {
+        let hx = Hx::FIRST; // a take records one human
         use crate::snapshot::Writer;
         let one = |f: &dyn Fn(&mut Writer)| {
             let mut w = Writer::new();
@@ -1390,21 +1414,21 @@ impl World {
             ("rand", one(&|w| w.put(&self.g.rand))),
             ("pseudo", one(&|w| w.put(&self.g.pseudo))),
             ("spawn_count", one(&|w| w.put(&self.g.spawn_count))),
-            ("player_mail", one(&|w| w.put(&self.g.player_mail))),
-            ("player_knock", one(&|w| w.put(&self.g.player_knock))),
-            ("player_aggro", one(&|w| w.put(&self.g.player_aggro))),
+            ("player_mail", one(&|w| w.put(&self.g.player_mail[hx]))),
+            ("player_knock", one(&|w| w.put(&self.g.player_knock[hx]))),
+            ("player_aggro", one(&|w| w.put(&self.g.player_aggro[hx]))),
             ("rival_wanted", one(&|w| w.put(&self.g.rival_wanted))),
             ("erupting", one(&|w| w.put(&self.g.erupting))),
             ("plume", one(&|w| w.put(&self.g.plume))),
             ("kills.shots.hits", {
                 let mut w = Writer::new();
-                w.put(&self.g.kills);
-                w.put(&self.g.shots);
-                w.put(&self.g.hits);
+                w.put(&self.g.kills[hx]);
+                w.put(&self.g.shots[hx]);
+                w.put(&self.g.hits[hx]);
                 w.into_buf()
             }),
-            ("player_danger", one(&|w| w.put(&self.g.player_danger))),
-            ("banked_houses", one(&|w| w.put(&self.g.banked_houses))),
+            ("player_danger", one(&|w| w.put(&self.g.player_danger[hx]))),
+            ("banked_houses", one(&|w| w.put(&self.g.banked_houses[hx]))),
             ("exhausted", one(&|w| w.put(&self.g.exhausted))),
             ("misfits", one(&|w| w.put(&self.g.misfits))),
             // The two wizard registers are maps, not `Snap` values —
@@ -1418,16 +1442,16 @@ impl World {
                 format!("{:?}", self.g.mc1_balloon_reg.0).into_bytes(),
             ),
             ("thing_table", one(&|w| w.put(&self.table))),
-            ("player", one(&|w| w.put(&self.player))),
+            ("player", one(&|w| w.put(&self.player_view(hx)))),
             ("rivals", one(&|w| w.put(&self.rivals))),
             ("kill_tally", one(&|w| w.put(&self.kill_tally))),
-            ("human_pose", one(&|w| w.put(&self.human_pose))),
+            ("human_pose", one(&|w| w.put(&self.human_pose(hx)))),
             ("rival_deaths", one(&|w| w.put(&self.rival_deaths))),
-            ("duel", one(&|w| w.put(&self.duel))),
-            ("mc1_ring", one(&|w| w.put(&self.mc1_ring))),
-            ("mc1_v14", one(&|w| w.put(&self.mc1_v14))),
-            ("prev_fire", one(&|w| w.put(&self.prev_fire))),
-            ("accel_veto", one(&|w| w.put(&self.accel_veto))),
+            ("duel", one(&|w| w.put(&self.duel[hx]))),
+            ("mc1_ring", one(&|w| w.put(&self.mc1_ring[hx]))),
+            ("mc1_v14", one(&|w| w.put(&self.mc1_v14[hx]))),
+            ("prev_fire", one(&|w| w.put(&self.prev_fire[hx]))),
+            ("accel_veto", one(&|w| w.put(&self.accel_veto[hx]))),
             ("win_pct", one(&|w| w.put(&self.win_pct))),
             ("placeholders", one(&|w| w.put(&self.placeholders))),
         ]
@@ -1491,6 +1515,7 @@ impl World {
     /// Eliminated rivals are omitted (the roster comparison owns that
     /// story).
     pub fn wiz_shadow_mc1(&self) -> Vec<WizShadowMc1> {
+        let hx = Hx::FIRST; // a take records one human
         let breg = |key: u16| -> Vec<i64> {
             let mut v: Vec<i64> = self
                 .g
@@ -1519,59 +1544,62 @@ impl World {
         // Retail's +314/+316/+318 duel triple; the port's register is
         // an Option that reads 0/0/0 released (the comparator skips
         // count/hold while retail's victim is 0 — those are stale).
-        let duel = self.duel.unwrap_or((0, 0, 0));
+        let duel = self.duel[hx].unwrap_or((0, 0, 0));
         let mut out = vec![WizShadowMc1 {
-            wiz: 0,
-            ent: PLAYER_TARGET,
+            wiz: self.g.human_seat(hx),
+            ent: self.g.human_tag[hx].0,
             scalars: vec![
-                ("charge", self.wiz_charge[0] as i64),
+                (
+                    "charge",
+                    self.wiz_charge[self.g.human_seat(hx) as usize] as i64,
+                ),
                 // Round 153's widening: the human's duel lock, the
                 // banked-share win streak, and the ESTABLISHED castle
-                // as the port's pool SCAN resolves it (`player_castle`)
+                // as the port's pool SCAN resolves it (`seat_castle`)
                 // against retail's stored +50 — the register itself is
                 // graded (`WizardMc1::castle`); this lane measures how
                 // often a scan-reader would see something else.
                 ("duel_victim", duel.0 as i64),
                 ("duel_count", duel.1 as i64),
                 ("duel_hold", duel.2 as i64),
-                ("win_streak", self.win_streak as i64),
-                ("castle_scan", self.player_castle().map_or(0, |c| c as i64)),
-                ("knock_dir", self.g.player_knock.0 as i64),
-                ("knock_mag", self.g.player_knock.1 as i64),
-                ("danger", self.g.player_danger as i64),
-                ("aggro", self.g.player_aggro as i64),
-                ("banked_houses", self.g.banked_houses as i64),
-                ("castle_alert", self.g.castle_alert as i64),
-                ("player_alert", self.g.player_alert as i64),
-                ("balloon_alert", self.g.balloon_alert as i64),
-                ("kills", self.g.kills as i64),
-                ("shots", self.g.shots as i64),
-                ("hits", self.g.hits as i64),
+                ("win_streak", self.win_streak[hx] as i64),
+                ("castle_scan", self.seat_castle(hx).map_or(0, |c| c as i64)),
+                ("knock_dir", self.g.player_knock[hx].0 as i64),
+                ("knock_mag", self.g.player_knock[hx].1 as i64),
+                ("danger", self.g.player_danger[hx] as i64),
+                ("aggro", self.g.player_aggro[hx] as i64),
+                ("banked_houses", self.g.banked_houses[hx] as i64),
+                ("castle_alert", self.g.castle_alert[hx] as i64),
+                ("player_alert", self.g.player_alert[hx] as i64),
+                ("balloon_alert", self.g.balloon_alert[hx] as i64),
+                ("kills", self.g.kills[hx] as i64),
+                ("shots", self.g.shots[hx] as i64),
+                ("hits", self.g.hits[hx] as i64),
                 // The regen/debit accumulator (carpet +132) — the
                 // lane every mana divergence rides one tick before
                 // the graded f140 moves.
-                ("mana_delta", self.player.mana_delta as i64),
+                ("mana_delta", self.players[hx].mana_delta as i64),
                 // The life-regen chain — rival-only through session
                 // 49's t=10097 `life` head (the same asymmetry as
                 // `acq`/`owned` below): the graded life lane shows
                 // the sum, these show the terms.
-                ("grace", self.player.grace as i64),
-                ("regen_stall", self.player.regen_delay as i64),
-                ("life_rate", self.player.life_rate as i64),
+                ("grace", self.players[hx].grace as i64),
+                ("regen_stall", self.players[hx].regen_delay as i64),
+                ("life_rate", self.players[hx].life_rate as i64),
             ],
             arrays: vec![
-                ("balloon_reg", breg(PLAYER_TARGET)),
-                ("guard_reg", greg(PLAYER_TARGET)),
+                ("balloon_reg", breg(self.g.human_tag[hx].0)),
+                ("guard_reg", greg(self.g.human_tag[hx].0)),
                 // The human's acquisition list + owned register were
                 // shadow-blind through session 48 (only RIVALS
                 // exported `acq`/`owned`) — the t=7993 stale-entry
                 // alias could only be seen by hand-dumping. 5th
                 // instrument-asymmetry occurrence; keep both sides
                 // exporting the same lanes.
-                ("acq", self.mc1_acq.iter().map(|&v| v as i64).collect()),
+                ("acq", self.mc1_acq[hx].iter().map(|&v| v as i64).collect()),
                 (
                     "owned",
-                    self.player.owned.iter().map(|&v| v as i64).collect(),
+                    self.players[hx].owned.iter().map(|&v| v as i64).collect(),
                 ),
             ],
         }];
@@ -1616,9 +1644,10 @@ impl World {
     /// (round 147's harness debt). Instrument-only: no sim path calls
     /// it, and it re-derives nothing — the values are retail's own.
     pub fn mc2_seed_book_progress(&mut self, levels: [u8; 26], xp_bank: [i32; 26], ring: [u8; 26]) {
-        self.mc2_book.levels = levels;
-        self.mc2_book.xp_bank = xp_bank;
-        self.mc2_book.ring = ring;
+        let hx = Hx::FIRST; // a take records one human
+        self.mc2_book[hx].levels = levels;
+        self.mc2_book[hx].xp_bank = xp_bank;
+        self.mc2_book[hx].ring = ring;
     }
 
     /// Every MC2 wizard's ungraded player-block/brain lanes, retail
@@ -1635,6 +1664,7 @@ impl World {
     /// Eliminated rivals are omitted (the roster comparison owns that
     /// story).
     pub fn wiz_shadow_mc2(&self) -> Vec<WizShadowMc2> {
+        let hx = Hx::FIRST; // a take records one human
         let book = |b: &crate::mc2::cast::Mc2Spellbook| -> Vec<(&'static str, Vec<i64>)> {
             vec![
                 ("spell_ent", b.ent.iter().map(|&v| v as i64).collect()),
@@ -1660,24 +1690,27 @@ impl World {
                 ("guards", reg(&self.g.mc1_guard_reg.0)),
             ]
         };
-        let duel = self.mc2_duel.unwrap_or((0, 0, 0));
-        let mut human_arrays = book(&self.mc2_book);
-        human_arrays.extend(regs(PLAYER_TARGET));
+        let duel = self.mc2_duel[hx].unwrap_or((0, 0, 0));
+        let mut human_arrays = book(&self.mc2_book[hx]);
+        human_arrays.extend(regs(self.g.human_tag[hx].0));
         let mut out = vec![WizShadowMc2 {
-            wiz: 0,
-            ent: PLAYER_TARGET,
+            wiz: self.g.human_seat(hx),
+            ent: self.g.human_tag[hx].0,
             scalars: vec![
-                ("charge", self.wiz_charge[0] as i64),
-                ("hand_left", self.mc2_book.left as i64),
-                ("hand_right", self.mc2_book.right as i64),
+                (
+                    "charge",
+                    self.wiz_charge[self.g.human_seat(hx) as usize] as i64,
+                ),
+                ("hand_left", self.mc2_book[hx].left as i64),
+                ("hand_right", self.mc2_book[hx].right as i64),
                 // Round 147's widening — the human's seated registers.
-                ("invuln", self.player.grace as i64),
-                ("regen_stall", self.player.regen_delay as i64),
-                ("life_regen", self.player.life_rate as i64),
-                ("knock_dir", self.g.player_knock.0 as i64),
-                ("knock_mag", self.g.player_knock.1 as i64),
-                ("wanted", self.g.player_aggro as i64),
-                ("recast_surcharge", self.mc2_recast_surcharge as i64),
+                ("invuln", self.players[hx].grace as i64),
+                ("regen_stall", self.players[hx].regen_delay as i64),
+                ("life_regen", self.players[hx].life_rate as i64),
+                ("knock_dir", self.g.player_knock[hx].0 as i64),
+                ("knock_mag", self.g.player_knock[hx].1 as i64),
+                ("wanted", self.g.player_aggro[hx] as i64),
+                ("recast_surcharge", self.mc2_recast_surcharge[hx] as i64),
                 ("duel_target", duel.0 as i64),
                 ("duel_hold", duel.1 as i64),
                 ("duel_tier", duel.2 as i64),
@@ -1830,7 +1863,7 @@ impl World {
             self.g.ent.get(slot as usize)?
         };
         let untr = |v: u16| -> i64 {
-            if v == PLAYER_TARGET {
+            if self.g.is_human_tag(v) {
                 human_slot as i64
             } else {
                 v as i64
@@ -1999,7 +2032,8 @@ impl World {
     /// The out-of-pool human's chain seat, `(cell, successor)` — see
     /// `features::PlayerChain`. `cell` is `usize::MAX` while unseeded.
     pub fn player_chain_shadow(&self) -> (usize, u16) {
-        (self.g.player_chain.cell, self.g.player_chain.next)
+        let hx = Hx::FIRST; // a take records one human
+        (self.g.player_chain[hx].cell, self.g.player_chain[hx].next)
     }
 
     /// One cell's whole tile chain in walk order, head first (the
@@ -2030,7 +2064,15 @@ impl World {
     /// of the pool here, so every link through his slot is taken past
     /// him. `links[slot] = (next, prev)`.
     pub fn install_captured_index(&mut self, heads: &[u16], links: &[(u16, u16)], human: u16) {
+        let hx = Hx::FIRST; // a take records one human
         let n = self.g.ent.len().min(links.len());
+        // Since the multiplayer stage 2 his (3,0) record is a chain
+        // member like retail's: take the captured words verbatim, his
+        // own included, and re-derive the seat from them.
+        let linked = crate::engine::features::human_tile_link()
+            && human != 0
+            && self.g.human_rec(hx) == human as usize;
+        let human = if linked { 0 } else { human };
         let past = |s: u16, back: bool| -> u16 {
             if s != 0 && s == human {
                 let l = links[human as usize];
@@ -2050,6 +2092,9 @@ impl World {
             }
             self.g.ent[s].next20 = past(links[s].0, false);
             self.g.ent[s].prev22 = past(links[s].1, true);
+        }
+        if linked {
+            self.g.rederive_player_chain(hx);
         }
     }
 
@@ -2125,7 +2170,7 @@ impl World {
         };
         let e = pool.get(slot as usize)?;
         let untr = |v: u16| -> i64 {
-            if v == PLAYER_TARGET {
+            if self.g.is_human_tag(v) {
                 human_slot as i64
             } else {
                 v as i64
@@ -2736,7 +2781,14 @@ impl World {
     }
 
     pub fn obs_project_mc1(&self, pin: &PinnedMc1) -> ObsMc1 {
-        let untr = |v: u16| if v == PLAYER_TARGET { pin.slot } else { v };
+        let hx = Hx::FIRST; // a take records one human
+        let untr = |v: u16| {
+            if v == self.g.human_tag[hx].0 {
+                pin.slot
+            } else {
+                v
+            }
+        };
         let mut entities: Vec<EntObsMc1> = Vec::new();
         for slot in 1..self.g.ent.len() as u16 {
             if slot == pin.slot {
@@ -2793,7 +2845,7 @@ impl World {
         // coincidence. The registers themselves stay untouched:
         // clearing them would lose what the respawn hands straight
         // back (mc1l42 t=17343 vs t=17397, the mirrored pair).
-        let corpse = self.player.state == LifeState::Dead;
+        let corpse = self.human_state(hx) == LifeState::Dead;
         let spell_u16 = |s: Option<SpellId>| -> Option<u16> {
             let s = s?;
             if corpse {
@@ -2814,12 +2866,12 @@ impl World {
                         self.g.rival_ents[i as usize]
                     },
                     hand_left: if localw {
-                        spell_u16(self.player.left)
+                        spell_u16(self.players[hx].left)
                     } else {
                         None
                     },
                     hand_right: if localw {
-                        spell_u16(self.player.right)
+                        spell_u16(self.players[hx].right)
                     } else {
                         None
                     },
@@ -2836,18 +2888,18 @@ impl World {
         let control: Vec<ControlMc1> = (0..8u16).map(zero_control).collect();
         let player = Some(PlayerJoinMc1 {
             carpet_slot: pin.slot,
-            life: self.player.life,
+            life: self.human_life(hx),
             max_life: PLAYER_LIFE_MAX as u32,
-            mana: self.player.mana,
-            mana_max: self.player.mana_max,
+            mana: self.human_mana(hx),
+            mana_max: self.human_mana_max(hx),
             x: pin.pose.x as f64 / 256.0,
             y: pin.pose.y as f64 / 256.0,
             z: pin.pose.z,
             heading: pin.pose.heading,
             pitch: pin.pose.pitch,
             speed: pin.pose.speed,
-            hand_left: spell_u16(self.player.left),
-            hand_right: spell_u16(self.player.right),
+            hand_left: spell_u16(self.players[hx].left),
+            hand_right: spell_u16(self.players[hx].right),
             castle: wizards[pin.local as usize].castle,
             flight: wizards[pin.local as usize].flight.clone(),
             control: Some(zero_control(pin.local)),
@@ -2934,10 +2986,11 @@ impl World {
     /// unreachable. ⭐ A LAW ON ONE CALL PATH IS NOT LANDED: the
     /// free-run half lives at the tick head in `World::tick_inner`.
     pub fn mc2_full_stop_import(&mut self, st: &RetailMc2, on: bool) {
+        let hx = Hx::FIRST; // a take records one human
         if !on || crate::engine::world::mc2_full_stop_kills_speed_off() {
             return;
         }
-        let m = self.mc2_book.ent[3] as usize;
+        let m = self.mc2_book[hx].ent[3] as usize;
         if m != 0 && m < self.g.ent.len() {
             self.g.ent[m].f26 = 0;
         }
@@ -2952,7 +3005,7 @@ impl World {
         let spell6_life = self.g.assets.spells.get(6).map_or([0i8; 3], |r| {
             [r.tiers[0].life, r.tiers[1].life, r.tiers[2].life]
         });
-        self.player.mana_delta =
+        self.players[hx].mana_delta =
             mc2_applied_mana_delta(st, ply, human_slot, carpet, spell6_life, true);
     }
 
@@ -3041,6 +3094,7 @@ impl World {
     /// the free stack, seed the globals and the human column, clear
     /// the cross-pair latches.
     pub fn retail_import_mc2(&mut self, st: &RetailMc2) -> Result<ImportReport, String> {
+        let hx = Hx::FIRST; // a take records one human
         // A SEEDED world is not a fresh level load: disarm the load's
         // last `sub_49F90` (see `no_mc2_load_free_rebuild`), which
         // retail ran long before the tick this closure was captured at.
@@ -3068,10 +3122,10 @@ impl World {
         // Pose registers from the closure (see the MC1 twin): the
         // first post-import tick's previous-position reads must see
         // the RECORDED carpet, not a stale pose.
-        self.human_pose = (carpet.x, carpet.y, carpet.z);
-        self.human_pose_prev = self.human_pose;
-        self.human_yaw = carpet.yaw as u16;
-        self.human_yaw_prev = self.human_yaw;
+        self.set_human_pose(hx, (carpet.x, carpet.y, carpet.z));
+        self.human_pose_prev[hx] = self.human_pose(hx);
+        self.set_human_heading(hx, carpet.yaw as u16);
+        self.human_yaw_prev[hx] = self.human_heading(hx);
         // ⭐ THE CARPET'S TARGET-YAW WORD @0x20, which the port has no
         // other source for: nothing in the port writes it (only
         // retail's wizard DEATH SPIN does, and the value then sits
@@ -3079,11 +3133,11 @@ impl World {
         // into every metamorph puppet the human casts. See
         // [`crate::engine::features::Gen::human_roll_0x20`] and
         // [`crate::engine::features::no_mc2_human_puppet_roll`].
-        self.g.human_roll_0x20 = crate::engine::features::HashSilent(carpet.roll as u16);
+        self.g.set_human_roll(hx, carpet.roll as u16);
         // The flight COMMAND register the speed token reads for its
         // direction (`World::mc2_cmd_speed`). A pinned-pose pair never
         // runs a driven tick, so this seed is its only source.
-        self.mc2_cmd_speed = ply.cmd_speed;
+        self.mc2_cmd_speed[hx] = ply.cmd_speed;
         // Cast-charge meters (wizext `byte_0x154_340`) — the MC1
         // twin's seeding law: unseeded, every projectile spawned
         // inside a pair banks a made-up charge in its @0x10. The
@@ -3126,17 +3180,21 @@ impl World {
         // (every recorded spell token slots below the carpet), so a
         // pair-mode world never runs the arm that would set it. It is
         // in the capture because retail's home for it is the carpet.
-        self.hand_bits = carpet.flags & 0x300;
+        self.set_human_hands(hx, carpet.flags & 0x300);
         // The human's PARALYZE latch — see `Gen::mc2_mobilize`. The
         // driver's flight ext owns it; a pair-mode world has no ext
         // history, so seed the mirror from the capture.
-        self.g.mc2_mobilize.0 = ply.mobilize as i32;
+        self.g.mc2_mobilize[hx].0 = ply.mobilize as i32;
         // …and the WEB-SLOW level beside it (`moveSpeed_0x14C_332`),
         // which `sub_38E70` reads to decide whether the stagger stamp
         // kicks and draws at all. Same reason: no ext history in a
         // pair-mode world.
-        self.g.mc2_slow.0 = ply.move_speed as i32;
-        let tr = |v: u16| if v == human_slot { PLAYER_TARGET } else { v };
+        self.g.mc2_slow[hx].0 = ply.move_speed as i32;
+        // The recorded carpet slot IS the human's tag (identity unless
+        // `MGC_NO_HUMAN_SLOT_TAG`, which translates it to the sentinel).
+        self.g.set_human_tag_slot(Hx::FIRST, human_slot);
+        let ht = self.g.human_tag[hx].0;
+        let tr = move |v: u16| if v == human_slot { ht } else { v };
 
         // The MANA-BALLOON REGISTER (`array_0x3C_60`, +998+60) — the
         // MC1 twin's law verbatim (`Type_160 +52`): the register's
@@ -3189,11 +3247,11 @@ impl World {
         // the tail entirely, and possession holds byte[1]&8 across
         // its whole window (t=3257-3267).
         self.mc2_turn = ply.turn.max(0) as u32;
-        self.mc2_carpet_slot = human_slot;
+        self.mc2_carpet_slot[hx] = human_slot;
         // …and the Gen-level mirror, for the `sub_49F90` rebuild
         // sites that live below the World layer (`Gen::mc2_eject_gc`).
-        self.g.mc2_pinned = crate::engine::features::Mc2Pinned(human_slot);
-        self.mc2_carpet_stall = carpet.flags & 0x800 != 0 || !matches!(carpet.action45, 0 | 2);
+        self.g.mc2_pinned[hx] = crate::engine::features::Mc2Pinned(human_slot);
+        self.mc2_carpet_stall[hx] = carpet.flags & 0x800 != 0 || !matches!(carpet.action45, 0 | 2);
 
         let n = pool.min(st.ents.len());
         let mut active = 0usize;
@@ -3214,6 +3272,10 @@ impl World {
             let r = &st.ents[slot];
             if slot == human_slot as usize {
                 self.g.ent[slot] = Ent::default();
+                // Its own tag (`Gen::set_human_tag_slot`).
+                if self.g.human_tag[hx].0 == human_slot {
+                    self.g.ent[slot].id24 = human_slot;
+                }
                 // ⭐⭐⭐ THE HUMAN'S PINNED SEAT HAD NO IMPORT LANE FOR
                 // THE WHIRLWIND LATCHES (dig Q7 — the lane census's
                 // "a port register with NO import seat"). The port's
@@ -3470,7 +3532,11 @@ impl World {
             } else {
                 0
             };
-            self.g.player_chain = crate::engine::features::PlayerChain { cell, next };
+            self.g.player_chain[hx] = crate::engine::features::PlayerChain { cell, next };
+            // …and the record itself takes that seat in the chain.
+            if hole_out {
+                self.g.seat_human_link(hx);
+            }
         }
 
         // Free stack: retail pops the FREE stack first and recycle
@@ -3734,7 +3800,7 @@ impl World {
         // construction (`set_mc2_stages` — the baker has already
         // compacted the -1 rows), so k IS retail's row index.
         if let Some(board) = st.objectives.get(local) {
-            self.completed = board[0] != 0;
+            self.completed[hx] = board[0] != 0;
             self.mc2_stage_current = board[1] as usize;
             self.mc2_objective_pause = board[2] as i16;
             for (k, s) in self.mc2_stages.iter_mut().enumerate().take(8) {
@@ -3851,7 +3917,7 @@ impl World {
             }
         }
         self.g.mc2_aura_claim.0.clear();
-        self.g.mc2_debuffs = Default::default();
+        self.g.mc2_debuffs[hx] = Default::default();
         for i in 0..8 {
             let p = st.players.get(i);
             self.g.rival_ents[i] = match p {
@@ -3881,7 +3947,7 @@ impl World {
                 continue;
             }
             let owner = if i == local {
-                PLAYER_TARGET
+                self.g.human_tag[hx].0
             } else {
                 tr(p.play_index)
             };
@@ -3976,16 +4042,16 @@ impl World {
                 _ => self.reanchor_mc2_rival(ri, 0, 0, 0, 0, 0, 0, 0),
             }
         }
-        self.g.player_aggro = ply.wanted;
-        self.g.player_danger = carpet.f36 as i16;
-        self.g.player_mail = carpet.mail.map(|(a, s)| (a.max(0) as u32, tr(s)));
-        self.g.player_invisible = carpet.flags & 0x20 != 0;
+        self.g.player_aggro[hx] = ply.wanted;
+        self.g.player_danger[hx] = carpet.f36 as i16;
+        *self.g.pmail_mut(hx) = carpet.mail.map(|(a, s)| (a.max(0) as u32, tr(s)));
+        self.g.player_invisible[hx] = carpet.flags & 0x20 != 0;
         // D11 PROBE
         if std::env::var_os("MGC_NO_MC2_REBOUND_SEAT").is_none() {
-            self.g.player_rebound = carpet.flags & 0x8000 != 0;
-            self.g.mc2_rebound_precise.0 = i32::from(carpet.flags & 0x10 != 0);
+            self.g.set_player_rebound(hx, carpet.flags & 0x8000 != 0);
+            self.g.mc2_rebound_precise[hx].0 = i32::from(carpet.flags & 0x10 != 0);
         }
-        self.g.mc2_player_drain.0 = 0;
+        self.g.mc2_player_drain[hx].0 = 0;
 
         // The human column. MC2 hands are DIRECT spell indices
         // (SpellIndexLeft/Right; −1 = empty) — no acquisition-list
@@ -4015,14 +4081,14 @@ impl World {
                 .contains(&raw)
                 .then_some(SpellId(raw as u8))
         };
-        self.player = Player {
-            mana: carpet.mana.max(0) as u32,
-            mana_max: carpet.mana_max.max(0) as u32,
+        self.players[hx] = Player {
+            mana_reg: carpet.mana.max(0) as u32,
+            mana_max_reg: carpet.mana_max.max(0) as u32,
             // The pending regen/debit delta (@0x88) — the value the
             // wizard body will APPLY next frame, which is NOT always
             // the recorded one: see [`mc2_applied_mana_delta`].
             mana_delta: mc2_applied_mana_delta(st, ply, human_slot, &carpet, spell6_life, false),
-            life: carpet.life,
+            life_reg: carpet.life,
             // MORTALITY (the MC1 arm's twin): the human carpet's
             // `actionIndex_0x45_69` IS the wizard's life state on the
             // MC2 column too — 0 alive (`AddPlayer03_00_5E010`), 2 the
@@ -4033,7 +4099,7 @@ impl World {
             // the imported mana clamped to `mana_max` — retail's
             // corpse touches neither (EF:59994-60040 gates the block
             // on `life >= 0`).
-            state: match carpet.action45 {
+            state_reg: match carpet.action45 {
                 _ if super::mc2_death_off() => LifeState::Alive,
                 2 => LifeState::Falling,
                 3 => LifeState::Dead,
@@ -4056,11 +4122,11 @@ impl World {
             // only this seat was missing, which is what forced
             // `player_regen_block`'s MC2 exception.
             life_rate: ply.life_regen as i32,
-            killer: tr(carpet.f24 as u16),
+            killer_reg: tr(carpet.f24 as u16),
             fall_speed: carpet.f2c,
-            invisible: carpet.flags & 0x20 != 0,
+            invisible_reg: carpet.flags & 0x20 != 0,
             // D11 PROBE
-            shield: std::env::var_os("MGC_NO_MC2_SHIELD_SEAT").is_none()
+            shield_reg: std::env::var_os("MGC_NO_MC2_SHIELD_SEAT").is_none()
                 && carpet.flags & 0x4000 != 0,
             // The shield's ARMED stage rides the SAME word one byte
             // up — retail `byte[2] & 0x40`, dword bit 22 (0x40_0000).
@@ -4069,7 +4135,7 @@ impl World {
             // was the last hole. mc2l6-rsg's carpet 343 holds
             // `flags` 0x40010D across t=22531..22705, 22730..22866
             // and 23116..23166.
-            shield_armed: !crate::mc2::cast::no_mc2_shield_armed()
+            shield_armed_reg: !crate::mc2::cast::no_mc2_shield_armed()
                 && std::env::var_os("MGC_NO_MC2_SHIELD_SEAT").is_none()
                 && carpet.flags & 0x40_0000 != 0,
             rebound: std::env::var_os("MGC_NO_MC2_REBOUND_SEAT").is_none()
@@ -4086,15 +4152,21 @@ impl World {
             // published `b46` 0 against retail's 176 — mc2l15 t=24152
             // slot 719 and t=24184 slot 314, on a human that died
             // earlier in the take.
-            mc2_respawn_timer: carpet.scratch10.max(0) as u32,
+            mc2_respawn_timer_reg: carpet.scratch10.max(0) as u32,
             ..Player::default()
         };
+        // The block import reset the global lanes it used to carry.
+        self.world_mana = 0;
+        self.lost = false;
+        // The vitals' home is the record once it exists (stage 3,
+        // channel 2): seat the imported registers onto it.
+        self.sync_vitals_to_record(hx);
         // The knock/buffet channel (`moveBoost` @+30 + direction @+32:
         // the MC1 channel's retail home on this column — same cap 128,
         // decay −4, snap <4): the MC1 arm seeds its twin from the
         // Type_160 tail; without this a free-running replay anchored
         // mid-buffet starts with a silently empty channel.
-        self.g.player_knock = (ply.knock_dir, ply.knock_mag);
+        self.g.player_knock[hx] = (ply.knock_dir, ply.knock_mag);
 
         // ⭐⭐⭐ THE MC2 HUMAN'S BRAKE WORD (`word_0xe_14`, Type_160
         // +14) — THE SAME SEAT THE MC1 ARM ALREADY HAS, 2,400 LINES
@@ -4123,7 +4195,7 @@ impl World {
         // credited `xp_vol[3]` and flew the burst.
         // `MGC_NO_MC2_BRAKE_SEAT=1` restores the unseeded pair.
         if std::env::var_os("MGC_NO_MC2_BRAKE_SEAT").is_none() {
-            self.mc1_v14 = ply.brake != 0;
+            self.mc1_v14[hx] = ply.brake != 0;
         }
 
         // The human's str_611 spellbook: manifestation slots, XP,
@@ -4132,7 +4204,7 @@ impl World {
         // seeding is cross-pair state, so rebuild from the closure.
         // Without this the cast machinery ticks whatever slots the
         // level build assigned, not the imported manifestations.
-        self.mc2_book = crate::mc2::cast::Mc2Spellbook {
+        self.mc2_book[hx] = crate::mc2::cast::Mc2Spellbook {
             ent: ply.spell_ent,
             xp_vol: ply.xp_vol,
             xp_bank: ply.xp_bank,
@@ -4148,7 +4220,7 @@ impl World {
         // latched window must import it — unseeded, every such pair
         // prices the token 3000 light. (mc2l3 584-597, 16012-16200,
         // 16247-17127, 17162-18075; spells-galore 32476-33465.)
-        self.mc2_recast_surcharge = ply.recast_surcharge != 0;
+        self.mc2_recast_surcharge[hx] = ply.recast_surcharge != 0;
 
         // TERRAIN REPLAY. `.mgcr` has no terrain channel, so the pool
         // lands on PRISTINE heights while retail's map still carries
@@ -4227,12 +4299,12 @@ impl World {
         }
 
         // Cross-pair latches, same wipe as the MC1 arm.
-        self.human_pose = (carpet.x, carpet.y, carpet.z);
-        self.pending_teleport = None;
-        self.pending_teleport_slot = None;
-        self.pending_respawn = None;
+        self.set_human_pose(hx, (carpet.x, carpet.y, carpet.z));
+        self.pending_teleport[hx] = None;
+        self.pending_teleport_slot[hx] = None;
+        self.pending_respawn[hx] = None;
         self.pending_restart = false;
-        self.duel = None;
+        self.duel[hx] = None;
         self.won = false;
         // ⭐⭐⭐ ROUND 98 (dig 98-Q11) — THE LEVEL-END LATCH IS
         // IMPORTED STATE, AND THIS WIPE ATE IT. The objective-board
@@ -4244,11 +4316,11 @@ impl World {
         // EF:54329-46 — `sub_4A1E0(id_0x1A_26, 1)` the first frame a
         // class-3 model-0 wizard's board carries the latch) never
         // fired. See `mc2::scenery::no_import_level_end_latch`.
-        self.completed = !crate::mc2::scenery::no_import_level_end_latch()
+        self.completed[hx] = !crate::mc2::scenery::no_import_level_end_latch()
             && st.objectives.get(local).is_some_and(|b| b[0] != 0);
-        self.win_streak = 0;
-        self.prev_fire = (false, false);
-        self.accel_veto = (false, false);
+        self.win_streak[hx] = 0;
+        self.prev_fire[hx] = (false, false);
+        self.accel_veto[hx] = (false, false);
         self.rival_deaths.clear();
         self.notifications.clear();
         self.kill_tally = [[0; 8]; 8];
@@ -4277,7 +4349,14 @@ impl World {
     /// through the SEMANTIC alias table (mc2/mobs.rs), the reverse of
     /// `import_ent_mc2`.
     pub fn obs_project_mc2(&self, pin: &PinnedMc2) -> ObsMc2 {
-        let untr = |v: u16| if v == PLAYER_TARGET { pin.slot } else { v };
+        let hx = Hx::FIRST; // a take records one human
+        let untr = |v: u16| {
+            if v == self.g.human_tag[hx].0 {
+                pin.slot
+            } else {
+                v
+            }
+        };
         let held: std::collections::BTreeMap<u16, &crate::mc2::stagevars::Mc2Held> =
             self.mc2_sv_held.iter().map(|h| (h.ent, h)).collect();
         let mut entities: Vec<EntObsMc2> = Vec::new();
@@ -4543,12 +4622,12 @@ impl World {
                     // Echoed, not derived — see [`PinnedMc2::castles`].
                     castle: pin.castles[i as usize & 7],
                     hand_left: if localp {
-                        spell_i16(self.player.left)
+                        spell_i16(self.players[hx].left)
                     } else {
                         None
                     },
                     hand_right: if localp {
-                        spell_i16(self.player.right)
+                        spell_i16(self.players[hx].right)
                     } else {
                         None
                     },
@@ -4565,10 +4644,10 @@ impl World {
             name: String::new(),
             is_ai: false,
             turn: 0,
-            life: self.player.life,
+            life: self.human_life(hx),
             max_life: PLAYER_LIFE_MAX,
-            mana: self.player.mana as i32,
-            mana_max: self.player.mana_max as i32,
+            mana: self.human_mana(hx) as i32,
+            mana_max: self.human_mana_max(hx) as i32,
             x: pin.pose.x as f64 / 256.0,
             y: pin.pose.y as f64 / 256.0,
             z: pin.pose.z,
@@ -4597,11 +4676,12 @@ impl World {
 
     /// The synthesized MC2 human-carpet obs row.
     fn synth_carpet_obs_mc2(&self, pin: &PinnedMc2) -> EntObsMc2 {
+        let hx = Hx::FIRST; // a take records one human
         EntObsMc2 {
             slot: pin.slot,
             class: 3,
             model: 0,
-            life: self.player.life,
+            life: self.human_life(hx),
             max_life: PLAYER_LIFE_MAX,
             x: pin.pose.x as f64 / 256.0,
             y: pin.pose.y as f64 / 256.0,
@@ -4611,8 +4691,8 @@ impl World {
             applied_yaw: 0,
             applied_pitch: 0,
             speed: pin.pose.speed,
-            mana: self.player.mana as i32,
-            mana_max: self.player.mana_max as i32,
+            mana: self.human_mana(hx) as i32,
+            mana_max: self.human_mana_max(hx) as i32,
             owner: pin.slot,
             action: 0,
             sv1: 0,
@@ -4627,11 +4707,12 @@ impl World {
     /// have no port-side counterpart outside the pool — the comparator
     /// treats the pinned slot specially.
     fn synth_carpet_obs(&self, pin: &PinnedMc1) -> EntObsMc1 {
+        let hx = Hx::FIRST; // a take records one human
         EntObsMc1 {
             slot: pin.slot,
             class: 3,
             model: 0,
-            sclass: match self.player.state {
+            sclass: match self.human_state(hx) {
                 LifeState::Alive => 0,
                 LifeState::Falling => 2,
                 LifeState::Dead => 3,
@@ -4639,7 +4720,7 @@ impl World {
             smodel: 0,
             flags: 0,
             id: pin.slot,
-            life: self.player.life,
+            life: self.human_life(hx),
             max_life: PLAYER_LIFE_MAX as u32,
             x: pin.pose.x as f64 / 256.0,
             y: pin.pose.y as f64 / 256.0,
@@ -4648,8 +4729,8 @@ impl World {
             pitch: pin.pose.pitch,
             target_yaw: pin.pose.heading,
             speed: pin.pose.speed,
-            mana: self.player.mana,
-            mana_max: self.player.mana_max,
+            mana: self.human_mana(hx),
+            mana_max: self.human_mana_max(hx),
             chase: 0,
             owner_ptr: 0,
             tick_byte: 0,
@@ -5263,7 +5344,7 @@ pub(crate) fn chain_ghost_splice() -> bool {
 ///
 /// Retail's human is an ordinary member of HIS OWN cell's chain; the
 /// port carries every walker's human arm out-of-pool (the flood's
-/// `ctx.px/py/pz` arm), so the pool chain must hold the hole nowhere.
+/// `view.x/y/z` arm), so the pool chain must hold the hole nowhere.
 ///
 /// `MGC_NO_MC2_IMPORT_HOLE_UNLINKED=1` restores the linked hole.
 pub(crate) fn mc2_import_hole_unlinked() -> bool {
@@ -7340,6 +7421,7 @@ pub fn pose_all_mc2(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mc1::mobs::PLAYER_TARGET;
 
     /// ⭐ THE MICROSCOPE AND THE GRADER READ ONE LANE LIST.
     /// `MGC_POSE_WINDOW` prints `pose_all_*`; the verdict is
@@ -8222,14 +8304,24 @@ mod tests {
         assert_eq!((w.g.ent[3].next20, w.g.ent[3].prev22), (4, 2), "tile A: 3");
         assert_eq!((w.g.ent[4].next20, w.g.ent[4].prev22), (5, 3), "tile A: 4");
         assert_eq!((w.g.ent[5].next20, w.g.ent[5].prev22), (0, 4), "tile A: 5");
-        // Tile B: 6 -> 7 -> 8 in the pool, the human's seat between
-        // 7 and 8.
+        // Tile B: 6 -> 7 -> human -> 8, the RECORDED order — the
+        // human's (3,0) record takes his seat between 7 and 8 for real
+        // (multiplayer stage 2, `Gen::seat_human_link`).
         assert_eq!(w.g.map_entity[tb] as usize, 6, "tile B head");
         assert_eq!((w.g.ent[6].next20, w.g.ent[6].prev22), (7, 0), "tile B: 6");
-        assert_eq!((w.g.ent[7].next20, w.g.ent[7].prev22), (8, 6), "tile B: 7");
-        assert_eq!((w.g.ent[8].next20, w.g.ent[8].prev22), (0, 7), "tile B: 8");
+        assert_eq!((w.g.ent[7].next20, w.g.ent[7].prev22), (1, 6), "tile B: 7");
         assert_eq!(
-            (w.g.player_chain.cell, w.g.player_chain.next),
+            (w.g.ent[1].next20, w.g.ent[1].prev22),
+            (8, 7),
+            "tile B: the human"
+        );
+        assert_ne!(w.g.ent[1].flags & 4, 0, "the human's record is linked");
+        assert_eq!((w.g.ent[8].next20, w.g.ent[8].prev22), (0, 1), "tile B: 8");
+        assert_eq!(
+            (
+                w.g.player_chain[Hx::FIRST].cell,
+                w.g.player_chain[Hx::FIRST].next
+            ),
             (tb, 8),
             "the human's seat: tile B, in front of 8"
         );
@@ -8733,7 +8825,7 @@ mod tests {
         );
         assert!(
             !w.g.free.contains(&3),
-            "the ghost's push belongs to tick()'s top reap, not the import"
+            "the ghost's push belongs to tick(Hx::FIRST)'s top reap, not the import"
         );
     }
 
@@ -8970,7 +9062,7 @@ mod tests {
                 plume: 0,
             };
             w.retail_import_mc1(&st).expect("import");
-            w.player.mana_delta
+            w.players[Hx::FIRST].mana_delta
         };
         // Spell 5 (f70=15) is NOT on the keep-list: its mid-burst
         // token clamps a positive seed…

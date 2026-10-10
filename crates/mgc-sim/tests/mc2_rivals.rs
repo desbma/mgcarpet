@@ -9,6 +9,7 @@
 //! player's gamedata bake is absent (CI without game assets).
 
 use mgc_formats::LevelPackage;
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
 use mgc_sim::ids::GameId;
@@ -266,7 +267,7 @@ fn mc2_rivals_spawn_brain_objective() {
         w2.state_hash(),
         "the rival brain is deterministic"
     );
-    assert!(!w.completed(), "kill-player stages still open");
+    assert!(!w.completed(Hx::FIRST), "kill-player stages still open");
     // The view exports a live altitude (the in-view rival tag's
     // anchor): a flying carpet sits well above z = 0.
     assert!(
@@ -281,7 +282,7 @@ fn mc2_rivals_spawn_brain_objective() {
     // kill-player stages read.
     let mut saw_banish = false;
     for t in 0..8000 {
-        if w.completed() {
+        if w.completed(Hx::FIRST) {
             break;
         }
         if t % 16 == 0 {
@@ -306,7 +307,7 @@ fn mc2_rivals_spawn_brain_objective() {
         "an elimination broadcasts the banished-from-the-realm line"
     );
     assert!(
-        w.completed(),
+        w.completed(Hx::FIRST),
         "both kill-player stages completed -> level end"
     );
 }
@@ -345,7 +346,7 @@ fn mc2_dead_wizard_grave_is_possessable() {
     // the ch1 claim and despawn, transferring every entity it owned.
     // The hook's debug_asserts also pin bit 8 + f28 == 2.
     let (before, after, freed) = w
-        .debug_mc2_possess_grave(0xFFFF)
+        .debug_mc2_possess_grave(w.human_tag(Hx::FIRST))
         .expect("a live grave to possess");
     assert!(freed, "possessing the grave despawns it (no longer inert)");
     assert_eq!(
@@ -398,7 +399,7 @@ fn mc2_level001_destroy_building_objective_completes() {
     assert_eq!(cursor, 4, "the destroy-building row is current");
     assert_eq!(board[4].1, 1, "row 4 still active");
     assert!(
-        !w.completed(),
+        !w.completed(Hx::FIRST),
         "level must NOT complete vacuously while the vaults stand"
     );
 
@@ -417,7 +418,7 @@ fn mc2_level001_destroy_building_objective_completes() {
         "each vault degraded into its tag-54 successor stage"
     );
     assert!(
-        !w.completed(),
+        !w.completed(Hx::FIRST),
         "the chain still stands (tag 54) — objective must wait"
     );
 
@@ -426,7 +427,7 @@ fn mc2_level001_destroy_building_objective_completes() {
     w.debug_smite(10, 45);
     for _ in 0..60 {
         w.tick(pose, idle);
-        if w.completed() {
+        if w.completed(Hx::FIRST) {
             break;
         }
     }
@@ -436,7 +437,7 @@ fn mc2_level001_destroy_building_objective_completes() {
         "the vaults are fully razed"
     );
     assert!(
-        w.completed(),
+        w.completed(Hx::FIRST),
         "razing the whole chain completes the type-9 row → level end"
     );
 }
@@ -469,7 +470,7 @@ fn mc2_objective_targets_tracks_current_stage() {
         w.tick(pose, idle);
     }
 
-    let targets = w.mc2_objective_targets();
+    let targets = w.mc2_objective_targets(Hx::FIRST);
     assert_eq!(
         targets.len(),
         2,
@@ -494,7 +495,7 @@ fn mc2_objective_targets_tracks_current_stage() {
     for _ in 0..60 {
         w.tick(pose, idle);
     }
-    let after = w.mc2_objective_targets();
+    let after = w.mc2_objective_targets(Hx::FIRST);
     assert_eq!(
         after.len(),
         2,
@@ -505,12 +506,12 @@ fn mc2_objective_targets_tracks_current_stage() {
     w.debug_smite(10, 45);
     for _ in 0..60 {
         w.tick(pose, idle);
-        if w.completed() {
+        if w.completed(Hx::FIRST) {
             break;
         }
     }
     assert!(
-        w.mc2_objective_targets().is_empty(),
+        w.mc2_objective_targets(Hx::FIRST).is_empty(),
         "completed objective yields no targets"
     );
 }
@@ -529,9 +530,9 @@ fn mc2_grant_plausible_learns_spells_and_levels_them() {
     // Fireball (0) is multi-tier (tier 1 = repeat, tier 2 = lightning),
     // so a huge XP install must promote it above tier 0. Spell 9 gets a
     // huge install too; spell 13 gets zero XP → must stay tier 0.
-    w.mc2_grant_plausible(&[(0u8, 100_000i32), (9, 100_000), (13, 0)]);
+    w.mc2_grant_plausible(Hx::FIRST, &[(0u8, 100_000i32), (9, 100_000), (13, 0)]);
 
-    let book = w.mc2_book_view();
+    let book = w.mc2_book_view(Hx::FIRST);
     assert!(
         book.owned[0] && book.owned[9] && book.owned[13],
         "all learned"
@@ -558,23 +559,23 @@ fn mc2_withheld_spell_keeps_its_xp_until_relearned() {
         eprintln!("skipping: no baked mc2 gamedata");
         return;
     };
-    w.mc2_bank_withheld(&[(24u8, 100_000i32)]);
-    let book = w.mc2_book_view();
+    w.mc2_bank_withheld(Hx::FIRST, &[(24u8, 100_000i32)]);
+    let book = w.mc2_book_view(Hx::FIRST);
     assert!(!book.owned[24], "withheld: not in the book");
     assert_eq!(book.xp[24], 100_000, "...but its XP is banked");
     let tier = book.levels[24];
     assert!(tier > 0, "...and its tier derived");
     assert!(book.left != 24 && book.right != 24, "no hand holds it");
 
-    w.mc2_grant_start_book(&[24]);
-    let book = w.mc2_book_view();
+    w.mc2_grant_start_book(Hx::FIRST, &[24]);
+    let book = w.mc2_book_view(Hx::FIRST);
     assert!(book.owned[24], "relearned");
     assert_eq!(book.xp[24], 100_000, "at the old XP");
     assert_eq!(book.levels[24], tier, "and the old tier");
 
     // An owned spell is never touched by the withhold.
-    w.mc2_bank_withheld(&[(24u8, 5)]);
-    assert_eq!(w.mc2_book_view().xp[24], 100_000);
+    w.mc2_bank_withheld(Hx::FIRST, &[(24u8, 5)]);
+    assert_eq!(w.mc2_book_view(Hx::FIRST).xp[24], 100_000);
 }
 
 /// Cave-In (25) is cave-only, and NOT through the block row: the book
@@ -588,12 +589,16 @@ fn mc2_cave_in_is_unselectable_off_cave() {
             eprintln!("skipping: no baked mc2 gamedata");
             return;
         };
-        w.mc2_grant_plausible(&[(25u8, 0i32)]);
-        let book = w.mc2_book_view();
+        w.mc2_grant_plausible(Hx::FIRST, &[(25u8, 0i32)]);
+        let book = w.mc2_book_view(Hx::FIRST);
         assert!(book.owned[25], "{level}: the book keeps it");
         assert_eq!(book.cave, cave, "{level}");
-        w.mc2_select_spell(25, 0, 0);
-        assert_eq!(w.mc2_book_view().left == 25, cave, "{level}: select");
+        w.mc2_select_spell(Hx::FIRST, 25, 0, 0);
+        assert_eq!(
+            w.mc2_book_view(Hx::FIRST).left == 25,
+            cave,
+            "{level}: select"
+        );
     }
 }
 
@@ -892,12 +897,12 @@ fn mc2_steal_mana_casts_a_projectile_not_a_stub() {
         eprintln!("skipping: no baked mc2 gamedata");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let pose = PlayerPose::from_tiles(64.0, 40.0, 64.0, 0.0, 0.0, 0.0);
     for _ in 0..6 {
         w.tick(pose, PlayerCommand::default());
     }
-    w.mc2_select_spell(13, 0, 0);
+    w.mc2_select_spell(Hx::FIRST, 13, 0, 0);
     w.tick(
         pose,
         PlayerCommand {
@@ -1141,20 +1146,20 @@ fn a_duel_re_press_collapses_the_window_without_pinning_regen() {
     // which is exactly the half under test.
     // Earned, not lent: the dev cheat is an OVERLAY and its
     // toggle-off below takes back every spell it minted.
-    w.mc2_grant_start_book(&[14]);
-    w.set_dev_spells(true);
-    w.mc2_select_spell(14, 0, 0);
+    w.mc2_grant_start_book(Hx::FIRST, &[14]);
+    w.set_dev_spells(Hx::FIRST, true);
+    w.mc2_select_spell(Hx::FIRST, 14, 0, 0);
     w.tick(p, fire);
-    w.set_dev_spells(false);
+    w.set_dev_spells(Hx::FIRST, false);
     // Headroom, so the wizard tick recomputes a POSITIVE regen each
     // frame for `sub_68DE0` to clamp (the accumulator, not the pool —
     // the pool is pinned by the ceiling in a castle-less world).
-    w.set_player_mana(600);
+    w.set_player_mana(Hx::FIRST, 600);
     for _ in 0..8 {
         w.tick(p, idle);
     }
     assert_eq!(
-        w.debug_player_mana_delta(),
+        w.debug_player_mana_delta(Hx::FIRST),
         0,
         "a live cast window pins the regen accumulator \
          (sub_68DE0 else, EF:55574-77)"
@@ -1165,10 +1170,10 @@ fn a_duel_re_press_collapses_the_window_without_pinning_regen() {
     // jumps past the whole else, `sub_68DE0` included.
     w.tick(p, fire);
     assert!(
-        w.debug_player_mana_delta() > 0,
+        w.debug_player_mana_delta(Hx::FIRST) > 0,
         "the collapse tick skips sub_68DE0, so the wizard's freshly \
          recomputed regen stands: {}",
-        w.debug_player_mana_delta()
+        w.debug_player_mana_delta(Hx::FIRST)
     );
 }
 
@@ -1221,11 +1226,15 @@ fn the_mc2_killer_latch_belongs_to_the_lethal_branch_alone() {
         w.tick(pose, idle);
     }
     // A survivable letter: the rival's life is in the thousands.
-    w.debug_mail_hit(slot, 100, 0xFFFF);
+    w.debug_mail_hit(slot, 100, w.human_tag(Hx::FIRST));
     w.tick(pose, idle);
     let (killer, attacker) = w.debug_hit_words(slot);
     assert_eq!(killer, 0, "a hit the wizard SURVIVES latches no killer");
-    assert_eq!(attacker, 0xFFFF, "…but does publish word_0x26_38");
+    assert_eq!(
+        attacker,
+        w.human_tag(Hx::FIRST),
+        "…but does publish word_0x26_38"
+    );
     // And the flag is one-tick: a quiet dispatch clears it again.
     w.tick(pose, idle);
     assert_eq!(
@@ -1247,7 +1256,7 @@ fn mc2_duel_locks_drains_and_breaks() {
         eprintln!("skipping: no baked mc2 gamedata");
         return;
     };
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let idle = PlayerCommand::default();
     let views = w.rival_views();
     assert!(!views.is_empty(), "level-004 spawns rivals");
@@ -1305,9 +1314,9 @@ fn mc2_duel_locks_drains_and_breaks() {
         },
     );
     w.debug_place_mc2_rival(rslot, px, pz);
-    w.debug_mail_ch(ent, 4, 1, 0xFFFF);
+    w.debug_mail_ch(ent, 4, 1, w.human_tag(Hx::FIRST));
     w.tick(near, idle);
-    let lock = w.debug_mc2_duel();
+    let lock = w.debug_mc2_duel(Hx::FIRST);
     assert!(lock.is_some(), "the victim's own dispatch stamped the lock");
     let (opp, hold, tier) = lock.unwrap();
     assert_eq!(opp as usize, ent, "…on the wizard the letter landed in");
@@ -1331,7 +1340,7 @@ fn mc2_duel_locks_drains_and_breaks() {
         w.tick(far, idle);
     }
     assert!(
-        w.debug_mc2_duel().is_none(),
+        w.debug_mc2_duel(Hx::FIRST).is_none(),
         "out of range ends the duel (EF:59947)"
     );
 }
@@ -1484,7 +1493,7 @@ fn an_mc2_rival_banks_its_knockback_until_it_dies() {
         "no letter, no impulse"
     );
     // A survivable 300-damage letter from the human: 300/10 = 30.
-    w.debug_mail_hit(slot, 300, 0xFFFF);
+    w.debug_mail_hit(slot, 300, w.human_tag(Hx::FIRST));
     w.tick(pose, idle);
     assert_eq!(
         w.debug_mc2_rival_knock(color).map(|k| k.1),
@@ -1503,7 +1512,7 @@ fn an_mc2_rival_banks_its_knockback_until_it_dies() {
     );
     // The clamp is [0, 80], not the human's 128 — a big (but survivable)
     // letter saturates rather than launching the wizard.
-    w.debug_mail_hit(slot, 900, 0xFFFF);
+    w.debug_mail_hit(slot, 900, w.human_tag(Hx::FIRST));
     w.tick(pose, idle);
     assert_eq!(
         w.debug_mc2_rival_knock(color).map(|k| k.1),

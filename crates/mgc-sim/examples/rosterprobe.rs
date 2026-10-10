@@ -2,6 +2,7 @@
 //! disposition, tick with the player amid the population, and report
 //! per-model class-5 counts, class-9 launches and the misfit ledger.
 use mgc_formats::LevelPackage;
+use mgc_sim::Hx;
 use mgc_sim::engine::features::FeatureAssets;
 use mgc_sim::engine::features::Planes;
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
@@ -48,7 +49,7 @@ fn main() {
     let mut sounds = std::collections::BTreeMap::new();
     // Park next to the first (5,19) firebug so the wave engages.
     let anchor = w
-        .live_poses()
+        .live_poses(Hx::FIRST)
         .iter()
         .find(|p| p.class == 5 && p.model == 19)
         .map(|p| (p.x, p.z));
@@ -61,17 +62,17 @@ fn main() {
         let alt = w.ground_height_tiles(x, z) + 2.0;
         let pose = PlayerPose::from_tiles(x, alt, z, 0.0, 0.0, 0.0);
         w.tick(pose, idle);
-        for s in &w.take_audio(pose).events {
+        for s in &w.take_audio(Hx::FIRST, pose).events {
             *sounds.entry(s.id).or_insert(0u32) += 1;
         }
-        for p in w.live_poses() {
+        for p in w.live_poses(Hx::FIRST) {
             if p.class == 9 {
                 *c9_seen.entry(p.model).or_insert(0u32) += 1;
             }
         }
     }
     let mut c5 = std::collections::BTreeMap::new();
-    for p in w.live_poses() {
+    for p in w.live_poses(Hx::FIRST) {
         if p.class == 5 {
             *c5.entry(p.model).or_insert(0u32) += 1;
         }

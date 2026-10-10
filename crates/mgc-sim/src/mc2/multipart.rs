@@ -107,7 +107,8 @@
 use super::behavior::BEHAVIOR;
 use super::sprite_params::SPRITE_PARAMS;
 use crate::engine::features::Gen;
-use crate::mc1::mobs::{MobCtx, PLAYER_TARGET};
+use crate::engine::world::Hx;
+use crate::mc1::mobs::MobCtx;
 
 /// `MGC_NO_MC2_M27_HIDE_BIT=1` restores the port's invented `0x20` in
 /// the m27 hydra's four burrow show/hide ops — i.e. it reverts this law.
@@ -288,8 +289,8 @@ impl Gen {
     /// A position read that tolerates corpses (retail dereferences
     /// the slot regardless); the human resolves through the ctx.
     fn mc2_raw_pos(&self, slot: u16, ctx: &MobCtx) -> Option<(u16, u16, i16)> {
-        if slot == PLAYER_TARGET {
-            return Some((ctx.px, ctx.py, ctx.pz));
+        if let Some(hx) = self.hx_of_tag(slot) {
+            return Some(self.seat_at(ctx, hx));
         }
         let j = slot as usize;
         if j == 0 || j >= self.ent.len() {
@@ -306,7 +307,7 @@ impl Gen {
     /// families are authored in Transform order,
     /// crate::mc2::COLOR_ART).
     pub(crate) fn mc2_ball_color(&self, target: u16) -> u16 {
-        if target == PLAYER_TARGET {
+        if self.is_human_tag(target) {
             return 105;
         }
         match self.rival_ents.iter().position(|&e| e != 0 && e == target) {
@@ -738,11 +739,17 @@ impl Gen {
             // mis-followed — which is the whole "middle segment's
             // heading is wildly wrong" signature).
             let p = self.ent[i].f38;
-            let hook_yaw = if p == PLAYER_TARGET && Self::m0_dodge_human_hook_law() {
-                // `ctx.pdead` IS retail's `life_0x8 < 0` on the carpet
+            let hook_yaw = if let Some(hx) = self.hx_of_tag(p)
+                && Self::m0_dodge_human_hook_law()
+            {
+                // `view.dead` IS retail's `life_0x8 < 0` on the carpet
                 // record; there is no reap bit for the out-of-pool
                 // human.
-                if ctx.pdead { None } else { Some(ctx.pyaw) }
+                if self.seat_dead(ctx, hx) {
+                    None
+                } else {
+                    Some(self.seat_yaw(ctx, hx))
+                }
             } else {
                 let j = p as usize;
                 if j == 0
@@ -765,8 +772,10 @@ impl Gen {
             // human that is his real pool index in retail, which the
             // import pins; native play has no such index and keeps the
             // sentinel (0xFFFF, odd).
-            let side = if p == PLAYER_TARGET && self.mc2_pinned.0 != 0 {
-                self.mc2_pinned.0
+            let side = if let Some(hx) = self.hx_of_tag(p)
+                && self.mc2_pinned[hx].0 != 0
+            {
+                self.mc2_pinned[hx].0
             } else {
                 p
             };
@@ -1139,7 +1148,7 @@ impl Gen {
                 // `dword_0x64 == 0` and the seg's byte-0xE bit 0x20 is
                 // already set (26e73-26e7d).
                 if self.ent[i].mail[1].0 != 0 || self.ent[i].flags & 0x20_0000 == 0 {
-                    residue = Some(if tag == PLAYER_TARGET {
+                    residue = Some(if self.is_human_tag(tag) {
                         None
                     } else {
                         Some(tag as i16 as i32 as u32)
@@ -1148,8 +1157,8 @@ impl Gen {
                 self.ent[head].f144 = tag;
                 self.ent[head].tick70 = M22_BASE + 1; // 177
                 self.ent[head].f26 = ((self.ent[i].f71 as i8 as i16) << 8) as i16;
-                if tag == PLAYER_TARGET {
-                    self.snd_player(4);
+                if let Some(hx) = self.hx_of_tag(tag) {
+                    self.snd_player(hx, 4);
                 } else {
                     self.snd(4, tag as usize);
                 }
@@ -1469,8 +1478,8 @@ impl Gen {
                     self.ent[i].f144 = tag;
                     self.ent[i].tick70 = M22_BASE + 1;
                     self.ent[i].f26 = 0;
-                    if tag == PLAYER_TARGET {
-                        self.snd_player(4);
+                    if let Some(hx) = self.hx_of_tag(tag) {
+                        self.snd_player(hx, 4);
                     } else {
                         self.snd(4, tag as usize);
                     }
@@ -1687,7 +1696,7 @@ impl Gen {
                     // `dump-state --port`'s own banner), and the port
                     // names the human carpet with the `PLAYER_TARGET`
                     // sentinel wherever retail carries a pool index.
-                    // Its mirror of `life_0x8 < 0` is `ctx.pdead`, the
+                    // Its mirror of `life_0x8 < 0` is `view.dead`, the
                     // mid-walk republished `player.life < 0` echo that
                     // exists for exactly this reason (world.rs:3047 —
                     // "retail's followers read `life_0x8 < 0` off the
@@ -1695,8 +1704,8 @@ impl Gen {
                     // never reap-flagged.
                     let t = target as usize;
                     let dead_target = Self::m22_target_gates_law()
-                        && if target == PLAYER_TARGET {
-                            ctx.pdead
+                        && if let Some(hx) = self.hx_of_tag(target) {
+                            self.seat_dead(ctx, hx)
                         } else {
                             t < self.ent.len()
                                 && (self.ent[t].class64 != 3
@@ -2012,18 +2021,48 @@ impl Gen {
         // (`life >= 0` at tick top) — see `m27_scan_life_law`.
         // (`player_ghost`: the ghost cheat's own gate — retail lets
         // this scan see through a cloak, the cheat does not.)
-        if (!ctx.pdead_top || !Self::m27_scan_life_law()) && !self.player_ghost.0 {
-            consider(ctx.px, ctx.py, PLAYER_TARGET);
+        let human_ok = |hx: Hx| {
+            (!self.seat_dead_top(hx) || !Self::m27_scan_life_law()) && !self.player_ghost.0
+        };
+        // (On the roster the human is met at his own slot below.)
+        let in_walk = |hx: Hx| {
+            self.human_rides_chain(hx) && Self::m27_scan_roster_law() && Self::m27_scan_life_law()
+        };
+        for hx in self
+            .human_tag
+            .ixs()
+            .filter(|&hx| !in_walk(hx) && human_ok(hx))
+        {
+            consider(
+                self.seat_at(ctx, hx).0,
+                self.seat_at(ctx, hx).1,
+                self.human_tag[hx].0,
+            );
         }
         if Self::m27_scan_roster_law() {
             for c in 0..self.wiz_chain.visible_len() {
                 let j = self.wiz_chain.list[c] as usize;
                 let w = &self.ent[j];
+                if let Some(hx) = self.hx_of_rec(j) {
+                    if in_walk(hx) && human_ok(hx) {
+                        consider(
+                            self.seat_at(ctx, hx).0,
+                            self.seat_at(ctx, hx).1,
+                            self.human_tag[hx].0,
+                        );
+                    }
+                    continue;
+                }
                 consider(w.x, w.y, j as u16);
             }
         } else {
             for (j, c) in self.ent.iter().enumerate().skip(1) {
-                if c.class64 == 3 && c.model65 <= 1 && c.act_life >= 0 && c.flags & 0x400 == 0 {
+                if c.class64 == 3
+                    && c.model65 <= 1
+                    && c.act_life >= 0
+                    && c.flags & 0x400 == 0
+                    && self.hx_of_rec(j).is_none()
+                {
                     consider(c.x, c.y, j as u16);
                 }
             }
@@ -2877,8 +2916,10 @@ impl Gen {
         };
         // `sub_584D0` (file 0x7CCD0): i16 deltas, squared, summed; the
         // `ja` at 0x92CE4 is unsigned.
-        let dx = bx.wrapping_sub(ctx.px) as i16 as i32;
-        let dy = by.wrapping_sub(ctx.py) as i16 as i32;
+        // The listener: retail's local player.
+        let (lpx, lpy, _) = self.seat_at(ctx, self.local_seat());
+        let dx = bx.wrapping_sub(lpx) as i16 as i32;
+        let dy = by.wrapping_sub(lpy) as i16 as i32;
         let sq = (dx * dx).wrapping_add(dy * dy) as u32;
         // W-52: `sub_581E0`'s full EAX (the atan2 word) — not modelled.
         self.m27_v34_slot.0 = None;
@@ -2886,7 +2927,7 @@ impl Gen {
         // W-64: `[ebp-0x14]` = `EuclideanDistXYZ_58490(listener, blast)`,
         // stored only past the silent-emitter and hearing-range exits.
         self.m27_v34_slot.2 = if fl & 0x80 == 0 && sq <= 0x0900_0000 {
-            Some(crate::mc2::morph::dist2d(ctx.px, ctx.py, bx as i32, by as i32) as u32)
+            Some(crate::mc2::morph::dist2d(lpx, lpy, bx as i32, by as i32) as u32)
         } else {
             None
         };
@@ -3004,8 +3045,8 @@ impl Gen {
     /// `life_0x8 >= 0` (EF:39975) — a DEAD wizard is not on it. Retail's
     /// human is a pool record and takes that test for free; ours is a
     /// ctx pose and must take the roster's ENTRY condition here
-    /// (`pdead_top`, the value the roster was built with — not
-    /// `pdead`, the live sign). No invisibility test: `sub_2A6F0` has
+    /// (`dead_top`, the value the roster was built with — not
+    /// `dead`, the live sign). No invisibility test: `sub_2A6F0` has
     /// none. mc2l24 walk 35492→35493: the human has been a corpse
     /// since ≈35145 (action 3, life −347); body 5's branch 61 draws
     /// `v34 = 0` (draw #B & 7) on an aligned phase and scans — retail
@@ -3761,7 +3802,10 @@ impl Gen {
     pub(crate) fn m27_v34_broken(&self, p: usize, i: usize) -> bool {
         p >= i
             || (p + 1..i).any(|k| {
+                // (the human's record is dispatched at the carpet
+                // anchor, which never touches `v34`)
                 self.ent[k].class64 != 0
+                    && self.hx_of_rec(k).is_none()
                     && !(self.ent[k].class64 == 5 && matches!(self.ent[k].tick70, 233 | 234))
             })
     }
@@ -4035,16 +4079,13 @@ mod tests {
         Gen::new(planes, assets, 1, ChassisParams::MC2, VerbSet::MC2)
     }
 
-    fn ctx() -> MobCtx {
+    fn ctx(g: &mut crate::engine::features::Gen) -> MobCtx {
+        *g.view_mut(crate::engine::world::Hx::FIRST) = crate::engine::features::SeatView {
+            z: 100,
+            ..Default::default()
+        };
         MobCtx {
-            px: 0,
-            py: 0,
-            pz: 100,
-            pyaw: 0,
-            pmana: 0,
-            pmana_max: 0,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: WorldPatches::RETAIL,
             mc2_turn: 0,
@@ -4164,9 +4205,9 @@ mod tests {
             e.f30 = 0;
         }
         g.rebuild_wiz_chain();
-        let mut c = ctx();
-        c.px = 20_000; // the human is well outside row 103's 5120
-        c.py = 20_000;
+        let c = ctx(&mut g);
+        g.view_mut(c.phx).x = 20_000; // the human is well outside row 103's 5120
+        g.view_mut(c.phx).y = 20_000;
         assert_eq!(
             g.m27_wizard_scan(br, &c),
             Some(other as u16),
@@ -4184,21 +4225,23 @@ mod tests {
     ///
     /// The free-run witness is `mc2l6-rival-spells-galore` t=25,532,
     /// where the possessed wizard is the HUMAN and the port takes the
-    /// `PLAYER_TARGET`/`ctx.pdead` arm. This test covers the POOL arm
+    /// `PLAYER_TARGET`/`view.dead` arm. This test covers the POOL arm
     /// (a rival wizard), which the recording corpus does not exercise.
     #[test]
     fn a_worm_drops_its_castle_target_when_the_wizard_dies() {
         // Live wizard: no revert, the head stays in 0xB2.
         let mut g = flat_gen();
         let (head, _, _) = worm_on_wizard(&mut g, 10_000);
-        g.m22_tick(head, &ctx());
+        let rig_ctx = ctx(&mut g);
+        g.m22_tick(head, &rig_ctx);
         assert_eq!(g.ent[head].tick70, M22_BASE + 2, "a live target holds 0xB2");
         assert_ne!(g.ent[head].f144, 0, "and keeps its playerEntityIndex");
 
         // Dead wizard: `cmpl $0x0,0x8(%eax) ; jl LABEL_17`.
         let mut g = flat_gen();
         let (head, _, _) = worm_on_wizard(&mut g, -1270);
-        g.m22_tick(head, &ctx());
+        let rig_ctx = ctx(&mut g);
+        g.m22_tick(head, &rig_ctx);
         assert_eq!(
             g.ent[head].tick70,
             M22_BASE + 1,
@@ -4211,7 +4254,8 @@ mod tests {
         let mut g = flat_gen();
         let (head, wiz, _) = worm_on_wizard(&mut g, 10_000);
         g.ent[wiz].flags |= 0x400;
-        g.m22_tick(head, &ctx());
+        let rig_ctx = ctx(&mut g);
+        g.m22_tick(head, &rig_ctx);
         assert_eq!(
             g.ent[head].tick70,
             M22_BASE + 1,
@@ -4222,7 +4266,8 @@ mod tests {
         let mut g = flat_gen();
         let (head, wiz, _) = worm_on_wizard(&mut g, 10_000);
         g.ent[wiz].class64 = 5;
-        g.m22_tick(head, &ctx());
+        let rig_ctx = ctx(&mut g);
+        g.m22_tick(head, &rig_ctx);
         assert_eq!(
             g.ent[head].tick70,
             M22_BASE + 1,

@@ -23,6 +23,7 @@
 //!
 //! Self-skips when the baked tree is absent (game data is optional).
 
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
 use mgc_sim::mc1::spells::SpellId;
@@ -126,8 +127,8 @@ fn castle_datum_reaverages_to_the_grown_corner_mean_each_transform() {
     let (cx, cy) = clear_spot(&planes);
     sculpt_peak(&mut planes, cx, cy);
     let mut w = World::new(planes, &things, seed, assets);
-    w.set_dev_spells(true);
-    w.grant_all_spells();
+    w.set_dev_spells(Hx::FIRST, true);
+    w.grant_all_spells(Hx::FIRST);
 
     let px = cx as f32 + 0.5;
     let pz = cy as f32 + 16.5;
@@ -161,7 +162,7 @@ fn castle_datum_reaverages_to_the_grown_corner_mean_each_transform() {
         "castle landed on the summit (built at ({btx}, {bty}), peak ({cx}, {cy}))"
     );
     let datum = |w: &World| (w.debug_castle_site_z().expect("castle site datum") / 32) as i32;
-    let (_, _, lvl) = w.loadout().castle.expect("castle panel");
+    let (_, _, lvl) = w.loadout(Hx::FIRST).castle.expect("castle panel");
     assert_eq!(lvl, 1, "castle established at level 1");
     let d1 = datum(&w);
     let mut trajectory = vec![(1u32, d1)];
@@ -184,7 +185,10 @@ fn castle_datum_reaverages_to_the_grown_corner_mean_each_transform() {
         for _ in 0..300 {
             w.tick(pose, PlayerCommand::default());
         }
-        let (_, _, lvl) = w.loadout().castle.expect("castle survives the upgrade");
+        let (_, _, lvl) = w
+            .loadout(Hx::FIRST)
+            .castle
+            .expect("castle survives the upgrade");
         assert_eq!(lvl as u32, want, "upgrade {want} completed");
         let d = datum(&w);
         assert_eq!(

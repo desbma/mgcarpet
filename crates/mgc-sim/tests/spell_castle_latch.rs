@@ -8,6 +8,7 @@
 //!
 //! Self-skips when the baked tree is absent.
 
+use mgc_sim::Hx;
 use mgc_sim::WorldPatches;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
@@ -99,8 +100,8 @@ fn castle_latch_retail_arm_reproduces_the_recorded_maze_castle() {
         return;
     };
     let mut w = build_world(&root);
-    w.set_dev_spells(true);
-    w.grant_all_spells();
+    w.set_dev_spells(Hx::FIRST, true);
+    w.grant_all_spells(Hx::FIRST);
     let wall_h = w.planes().height[234 * 256 + 16];
     assert_eq!(wall_h, 244, "the target wall stands before the cast");
 
@@ -128,8 +129,8 @@ fn castle_latch_retail_arm_fizzles_the_first_recorded_aim() {
         return;
     };
     let mut w = build_world(&root);
-    w.set_dev_spells(true);
-    w.grant_all_spells();
+    w.set_dev_spells(Hx::FIRST, true);
+    w.grant_all_spells(Hx::FIRST);
     cast_and_run(&mut w, recorded_pose(590), 60);
     assert_eq!(castle_tile(&w), None, "the yaw-590 launch scan refuses");
 }
@@ -148,8 +149,8 @@ fn castle_latch_patched_arm_refuses_the_recorded_cast() {
         castle_latch_bug: true,
         ..WorldPatches::RETAIL
     });
-    w.set_dev_spells(true);
-    w.grant_all_spells();
+    w.set_dev_spells(Hx::FIRST, true);
+    w.grant_all_spells(Hx::FIRST);
     for heading in [530u16, 590] {
         cast_and_run(&mut w, recorded_pose(heading), 60);
         assert_eq!(
@@ -193,8 +194,8 @@ fn castle_latch_patched_arm_keeps_the_carpet_anchored_corridor_build() {
         castle_latch_bug: true,
         ..WorldPatches::RETAIL
     });
-    w.set_dev_spells(true);
-    w.grant_all_spells();
+    w.set_dev_spells(Hx::FIRST, true);
+    w.grant_all_spells(Hx::FIRST);
     cast_and_run(&mut w, park, 110);
     assert_eq!(
         castle_tile(&w),
@@ -203,8 +204,8 @@ fn castle_latch_patched_arm_keeps_the_carpet_anchored_corridor_build() {
     );
 
     let mut w = build_world(&root);
-    w.set_dev_spells(true);
-    w.grant_all_spells();
+    w.set_dev_spells(Hx::FIRST, true);
+    w.grant_all_spells(Hx::FIRST);
     cast_and_run(&mut w, park, 60);
     assert_eq!(
         castle_tile(&w),

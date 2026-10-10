@@ -70,6 +70,7 @@ pub fn mail_trace_slot() -> usize {
 }
 
 use engine::world;
+pub use engine::world::Hx;
 use mc1::spells;
 
 /// Fixed simulation tick rate.
@@ -399,36 +400,36 @@ pub struct Simulation {
     /// Monotonic tick counter since level start. One tick = one of the
     /// original's game turns (events, water phase, sprite frames).
     pub tick: u64,
-    pub flyer: Flyer,
+    pub flyer: world::Seats<Flyer>,
     /// The two G-class flight tiers; fixed per run (replay headers
     /// must record them once replays exist).
-    pub thrust_model: ThrustModel,
-    pub altitude_model: AltitudeModel,
+    pub thrust_model: world::Seats<ThrustModel>,
+    pub altitude_model: world::Seats<AltitudeModel>,
     /// Faithful integer carpet state, authoritative under
     /// [`ThrustModel::Mc1`]; `flyer` is derived from it after each
     /// tick for the renderer/camera.
-    pub carpet: flight::Mc1State,
+    pub carpet: world::Seats<flight::Mc1State>,
     /// The MC2-only carpet channels (slow/stun webs, displacement
     /// mailbox, nudge latch, tuning row) — live under the
     /// [`verbs::FlightVerb::Mc2`] arm; the enhanced mover services
     /// the debuff channels too (the webs are gameplay).
-    pub carpet_mc2: flight::Mc2Ext,
+    pub carpet_mc2: world::Seats<flight::Mc2Ext>,
     /// The Accelerate override was live last tick (its expiry resets
     /// the speed target to +80 max forward, :65191-97).
-    accel_was_active: bool,
+    accel_was_active: world::Seats<bool>,
     /// Enhanced-throttle steering state (deliberate deviation).
     /// `aim_lead` = the chase-the-pointer desired-heading offset ahead
     /// of the carpet yaw, radians, clamped ±[`LEAD_MAX`] — the aim
     /// crosshair sits at yaw+lead and the carpet turns to close it.
     /// `turn_rate` = the ACTUAL rate the chase produced this tick,
     /// rad/s (feeds the proportional bank).
-    aim_lead: f32,
-    turn_rate: f32,
+    aim_lead: world::Seats<f32>,
+    turn_rate: world::Seats<f32>,
     /// Enhanced-altitude state (deliberate deviation): the pinned
     /// GROUND-RELATIVE desired altitude, engine units over terrain.
     /// PINNED through flings/pins/catapults (player ruling 6); reset
     /// to the spawn offset on respawn and re-seeded at level hand-off.
-    lift_desired: i16,
+    lift_desired: world::Seats<i16>,
     /// Weightless cheat (`gameplay.cheat.weightless`; `dev.lift_unclamped`
     /// until 2026-09-15; live-applied by the app): unclamp the
     /// desired-altitude band to the global lift
@@ -438,7 +439,7 @@ pub struct Simulation {
     /// MC2's barrel roll driver state (`sub_55C60`) — see
     /// [`flight::BarrelRoll`]. Idle (all-default) off-MC2 and between
     /// rolls; hash-quiet at rest so pinned goldens stay unmoved.
-    broll: flight::BarrelRoll,
+    broll: world::Seats<flight::BarrelRoll>,
     /// 256x256 height bytes, row-major `y * 256 + x`; empty means flat.
     /// The static fallback when no [`world::World`] is attached.
     terrain_height: Vec<u8>,
@@ -459,7 +460,7 @@ impl Simulation {
             terrain_height,
             ..Self::default()
         };
-        sim.sync_carpet_from_flyer();
+        sim.sync_carpet_from_flyer(Hx::FIRST);
         sim
     }
 
@@ -470,8 +471,47 @@ impl Simulation {
             world: Some(world),
             ..Self::default()
         };
-        sim.sync_carpet_from_flyer();
+        sim.sync_carpet_from_flyer(Hx::FIRST);
+        // Every further human seat the world holds gets its own flight
+        // tier, standing on its carpet record ([`World::add_human_seat`]).
+        let seats: Vec<Hx> = sim
+            .world
+            .as_ref()
+            .map_or(Vec::new(), |w| w.seat_ixs().skip(1).collect());
+        for hx in seats {
+            sim.push_sim_seat(hx);
+        }
         sim
+    }
+
+    /// One more seat's flight tier, seeded from the world's pose for
+    /// seat `hx` (its carpet record).
+    fn push_sim_seat(&mut self, hx: Hx) {
+        for (got, want) in [
+            (self.flyer.push(Flyer::default()), hx),
+            (self.thrust_model.push(self.thrust_model[Hx::FIRST]), hx),
+            (self.altitude_model.push(self.altitude_model[Hx::FIRST]), hx),
+            (self.carpet.push(flight::Mc1State::default()), hx),
+            (self.carpet_mc2.push(flight::Mc2Ext::default()), hx),
+            (self.accel_was_active.push(false), hx),
+            (self.aim_lead.push(0.0), hx),
+            (self.turn_rate.push(0.0), hx),
+            (self.lift_desired.push(0), hx),
+            (self.broll.push(flight::BarrelRoll::default()), hx),
+        ] {
+            assert_eq!(got, want, "the flight tier's seats stay index-aligned");
+        }
+        if let Some(w) = &self.world {
+            let (x, y, z) = w.human_pose(hx);
+            self.carpet[hx] = flight::Mc1State::from_tiles(
+                x as f32 / 256.0,
+                y as f32 / 256.0,
+                z as f32 / 256.0,
+                0.0,
+            );
+        }
+        self.sync_flyer_from_carpet(hx);
+        self.seed_lift_desired(hx);
     }
 
     /// Deterministic digest of the FULL sim state: the world's own
@@ -506,36 +546,43 @@ impl Simulation {
         } = self;
         let mut h = world::Fnv(0xcbf2_9ce4_8422_2325);
         tick.hash(&mut h);
-        // Floats by BIT PATTERN (the `Player::speed_boost` precedent):
-        // determinism here is bit-exact, and `-0.0` must not alias
-        // `0.0`.
-        for f in [
-            flyer.x,
-            flyer.y,
-            flyer.z,
-            flyer.vx,
-            flyer.vy,
-            flyer.vz,
-            flyer.yaw,
-            flyer.pitch,
-            flyer.roll,
-        ] {
-            f.to_bits().hash(&mut h);
+        // One flight block per seat, in seat order (a one-seat sim
+        // hashes exactly as the single block did).
+        for hx in flyer.ixs() {
+            let flyer = &flyer[hx];
+            // Floats by BIT PATTERN (the `Player::speed_boost` precedent):
+            // determinism here is bit-exact, and `-0.0` must not alias
+            // `0.0`.
+            for f in [
+                flyer.x,
+                flyer.y,
+                flyer.z,
+                flyer.vx,
+                flyer.vy,
+                flyer.vz,
+                flyer.yaw,
+                flyer.pitch,
+                flyer.roll,
+            ] {
+                f.to_bits().hash(&mut h);
+            }
+            (thrust_model[hx], altitude_model[hx]).hash(&mut h);
+            carpet[hx].hash(&mut h);
+            carpet_mc2[hx].hash(&mut h);
+            accel_was_active[hx].hash(&mut h);
+            turn_rate[hx].to_bits().hash(&mut h);
+            aim_lead[hx].to_bits().hash(&mut h);
+            lift_desired[hx].hash(&mut h);
         }
-        (thrust_model, altitude_model).hash(&mut h);
-        carpet.hash(&mut h);
-        carpet_mc2.hash(&mut h);
-        accel_was_active.hash(&mut h);
-        turn_rate.to_bits().hash(&mut h);
-        aim_lead.to_bits().hash(&mut h);
-        lift_desired.hash(&mut h);
         weightless.hash(&mut h);
         // Hash-quiet at rest (the transparent-at-pristine law): the
         // pinned goldens predate the barrel roll; a LIVE roll stamps a
         // tag byte (aliasing guard) + the driver state.
-        if broll.active() {
-            11u8.hash(&mut h);
-            broll.hash(&mut h);
+        for hx in broll.ixs() {
+            if broll[hx].active() {
+                11u8.hash(&mut h);
+                broll[hx].hash(&mut h);
+            }
         }
         terrain_height.hash(&mut h);
         // Folded, not re-derived: the world keeps its own pinned
@@ -549,27 +596,27 @@ impl Simulation {
     /// chase-steering lead (aim is instant, the hull catches up —
     /// player ruling 2026-07-23); under the faithful models aim IS the
     /// carpet heading.
-    pub fn aim_yaw(&self) -> f32 {
-        match self.thrust_model {
-            ThrustModel::Enhanced => self.flyer.yaw + self.aim_lead,
-            ThrustModel::Mc1 => self.flyer.yaw,
+    pub fn aim_yaw(&self, hx: Hx) -> f32 {
+        match self.thrust_model[hx] {
+            ThrustModel::Enhanced => self.flyer[hx].yaw + self.aim_lead[hx],
+            ThrustModel::Mc1 => self.flyer[hx].yaw,
         }
     }
 
     /// Whether the MC2 barrel roll is running. The app recenters its
     /// virtual stick / mouse-yaw accumulator while it is (retail's
     /// `rollDelta` zero recenters the mouse stick the same way).
-    pub fn barrel_rolling(&self) -> bool {
-        self.broll.active()
+    pub fn barrel_rolling(&self, hx: Hx) -> bool {
+        self.broll[hx].active()
     }
 
     /// What a hand offers the app's autofire macro this tick (see
     /// [`world::autofire`]); world-less sims have no spells.
-    pub fn autofire_hand(&self, right: bool) -> world::autofire::AutofireHand {
+    pub fn autofire_hand(&self, hx: Hx, right: bool) -> world::autofire::AutofireHand {
         self.world
             .as_ref()
             .map_or(world::autofire::AutofireHand::Manual, |w| {
-                w.autofire_hand(right)
+                w.autofire_hand(hx, right)
             })
     }
 
@@ -592,27 +639,27 @@ impl Simulation {
     /// hand-off, tests that set the flyer directly). Also seeds the
     /// enhanced-altitude desired offset from the pose (ruling 6: the
     /// spawn altitude is the reset point).
-    pub fn sync_carpet_from_flyer(&mut self) {
-        let f = self.flyer;
-        self.carpet = flight::Mc1State::from_tiles(f.x, f.z, f.y, f.yaw);
-        self.seed_lift_desired();
+    pub fn sync_carpet_from_flyer(&mut self, hx: Hx) {
+        let f = self.flyer[hx];
+        self.carpet[hx] = flight::Mc1State::from_tiles(f.x, f.z, f.y, f.yaw);
+        self.seed_lift_desired(hx);
     }
 
     /// Drop the Accelerate expiry edge (the replay RE-anchor: a fresh
     /// segment must not fire the +80 restore off the previous
     /// segment's stale arm).
-    pub fn clear_accel_edge(&mut self) {
-        self.accel_was_active = false;
+    pub fn clear_accel_edge(&mut self, hx: Hx) {
+        self.accel_was_active[hx] = false;
     }
 
     /// The reverse hand-off: derive the float flyer WHOLESALE from
     /// the integer carpet (the replay anchor — the carpet was just
     /// seeded from a recorded closure and is the sole authority).
     /// Velocities zero; the continuous yaw accumulator re-bases here.
-    pub fn sync_flyer_from_carpet(&mut self) {
+    pub fn sync_flyer_from_carpet(&mut self, hx: Hx) {
         const RAD: f32 = std::f32::consts::TAU / 2048.0;
-        let c = self.carpet;
-        let f = &mut self.flyer;
+        let c = self.carpet[hx];
+        let f = &mut self.flyer[hx];
         f.x = c.x as f32 / 256.0;
         f.z = c.y as f32 / 256.0;
         f.y = c.z as f32 / 256.0;
@@ -622,7 +669,7 @@ impl Simulation {
         f.vx = 0.0;
         f.vy = 0.0;
         f.vz = 0.0;
-        self.seed_lift_desired();
+        self.seed_lift_desired(hx);
     }
 
     /// The desired-altitude offset band, engine units over terrain:
@@ -641,23 +688,23 @@ impl Simulation {
 
     /// Seed the desired altitude from the current flyer pose (level
     /// hand-off / model switch), clamped into the game band.
-    fn seed_lift_desired(&mut self) {
-        let (x, z, y) = (self.flyer.x, self.flyer.z, self.flyer.y);
+    fn seed_lift_desired(&mut self, hx: Hx) {
+        let (x, z, y) = (self.flyer[hx].x, self.flyer[hx].z, self.flyer[hx].y);
         let g = self.ground_height(x, z);
         let (lo, hi) = self.lift_band();
-        self.lift_desired = (((y - g) * 256.0) as i32).clamp(lo as i32, hi as i32) as i16;
+        self.lift_desired[hx] = (((y - g) * 256.0) as i32).clamp(lo as i32, hi as i32) as i16;
     }
 
     /// Switch the altitude model mid-run (the options-menu path):
     /// entering the enhanced tier re-seeds the desired altitude at
     /// the live pose so the carpet doesn't lunge for a stale target.
-    pub fn set_altitude_model(&mut self, model: AltitudeModel) {
-        if model == self.altitude_model {
+    pub fn set_altitude_model(&mut self, hx: Hx, model: AltitudeModel) {
+        if model == self.altitude_model[hx] {
             return;
         }
-        self.altitude_model = model;
+        self.altitude_model[hx] = model;
         if model == AltitudeModel::ExtendedLift {
-            self.seed_lift_desired();
+            self.seed_lift_desired(hx);
         }
     }
 
@@ -666,8 +713,8 @@ impl Simulation {
     /// mover's stale state: the integer carpet resumes at its spawn
     /// seed (a phantom warp + inverted velocity), and the float flyer
     /// keeps velocities the faithful mover never writes.
-    pub fn set_thrust_model(&mut self, model: ThrustModel) {
-        if model == self.thrust_model {
+    pub fn set_thrust_model(&mut self, hx: Hx, model: ThrustModel) {
+        if model == self.thrust_model[hx] {
             return;
         }
         const RAD: f32 = std::f32::consts::TAU / 2048.0;
@@ -680,24 +727,24 @@ impl Simulation {
                 // cruise clamp), aim pitch seeded through the stick
                 // filter so the published aim starts where the
                 // enhanced camera was pointing.
-                self.sync_carpet_from_flyer();
-                let f = &self.flyer;
+                self.sync_carpet_from_flyer(hx);
+                let f = &self.flyer[hx];
                 let (sy, cy) = f.yaw.sin_cos();
                 let fwd = f.vx * sy - f.vz * cy;
                 let side = f.vx * cy + f.vz * sy;
                 let sp = (fwd * TICK_DT * 256.0).clamp(-80.0, 80.0) as i16;
-                self.carpet.act_speed = sp;
-                self.carpet.tgt_speed = sp;
-                self.carpet.strafe = (side * TICK_DT * 256.0).clamp(-80.0, 80.0) as i16;
-                self.carpet.pitch_f = (-f.pitch / RAD).clamp(-254.0, 254.0) as i16;
-                self.carpet.aim_pitch = (self.carpet.pitch_f as u16) & 0x7FF;
+                self.carpet[hx].act_speed = sp;
+                self.carpet[hx].tgt_speed = sp;
+                self.carpet[hx].strafe = (side * TICK_DT * 256.0).clamp(-80.0, 80.0) as i16;
+                self.carpet[hx].pitch_f = (-f.pitch / RAD).clamp(-254.0, 254.0) as i16;
+                self.carpet[hx].aim_pitch = (self.carpet[hx].pitch_f as u16) & 0x7FF;
             }
             ThrustModel::Enhanced => {
                 // Faithful → enhanced: the flyer pose is derived
                 // fresh every tick; hand the carpet speeds over as
                 // the float velocity (forward + strafe, tiles/sec).
-                let c = self.carpet;
-                let f = &mut self.flyer;
+                let c = self.carpet[hx];
+                let f = &mut self.flyer[hx];
                 let (sy, cy) = f.yaw.sin_cos();
                 let fwd_v = c.act_speed as f32 / 256.0 / TICK_DT;
                 let side_v = c.strafe as f32 / 256.0 / TICK_DT;
@@ -707,29 +754,57 @@ impl Simulation {
             }
         }
         // The enhanced turn damper starts (and leaves) centered.
-        self.turn_rate = 0.0;
-        self.aim_lead = 0.0;
+        self.turn_rate[hx] = 0.0;
+        self.aim_lead[hx] = 0.0;
         // The v14 brake latch is the CLASSIC mover's (the enhanced
         // controls brake immediately and never write it): a stale
         // `true` carried across the switch would end every later
         // Accelerate/Speed cast on its first token pass.
         if let Some(w) = &mut self.world {
-            w.mc1_v14 = false;
+            w.mc1_v14[hx] = false;
         }
-        self.thrust_model = model;
+        self.thrust_model[hx] = model;
     }
 
-    /// Advance exactly one fixed tick.
+    /// Advance exactly one fixed tick — the one-seat turn.
     pub fn step(&mut self, input: &FlightInput) {
-        self.tick += 1;
+        self.step_seats(std::slice::from_ref(input));
+    }
 
+    /// ⭐ MULTIPLAYER STAGE 3, SLICE 5c — ONE TICK FOR EVERY HUMAN SEAT,
+    /// one [`FlightInput`] each in seat order. Each seat's controls
+    /// resolve on their own (`step_pre`), then ONE world turn walks the
+    /// pool with every seat's mover at its own carpet record's slot
+    /// ([`world::World::tick_flight_seats`]), then each seat settles its
+    /// flight tier (`step_post`). One seat is the single-player tick.
+    pub fn step_seats(&mut self, inputs: &[FlightInput]) {
+        assert_eq!(
+            inputs.len(),
+            self.flyer.ixs().count(),
+            "one FlightInput per human seat"
+        );
+        self.tick += 1;
+        let mut pres = Vec::with_capacity(inputs.len());
+        for (hx, input) in self.flyer.ixs().zip(inputs) {
+            pres.push(self.step_pre(hx, input));
+        }
+        let walked = self.step_turn(&pres);
+        for ((hx, pre), (walked_prev, kernel_refs)) in self.flyer.ixs().zip(&pres).zip(walked) {
+            self.step_post(hx, pre, walked_prev, kernel_refs);
+        }
+    }
+
+    /// One seat's controls before the world turn: the death/end-sequence
+    /// input overrides, the barrel roll, the Accelerate cancel, the full
+    /// stop and the pre-walk movers.
+    fn step_pre(&mut self, hx: Hx, input: &FlightInput) -> SeatPre {
         // The death fall / dead wait override the controls: the
         // original's dead wizard never reaches the command handler
         // (sub_46840 is skipped from state 2 on) — the stick filters
         // decay, the speed targets freeze, casts stop. Only the
         // respawn key passes through.
         let (falling, dead) = match &self.world {
-            Some(w) => (w.player_falling(), w.player_dead()),
+            Some(w) => (w.player_falling(hx), w.player_dead(hx)),
             None => (false, false),
         };
         let mut input = *input;
@@ -776,16 +851,16 @@ impl Simulation {
             .world
             .as_ref()
             .is_some_and(|w| w.verbs().flight == verbs::FlightVerb::Mc2);
-        let classic_walk = self.thrust_model == ThrustModel::Mc1 && self.world.is_some();
-        let enhanced_walk = self.thrust_model == ThrustModel::Enhanced && self.world.is_some();
+        let classic_walk = self.thrust_model[hx] == ThrustModel::Mc1 && self.world.is_some();
+        let enhanced_walk = self.thrust_model[hx] == ThrustModel::Enhanced && self.world.is_some();
         let walk = classic_walk || enhanced_walk;
         if dead {
-            self.flyer.vx = 0.0;
-            self.flyer.vy = 0.0;
-            self.flyer.vz = 0.0;
+            self.flyer[hx].vx = 0.0;
+            self.flyer[hx].vy = 0.0;
+            self.flyer[hx].vz = 0.0;
             // The enhanced turn damper is steering state — pinned too.
-            self.turn_rate = 0.0;
-            self.aim_lead = 0.0;
+            self.turn_rate[hx] = 0.0;
+            self.aim_lead[hx] = 0.0;
         }
         // The MC2 ending sequence seizes the flyer (retail swaps the
         // player's actionIndex to 11, sub_5E8C0 — every control
@@ -794,7 +869,7 @@ impl Simulation {
         let end_seized = self
             .world
             .as_ref()
-            .is_some_and(|w| w.mc2_end_pose().is_some());
+            .is_some_and(|w| w.mc2_end_pose(hx).is_some());
         if end_seized {
             input = FlightInput::default();
         }
@@ -807,14 +882,14 @@ impl Simulation {
         // X only, the pitch stick stays live. The START tick's move
         // still sees the live stick, like retail: the driver's zero
         // runs after the move.
-        let rolling_before = self.broll.active();
+        let rolling_before = self.broll[hx].active();
         if input.barrel_roll
             && self
                 .world
                 .as_ref()
                 .is_some_and(|w| w.verbs().flight == verbs::FlightVerb::Mc2)
         {
-            self.broll.arm();
+            self.broll[hx].arm();
         }
         if rolling_before {
             input.stick_x = 0;
@@ -844,9 +919,9 @@ impl Simulation {
                 Some(_) => 0.0,
                 None => input.thrust,
             };
-            w.thrust_cancel(thrust);
-            if self.thrust_model == ThrustModel::Enhanced {
-                w.accel_brake_immediate(thrust);
+            w.thrust_cancel(hx, thrust);
+            if self.thrust_model[hx] == ThrustModel::Enhanced {
+                w.accel_brake_immediate(hx, thrust);
             }
         }
 
@@ -859,21 +934,21 @@ impl Simulation {
         // skips the spell's guarded drive block, so no +80/minSpeed
         // restore may fire (EF:56203 guard).
         if input.full_stop {
-            self.carpet.act_speed = 0;
-            self.carpet.tgt_speed = 0;
+            self.carpet[hx].act_speed = 0;
+            self.carpet[hx].tgt_speed = 0;
             // The enhanced mover's float velocities are its speed
             // state — the enhancement's analog of the same stop.
-            self.flyer.vx = 0.0;
-            self.flyer.vy = 0.0;
-            self.flyer.vz = 0.0;
+            self.flyer[hx].vx = 0.0;
+            self.flyer[hx].vy = 0.0;
+            self.flyer[hx].vz = 0.0;
             if let Some(w) = &mut self.world {
-                w.full_stop_cancel_accel();
+                w.full_stop_cancel_accel(hx);
             }
-            self.accel_was_active = false;
+            self.accel_was_active[hx] = false;
             // The enhanced turn damper recenters with the steering
             // (the stop's SetCenterScreenForFlyAssistant analog).
-            self.turn_rate = 0.0;
-            self.aim_lead = 0.0;
+            self.turn_rate[hx] = 0.0;
+            self.aim_lead[hx] = 0.0;
         }
 
         // The faithful mover on a live world steps INSIDE the world
@@ -890,22 +965,22 @@ impl Simulation {
         // world-less sims) the MC1 arm.
         // The enhanced kernel's reference pose: the carpet BEFORE the
         // prelude, so the prelude's spin reaches the flyer too.
-        let pre_walk = self.carpet;
-        match self.thrust_model {
+        let pre_walk = self.carpet[hx];
+        match self.thrust_model[hx] {
             ThrustModel::Mc1 => {
                 if !classic_walk {
                     // World-less: MC2's gate/ceiling data needs a world.
-                    self.move_mc1(input);
+                    self.move_mc1(hx, input);
                 } else if walk_mc2 {
-                    self.mc2_walk_prelude(input);
+                    self.mc2_walk_prelude(hx, input);
                 }
             }
             ThrustModel::Enhanced if enhanced_walk => {
                 if walk_mc2 {
-                    self.mc2_walk_prelude(input);
+                    self.mc2_walk_prelude(hx, input);
                 }
             }
-            ThrustModel::Enhanced => self.move_enhanced(input),
+            ThrustModel::Enhanced => self.move_enhanced(hx, input),
         }
 
         // The death fall and the dead wait run world-side, at the
@@ -928,74 +1003,153 @@ impl Simulation {
             suicide: input.suicide,
             cheat: input.cheat,
         };
+
+        SeatPre {
+            input: *input,
+            falling,
+            dead,
+            walk_mc2,
+            classic_walk,
+            enhanced_walk,
+            walk,
+            pre_walk,
+            pcmd,
+        }
+    }
+
+    /// The world turn for every seat at once: each seat's faithful
+    /// mover (or the enhanced kernel inside it) is handed to the walk,
+    /// which steps it at that seat's carpet slot. Returns, per seat, the
+    /// pre-turn carpet (`None` when the seat did not walk) and the
+    /// enhanced kernel's reference pose.
+    fn step_turn(
+        &mut self,
+        pres: &[SeatPre],
+    ) -> Vec<(Option<flight::Mc1State>, Option<KernelRefs>)> {
         // Faithful MC1/HW on a live world: the pre-move channels are
         // sampled at the tick head (the conform replay driver's phase
         // law — Accelerate restore edge, armed knock), then the world
         // turn steps the carpet at its walk slot (tick_flight); the
         // flyer derives after.
-        let mut walked_prev: Option<flight::Mc1State> = None;
-        let mut kernel_refs = None;
-        if walk && let Some(w) = &mut self.world {
-            // The Accelerate kill and the speed writes resolve
-            // INSIDE the walk at the token's own slot (below-carpet
-            // mail via World::step_player_flight, above-carpet mail
-            // taken after the turn below); this tick-head sample is
-            // just the drive's initial value and the faithful MC1
-            // world path forces the override off.
-            let over = w.accel_override();
-            let prev = self.carpet;
-            let mut kernel = enhanced_walk.then(|| EnhancedKernel {
-                flyer: &mut self.flyer,
-                aim_lead: &mut self.aim_lead,
-                turn_rate: &mut self.turn_rate,
-                input: *input,
-                over,
-                pitch_climbs: self.altitude_model == AltitudeModel::Faithful,
-                refs: KernelRefs::of(&pre_walk),
-            });
-            let mut drive = world::FlightDrive {
-                propel: kernel.as_mut().map(|k| k as &mut dyn flight::CarpetPropel),
-                s: &mut self.carpet,
-                inp: mc1_input(input),
-                over,
-                falling,
-                dead,
-                mc2: walk_mc2.then_some(world::Mc2Drive {
-                    ext: &mut self.carpet_mc2,
-                    accel_was_active: &mut self.accel_was_active,
-                }),
-            };
-            w.tick_flight(&mut drive, pcmd);
-            kernel_refs = kernel.map(|k| k.refs);
-            walked_prev = Some(prev);
+        let Some(w) = self.world.as_mut() else {
+            return pres.iter().map(|_| (None, None)).collect();
+        };
+        if !pres.iter().any(|p| p.walk) {
+            return pres.iter().map(|_| (None, None)).collect();
         }
+        // The Accelerate kill and the speed writes resolve INSIDE the
+        // walk at the token's own slot (below-carpet mail via
+        // World::step_player_flight, above-carpet mail taken after the
+        // turn below); this tick-head sample is just the drive's
+        // initial value and the faithful MC1 world path forces the
+        // override off.
+        let overs: Vec<Option<f32>> = self.flyer.ixs().map(|hx| w.accel_override(hx)).collect();
+        let prevs: Vec<flight::Mc1State> = self.flyer.ixs().map(|hx| self.carpet[hx]).collect();
+        let altitude: Vec<AltitudeModel> =
+            self.flyer.ixs().map(|hx| self.altitude_model[hx]).collect();
+        let mut kernels: Vec<Option<EnhancedKernel<'_>>> = self
+            .flyer
+            .iter_mut()
+            .zip(self.aim_lead.iter_mut())
+            .zip(self.turn_rate.iter_mut())
+            .enumerate()
+            .map(|(k, ((flyer, aim_lead), turn_rate))| {
+                let p = &pres[k];
+                (p.walk && p.enhanced_walk).then(|| EnhancedKernel {
+                    flyer,
+                    aim_lead,
+                    turn_rate,
+                    input: p.input,
+                    over: overs[k],
+                    pitch_climbs: altitude[k] == AltitudeModel::Faithful,
+                    refs: KernelRefs::of(&p.pre_walk),
+                })
+            })
+            .collect();
+        let mut drives: Vec<Option<world::FlightDrive<'_>>> = kernels
+            .iter_mut()
+            .zip(self.carpet.iter_mut())
+            .zip(self.carpet_mc2.iter_mut())
+            .zip(self.accel_was_active.iter_mut())
+            .enumerate()
+            .map(|(k, (((kernel, s), ext), accel_was_active))| {
+                let p = &pres[k];
+                p.walk.then(|| world::FlightDrive {
+                    propel: kernel.as_mut().map(|k| k as &mut dyn flight::CarpetPropel),
+                    s,
+                    inp: mc1_input(&p.input),
+                    over: overs[k],
+                    falling: p.falling,
+                    dead: p.dead,
+                    mc2: p.walk_mc2.then_some(world::Mc2Drive {
+                        ext,
+                        accel_was_active,
+                    }),
+                })
+            })
+            .collect();
+        let mut seats: Vec<(Hx, &mut world::FlightDrive<'_>, world::PlayerCommand)> = drives
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(k, d)| d.as_mut().map(|d| (Hx(k as u8), d, pres[k].pcmd)))
+            .collect();
+        w.tick_flight_seats(&mut seats);
+        drop(seats);
+        drop(drives);
+        kernels
+            .into_iter()
+            .enumerate()
+            .map(|(k, kernel)| {
+                let walked_prev = pres[k].walk.then_some(prevs[k]);
+                (walked_prev, kernel.map(|k| k.refs))
+            })
+            .collect()
+    }
+
+    /// One seat's flight tier after the world turn: the lift law, the
+    /// flyer derive, the barrel roll and the post-turn mail takes.
+    fn step_post(
+        &mut self,
+        hx: Hx,
+        pre: &SeatPre,
+        walked_prev: Option<flight::Mc1State>,
+        kernel_refs: Option<KernelRefs>,
+    ) {
+        let SeatPre {
+            ref input,
+            falling,
+            dead,
+            walk_mc2,
+            classic_walk,
+            ..
+        } = *pre;
         if let Some(prev) = walked_prev
             && walk_mc2
         {
-            self.mc2_walk_lift(input, falling, dead);
+            self.mc2_walk_lift(hx, input, falling, dead);
             match kernel_refs {
                 // The enhanced flyer follows whatever the shared
                 // dispatch did to the carpet after its kernel ran
                 // (knock, leash, gate, vertical, lift law).
-                Some(refs) => refs.follow(&mut self.flyer, &self.carpet),
-                None => self.derive_flyer(prev),
+                Some(refs) => refs.follow(&mut self.flyer[hx], &self.carpet[hx]),
+                None => self.derive_flyer(hx, prev),
             }
         } else if let Some(prev) = walked_prev {
             // Enhanced altitude: the desired-altitude law (deliberate
             // deviation), after the in-walk move — vertical only, the
             // z-floor stays (see move_mc1's pre-tick twin). Skipped
             // during the death fall/dead wait.
-            if self.altitude_model == AltitudeModel::ExtendedLift && !falling && !dead {
+            if self.altitude_model[hx] == AltitudeModel::ExtendedLift && !falling && !dead {
                 let g = self
                     .world
                     .as_ref()
                     .expect("faithful walk has a world")
-                    .ground_z_engine(self.carpet.x, self.carpet.y);
+                    .ground_z_engine(self.carpet[hx].x, self.carpet[hx].y);
                 let (hi, cap) = self.lift_caps(g, LIFT_BAND_MC1);
-                self.carpet.z = lift_desired_law(
-                    self.carpet.z,
+                self.carpet[hx].z = lift_desired_law(
+                    self.carpet[hx].z,
                     g,
-                    &mut self.lift_desired,
+                    &mut self.lift_desired[hx],
                     input.lift,
                     128,
                     hi,
@@ -1005,8 +1159,8 @@ impl Simulation {
                 );
             }
             match kernel_refs {
-                Some(refs) => refs.follow(&mut self.flyer, &self.carpet),
-                None => self.derive_flyer(prev),
+                Some(refs) => refs.follow(&mut self.flyer[hx], &self.carpet[hx]),
+                None => self.derive_flyer(hx, prev),
             }
         }
         // The barrel-roll driver runs after the move AND after the
@@ -1019,23 +1173,23 @@ impl Simulation {
         // (retail's phase-8 arm), so the normal bank publish resumes
         // seam-free — the masked rest angle `(|bank|+2048) & 0x7FF`
         // IS the live bank.
-        if self.broll.active() {
+        if self.broll[hx].active() {
             const ROLL_RAD: f32 = std::f32::consts::TAU / 2048.0;
-            let bank = match self.thrust_model {
-                ThrustModel::Mc1 => self.carpet.roll_f,
+            let bank = match self.thrust_model[hx] {
+                ThrustModel::Mc1 => self.carpet[hx].roll_f,
                 // The enhanced bank is a derived float — feed it back
                 // in angle units so the phase targets track it the
                 // same way.
-                ThrustModel::Enhanced => (self.flyer.roll / ROLL_RAD) as i16,
+                ThrustModel::Enhanced => (self.flyer[hx].roll / ROLL_RAD) as i16,
             };
-            let out = self.broll.tick(bank, input.raw_dx);
+            let out = self.broll[hx].tick(bank, input.raw_dx);
             if out.lock_break
                 && let Some(w) = &mut self.world
             {
                 w.mc2_break_player_locks();
             }
             if let Some(v) = out.view {
-                self.flyer.roll = v as f32 * ROLL_RAD;
+                self.flyer[hx].roll = v as f32 * ROLL_RAD;
             }
         }
 
@@ -1084,11 +1238,11 @@ impl Simulation {
             // possession bolt launched at 384 − 400 = −16, i.e.
             // hanging in the air even from a standstill
             // (player-reported 2026-09-19).
-            if let Some(base) = w.take_speed_base()
-                && self.thrust_model == ThrustModel::Mc1
+            if let Some(base) = w.take_speed_base(hx)
+                && self.thrust_model[hx] == ThrustModel::Mc1
             {
-                self.carpet.tgt_speed = base;
-                self.carpet.act_speed = base;
+                self.carpet[hx].tgt_speed = base;
+                self.carpet[hx].act_speed = base;
             }
             // Respawn (sub_44D30): reposition at the castle's FULL
             // position (:54858-61), flight state zeroed (thrust
@@ -1103,16 +1257,16 @@ impl Simulation {
             // `mgc-conform replay` could not see it because its pose
             // channel GATES the death/respawn domain — the app's own
             // `--replay-check` is what caught it.
-            if let Some((x, z, alt)) = w.take_respawn() {
-                let yaw_i = self.carpet.yaw;
-                let f = &mut self.flyer;
+            if let Some((x, z, alt)) = w.take_respawn(hx) {
+                let yaw_i = self.carpet[hx].yaw;
+                let f = &mut self.flyer[hx];
                 f.x = x;
                 f.z = z;
                 f.y = alt;
                 f.vx = 0.0;
                 f.vy = 0.0;
                 f.vz = 0.0;
-                if self.thrust_model == ThrustModel::Mc1 {
+                if self.thrust_model[hx] == ThrustModel::Mc1 {
                     // ⭐ THE RESPAWN CLEARS EXACTLY THREE REGISTERS
                     // (:54868-83) — `v_12` (target speed), `v_16`
                     // (strafe) and the knock triple, which the world
@@ -1129,7 +1283,7 @@ impl Simulation {
                     // stay one law, and they had drifted apart, which
                     // is exactly what let the app's `--replay-check`
                     // see a divergence `mgc-conform replay` could not.
-                    let s = &mut self.carpet;
+                    let s = &mut self.carpet[hx];
                     s.x = (f.x.rem_euclid(256.0) * 256.0) as u16;
                     s.y = (f.z.rem_euclid(256.0) * 256.0) as u16;
                     s.z = (alt * 256.0) as i16;
@@ -1137,7 +1291,7 @@ impl Simulation {
                     s.strafe = 0;
                     s.yaw = yaw_i;
                 } else {
-                    self.carpet = flight::Mc1State::from_tiles(f.x, f.z, f.y, f.yaw);
+                    self.carpet[hx] = flight::Mc1State::from_tiles(f.x, f.z, f.y, f.yaw);
                 }
                 // Ruling 6: death/respawn resets the pinned desired
                 // altitude to the spawn offset (ground + one tile).
@@ -1147,11 +1301,11 @@ impl Simulation {
                 } else {
                     (128, LIFT_BAND_MC1)
                 };
-                self.lift_desired = 256i16.clamp(lo, hi);
-                self.turn_rate = 0.0;
-                self.aim_lead = 0.0;
+                self.lift_desired[hx] = 256i16.clamp(lo, hi);
+                self.turn_rate[hx] = 0.0;
+                self.aim_lead[hx] = 0.0;
             }
-            if let Some((x, z, alt)) = w.take_teleport() {
+            if let Some((x, z, alt)) = w.take_teleport(hx) {
                 // Teleport arrival: `CopyEntityPosition` hands the
                 // FULL destination axis to the wizard where retail
                 // authors one — the vortex/pad warp lands exactly on
@@ -1161,32 +1315,32 @@ impl Simulation {
                 // leaves z untouched (the mover's own z-floor digs it
                 // out of higher terrain next move, :55103-05).
                 // Velocity/steering carry over — position only.
-                let f = &mut self.flyer;
+                let f = &mut self.flyer[hx];
                 f.x = x;
                 f.z = z;
                 if let Some(alt) = alt {
                     f.y = alt;
                 }
-                self.carpet.x = (x.rem_euclid(256.0) * 256.0) as u16;
-                self.carpet.y = (z.rem_euclid(256.0) * 256.0) as u16;
-                self.carpet.z = (self.flyer.y * 256.0) as i16;
+                self.carpet[hx].x = (x.rem_euclid(256.0) * 256.0) as u16;
+                self.carpet[hx].y = (z.rem_euclid(256.0) * 256.0) as u16;
+                self.carpet[hx].z = (self.flyer[hx].y * 256.0) as i16;
                 // The pinned ground-relative desired altitude is a
                 // port-model quantity — re-seed it at the arrival
                 // pose (the spawn-seed law, inlined like the respawn
                 // arm's): retail has no absolute altitude hold, so a
                 // ground-level emergence must not auto-climb back to
                 // the departure altitude.
-                let g = w.ground_height_tiles(self.flyer.x, self.flyer.z);
+                let g = w.ground_height_tiles(self.flyer[hx].x, self.flyer[hx].z);
                 let (lo, hi) = if w.verbs().flight == verbs::FlightVerb::Mc2 {
                     let row = w.mc2_carpet_row();
                     (row.clearance, row.band)
                 } else {
                     (128, LIFT_BAND_MC1)
                 };
-                self.lift_desired =
-                    (((self.flyer.y - g) * 256.0) as i32).clamp(lo as i32, hi as i32) as i16;
+                self.lift_desired[hx] =
+                    (((self.flyer[hx].y - g) * 256.0) as i32).clamp(lo as i32, hi as i32) as i16;
             }
-            if w.take_speed_zero() {
+            if w.take_speed_zero(hx) {
                 // The teleport spell's `Type_160 v_12 = 0`
                 // (:65583/:65601/:65614; MC2 EF:57029/57046): the
                 // TARGET speed alone — the actual then chases down
@@ -1194,10 +1348,10 @@ impl Simulation {
                 // mover's float velocity is its speed state; kill the
                 // horizontal component as the same stop (vertical is
                 // outside retail's word).
-                self.carpet.tgt_speed = 0;
-                if self.thrust_model == ThrustModel::Enhanced {
-                    self.flyer.vx = 0.0;
-                    self.flyer.vz = 0.0;
+                self.carpet[hx].tgt_speed = 0;
+                if self.thrust_model[hx] == ThrustModel::Enhanced {
+                    self.flyer[hx].vx = 0.0;
+                    self.flyer[hx].vz = 0.0;
                 }
             }
             // The MC2 ending sequence: mirror the scripted pose onto
@@ -1218,8 +1372,8 @@ impl Simulation {
             // touches the other. The conformance driver dropped this
             // same block for the same reason; the flyer follows from
             // `derive_flyer` above.
-            if !classic_walk && let Some((x, alt, z, yaw)) = w.mc2_end_pose() {
-                let f = &mut self.flyer;
+            if !classic_walk && let Some((x, alt, z, yaw)) = w.mc2_end_pose(hx) {
+                let f = &mut self.flyer[hx];
                 f.x = x;
                 f.z = z;
                 f.y = alt;
@@ -1231,14 +1385,15 @@ impl Simulation {
                 // sign·3)>>2, in float space: geometric decay to 0.
                 f.roll -= f.roll * 0.125;
                 f.pitch -= f.pitch * 0.25;
-                self.carpet.x = (x.rem_euclid(256.0) * 256.0) as u16;
-                self.carpet.y = (z.rem_euclid(256.0) * 256.0) as u16;
-                self.carpet.z = (alt * 256.0) as i16;
-                self.carpet.yaw = ((yaw.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU
+                self.carpet[hx].x = (x.rem_euclid(256.0) * 256.0) as u16;
+                self.carpet[hx].y = (z.rem_euclid(256.0) * 256.0) as u16;
+                self.carpet[hx].z = (alt * 256.0) as i16;
+                self.carpet[hx].yaw = ((yaw.rem_euclid(std::f32::consts::TAU)
+                    / std::f32::consts::TAU
                     * 2048.0) as u16)
                     & 0x7FF;
-                self.carpet.act_speed = 0;
-                self.carpet.tgt_speed = 0;
+                self.carpet[hx].act_speed = 0;
+                self.carpet[hx].tgt_speed = 0;
             }
         }
     }
@@ -1246,7 +1401,7 @@ impl Simulation {
     /// The faithful MC1 mover (remc1 sub_455D0, ported in [`flight`])
     /// over the integer carpet state; `flyer` is derived from it for
     /// the renderer/camera afterwards.
-    fn move_mc1(&mut self, input: &FlightInput) {
+    fn move_mc1(&mut self, hx: Hx, input: &FlightInput) {
         debug_assert!(self.world.is_none(), "a live world flies the walk");
         let th = &self.terrain_height;
         let ground = |x: u16, y: u16| -> i16 {
@@ -1257,18 +1412,20 @@ impl Simulation {
             th[ty * MAP_TILES + tx] as i16 * 32
         };
         let inp = mc1_input(input);
-        let prev = self.carpet;
-        flight::mc1_move(&mut self.carpet, &inp, None, None, &ground, &|_, p| {
+        let prev = self.carpet[hx];
+        flight::mc1_move(&mut self.carpet[hx], &inp, None, None, &ground, &|_, p| {
             (true, p)
         });
-        if self.altitude_model == AltitudeModel::ExtendedLift {
-            let g = (self.ground_height(self.carpet.x as f32 / 256.0, self.carpet.y as f32 / 256.0)
-                * 256.0) as i16;
+        if self.altitude_model[hx] == AltitudeModel::ExtendedLift {
+            let g = (self.ground_height(
+                self.carpet[hx].x as f32 / 256.0,
+                self.carpet[hx].y as f32 / 256.0,
+            ) * 256.0) as i16;
             let (hi, cap) = self.lift_caps(g, LIFT_BAND_MC1);
-            self.carpet.z = lift_desired_law(
-                self.carpet.z,
+            self.carpet[hx].z = lift_desired_law(
+                self.carpet[hx].z,
                 g,
-                &mut self.lift_desired,
+                &mut self.lift_desired[hx],
                 input.lift,
                 128,
                 hi,
@@ -1277,22 +1434,22 @@ impl Simulation {
                 LIFT_DRIFT_MC1,
             );
         }
-        self.derive_flyer(prev);
+        self.derive_flyer(hx, prev);
     }
 
     /// Derive the float flyer for the renderer from the integer
     /// carpet: yaw stays CONTINUOUS (accumulated radians) across the
     /// 11-bit wrap so the camera lerp never spins the long way.
     /// Shared tail of the two faithful movers.
-    fn derive_flyer(&mut self, prev: flight::Mc1State) {
+    fn derive_flyer(&mut self, hx: Hx, prev: flight::Mc1State) {
         const RAD: f32 = std::f32::consts::TAU / 2048.0;
-        let mut dyaw = (self.carpet.yaw as i32 - prev.yaw as i32) & 0x7FF;
+        let mut dyaw = (self.carpet[hx].yaw as i32 - prev.yaw as i32) & 0x7FF;
         if dyaw > 1024 {
             dyaw -= 2048;
         }
         let wrapd = |a: u16, b: u16| b.wrapping_sub(a) as i16 as f32 / 256.0;
-        let c = self.carpet;
-        let f = &mut self.flyer;
+        let c = self.carpet[hx];
+        let f = &mut self.flyer[hx];
         f.yaw += dyaw as f32 * RAD;
         // Engine pitch is positive-DOWN; the flyer's is positive-up.
         // This is the FULL aim pitch (casts use it); the app camera
@@ -1322,49 +1479,49 @@ impl Simulation {
     /// own walk slot ([`world::World::step_player_flight_mc2`]). The
     /// Accelerate restore edge, the knock and the debuff drain are
     /// NOT here — those all belong to the dispatch.
-    fn mc2_walk_prelude(&mut self, input: &FlightInput) {
+    fn mc2_walk_prelude(&mut self, hx: Hx, input: &FlightInput) {
         // The tuning row per map type (spawn-time in retail via
         // AddPlayer_4A920; the map type never changes mid-level).
         if let Some(w) = &self.world {
-            self.carpet_mc2.row = w.mc2_carpet_row();
+            self.carpet_mc2[hx].row = w.mc2_carpet_row();
         }
         // The tornado's forced turn (`sub_33340`'s wizard arm writes
         // `yaw_0x1C_28` on every arm — see `Gen::player_spin`), ahead
         // of the move so this tick's flight rides the imposed heading.
         if let Some(w) = &mut self.world {
-            let spin = w.take_player_spin();
+            let spin = w.take_player_spin(hx);
             if spin != 0 {
-                self.carpet.yaw = (self.carpet.yaw as i32 + spin as i32) as u16 & 0x7FF;
+                self.carpet[hx].yaw = (self.carpet[hx].yaw as i32 + spin as i32) as u16 & 0x7FF;
             }
         }
         // A replay-recovered speed command IS the target (the
         // cmd_speed lane, mouse-proportional — the key servo stays
         // out via `mc1_input`'s bit strip).
         if let Some(v) = input.mc2_cmd_speed {
-            self.carpet.tgt_speed = v;
+            self.carpet[hx].tgt_speed = v;
         }
     }
 
     /// The ExtendedLift deviation's MC2 tail, after the in-walk move
     /// (both control modes).
-    fn mc2_walk_lift(&mut self, input: &FlightInput, falling: bool, dead: bool) {
-        if self.altitude_model != AltitudeModel::ExtendedLift
-            || self.carpet_mc2.mobilize != 0
+    fn mc2_walk_lift(&mut self, hx: Hx, input: &FlightInput, falling: bool, dead: bool) {
+        if self.altitude_model[hx] != AltitudeModel::ExtendedLift
+            || self.carpet_mc2[hx].mobilize != 0
             || falling
             || dead
         {
             return;
         }
-        let (cx, cy) = (self.carpet.x, self.carpet.y);
-        let row = self.carpet_mc2.row;
+        let (cx, cy) = (self.carpet[hx].x, self.carpet[hx].y);
+        let row = self.carpet_mc2[hx].row;
         let Some(w) = self.world.as_ref() else { return };
         let g = w.ground_z_engine(cx, cy);
         let sink = row.buoyancy.unsigned_abs() as i16;
         let (hi, cap) = self.lift_caps(g, row.band);
-        self.carpet.z = lift_desired_law(
-            self.carpet.z,
+        self.carpet[hx].z = lift_desired_law(
+            self.carpet[hx].z,
             g,
-            &mut self.lift_desired,
+            &mut self.lift_desired[hx],
             input.lift,
             row.clearance,
             hi,
@@ -1375,8 +1532,8 @@ impl Simulation {
         let w = self.world.as_ref().expect("checked above");
         if let Some(c) = w.player_cave_ceiling(cx, cy) {
             let c = c.max(g.saturating_add(row.clearance));
-            if self.carpet.z > c {
-                self.carpet.z = c;
+            if self.carpet[hx].z > c {
+                self.carpet[hx].z = c;
             }
         }
     }
@@ -1396,21 +1553,21 @@ impl Simulation {
     /// the two was a player bug (the web latch, the duel leash and
     /// grip, the cave-wall Speed cancel, the gravity-well pull, the
     /// whirl spin, the flutter — parity audit 2026-09-25).
-    fn move_enhanced(&mut self, input: &FlightInput) {
+    fn move_enhanced(&mut self, hx: Hx, input: &FlightInput) {
         debug_assert!(self.world.is_none(), "a live world flies the kernel");
         // Chase-the-pointer steering (player design 2026-07-23), as in
         // the kernel.
-        self.aim_lead = (self.aim_lead + input.yaw_delta).clamp(-LEAD_MAX, LEAD_MAX);
-        let step = if self.aim_lead.abs() < 1e-4 {
-            self.aim_lead // snap the tail closed (floats never reach 0)
+        self.aim_lead[hx] = (self.aim_lead[hx] + input.yaw_delta).clamp(-LEAD_MAX, LEAD_MAX);
+        let step = if self.aim_lead[hx].abs() < 1e-4 {
+            self.aim_lead[hx] // snap the tail closed (floats never reach 0)
         } else {
-            (self.aim_lead * CHASE_GAIN * TICK_DT)
+            (self.aim_lead[hx] * CHASE_GAIN * TICK_DT)
                 .clamp(-TURN_RATE_MAX * TICK_DT, TURN_RATE_MAX * TICK_DT)
         };
-        self.aim_lead -= step;
-        self.turn_rate = step / TICK_DT;
+        self.aim_lead[hx] -= step;
+        self.turn_rate[hx] = step / TICK_DT;
 
-        let f = &mut self.flyer;
+        let f = &mut self.flyer[hx];
         f.yaw += step;
         f.pitch = (f.pitch + input.pitch_delta).clamp(-MAX_PITCH, MAX_PITCH);
         let (sy, cy) = f.yaw.sin_cos();
@@ -1426,13 +1583,13 @@ impl Simulation {
         f.z = (f.z + f.vz * TICK_DT).rem_euclid(MAP_TILES as f32);
         f.y += f.vy * TICK_DT;
 
-        let g = self.ground_height(self.flyer.x, self.flyer.z);
-        if self.altitude_model == AltitudeModel::Faithful {
+        let g = self.ground_height(self.flyer[hx].x, self.flyer[hx].z);
+        if self.altitude_model[hx] == AltitudeModel::Faithful {
             // MC1's float climb law: a dive passes the raw aim, a climb
             // scales by the authority band (full at ground, zero at the
             // 4-tile soft ceiling, inverted above), plus the at-rest
             // 8/tick sink above the band.
-            let f = &mut self.flyer;
+            let f = &mut self.flyer[hx];
             let s = (f.vx * fwd[0] + f.vz * fwd[2]) * TICK_DT;
             if s != 0.0 && f.pitch != 0.0 {
                 let dive = (s > 0.0 && f.pitch < 0.0) || (s < 0.0 && f.pitch > 0.0);
@@ -1449,23 +1606,23 @@ impl Simulation {
             }
         }
         {
-            let f = &mut self.flyer;
+            let f = &mut self.flyer[hx];
             let floor = g + MIN_CLEARANCE;
             if f.y < floor {
                 f.y = floor;
                 f.vy = f.vy.max(0.0);
             }
         }
-        if self.altitude_model == AltitudeModel::ExtendedLift {
+        if self.altitude_model[hx] == AltitudeModel::ExtendedLift {
             let clr = (MIN_CLEARANCE * 256.0) as i16;
             let g_e = ((g * 256.0) as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            let z_e = ((self.flyer.y * 256.0).round() as i32)
+            let z_e = ((self.flyer[hx].y * 256.0).round() as i32)
                 .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
             let (hi, cap) = self.lift_caps(g_e, LIFT_BAND_MC1);
             let nz = lift_desired_law(
                 z_e,
                 g_e,
-                &mut self.lift_desired,
+                &mut self.lift_desired[hx],
                 input.lift,
                 clr,
                 hi,
@@ -1473,12 +1630,12 @@ impl Simulation {
                 0,
                 LIFT_DRIFT_MC1,
             );
-            self.flyer.y = nz as f32 / 256.0;
+            self.flyer[hx].y = nz as f32 / 256.0;
         }
         // The global lift ceiling only stops further RISING — it never
         // pulls down altitude already held.
         let ceiling = self.lift_ceiling();
-        let f = &mut self.flyer;
+        let f = &mut self.flyer[hx];
         if f.y > ceiling && f.y > from_y {
             f.y = from_y.max(ceiling);
             f.vy = f.vy.min(0.0);
@@ -1486,7 +1643,7 @@ impl Simulation {
         // The proportional bank (ruling 5 + the 2026-07-27 forward-
         // projection amendment).
         let fwd_sp = f.vx * fwd[0] + f.vz * fwd[2];
-        f.roll = enhanced_bank(self.turn_rate, fwd_sp);
+        f.roll = enhanced_bank(self.turn_rate[hx], fwd_sp);
     }
 
     /// The enhanced-altitude band + cap for one arm: `(hi, cap_abs)` —
@@ -1528,6 +1685,20 @@ impl Simulation {
 /// velocity; the integer carpet is the authority the world sees. The
 /// flyer tracks every carpet write it did not make itself through
 /// [`KernelRefs`].
+/// One seat's controls as resolved before the world turn
+/// ([`Simulation::step_seats`]).
+struct SeatPre {
+    input: FlightInput,
+    falling: bool,
+    dead: bool,
+    walk_mc2: bool,
+    classic_walk: bool,
+    enhanced_walk: bool,
+    walk: bool,
+    pre_walk: flight::Mc1State,
+    pcmd: world::PlayerCommand,
+}
+
 struct EnhancedKernel<'a> {
     flyer: &'a mut Flyer,
     aim_lead: &'a mut f32,
@@ -1835,27 +2006,28 @@ mod tests {
         let t = w.g.mc2_spawn_whirlwind(wx, wy, gz).expect("whirlwind");
         w.g.ent[t].id24 = 7; // someone ELSE's funnel (`sub_33810` case 1)
         let mut sim = Simulation::with_world(w);
-        sim.thrust_model = ThrustModel::Enhanced;
-        sim.altitude_model = AltitudeModel::ExtendedLift;
+        sim.thrust_model[Hx::FIRST] = ThrustModel::Enhanced;
+        sim.altitude_model[Hx::FIRST] = AltitudeModel::ExtendedLift;
         // Four tiles east of the eye = the MID RING, facing north, no
         // input at all: every unit of motion below is the funnel's.
-        sim.flyer.x = 104.5;
-        sim.flyer.z = 100.5;
-        sim.flyer.y = 100.0 / 8.0 + 2.0;
-        sim.flyer.yaw = 0.0;
-        sim.sync_carpet_from_flyer();
-        let (x0, z0) = (sim.flyer.x, sim.flyer.z);
+        sim.flyer[Hx::FIRST].x = 104.5;
+        sim.flyer[Hx::FIRST].z = 100.5;
+        sim.flyer[Hx::FIRST].y = 100.0 / 8.0 + 2.0;
+        sim.flyer[Hx::FIRST].yaw = 0.0;
+        sim.sync_carpet_from_flyer(Hx::FIRST);
+        let (x0, z0) = (sim.flyer[Hx::FIRST].x, sim.flyer[Hx::FIRST].z);
         // Tick 1 arms the channel at the funnel's slot; tick 2's move
         // drains it.
         for _ in 0..2 {
             sim.step(&FlightInput::default());
         }
         assert!(
-            sim.flyer.yaw.abs() > 0.5,
+            sim.flyer[Hx::FIRST].yaw.abs() > 0.5,
             "the mid ring seizes the heading (tangent + 591): yaw {}",
-            sim.flyer.yaw
+            sim.flyer[Hx::FIRST].yaw
         );
-        let moved = ((sim.flyer.x - x0).powi(2) + (sim.flyer.z - z0).powi(2)).sqrt();
+        let moved =
+            ((sim.flyer[Hx::FIRST].x - x0).powi(2) + (sim.flyer[Hx::FIRST].z - z0).powi(2)).sqrt();
         assert!(
             moved > 0.3,
             "the 96-unit step landed on the float flyer: moved {moved} tiles"
@@ -1863,9 +2035,10 @@ mod tests {
         // …and `actSpeed = 80` re-aims the cruise along the seized
         // heading, so the sweep keeps its retail violence: the next
         // ticks each cover the step PLUS the cruise.
-        let (x1, z1) = (sim.flyer.x, sim.flyer.z);
+        let (x1, z1) = (sim.flyer[Hx::FIRST].x, sim.flyer[Hx::FIRST].z);
         sim.step(&FlightInput::default());
-        let per_tick = ((sim.flyer.x - x1).powi(2) + (sim.flyer.z - z1).powi(2)).sqrt();
+        let per_tick =
+            ((sim.flyer[Hx::FIRST].x - x1).powi(2) + (sim.flyer[Hx::FIRST].z - z1).powi(2)).sqrt();
         assert!(
             per_tick > (96.0 + 40.0) / 256.0,
             "step + cruise per tick, not the step alone: {per_tick} tiles"
@@ -1887,18 +2060,22 @@ mod tests {
     fn enhanced_tier_drains_the_speed_mail() {
         let w = mc2_flat_world(100);
         let mut sim = Simulation::with_world(w);
-        sim.thrust_model = ThrustModel::Enhanced;
-        sim.flyer.x = 100.5;
-        sim.flyer.z = 100.5;
-        sim.flyer.y = 100.0 / 8.0 + 2.0;
-        sim.sync_carpet_from_flyer();
-        sim.world.as_mut().unwrap().pending_speed_base = Some(-400);
+        sim.thrust_model[Hx::FIRST] = ThrustModel::Enhanced;
+        sim.flyer[Hx::FIRST].x = 100.5;
+        sim.flyer[Hx::FIRST].z = 100.5;
+        sim.flyer[Hx::FIRST].y = 100.0 / 8.0 + 2.0;
+        sim.sync_carpet_from_flyer(Hx::FIRST);
+        sim.world.as_mut().unwrap().pending_speed_base[Hx::FIRST] = Some(-400);
         sim.step(&FlightInput::default());
         let w = sim.world.as_ref().unwrap();
-        assert_eq!(w.pending_speed_base, None, "the stale mail is drained");
+        assert_eq!(
+            w.pending_speed_base[Hx::FIRST],
+            None,
+            "the stale mail is drained"
+        );
         let p = world::PlayerPose::from_tiles(100.5, 14.5, 100.5, 0.0, 0.0, 0.0);
         assert_eq!(
-            w.mc2_caster_act_speed(p),
+            w.mc2_caster_act_speed(Hx::FIRST, p),
             0,
             "a standstill caster casts at its own speed, not the dead burst's"
         );
@@ -1927,16 +2104,16 @@ mod tests {
             // The app's shape: a pinned class-0 human record.
             let pinned = w.g.new_event().expect("pinned seat");
             w.g.ent[pinned] = crate::engine::features::Ent::default();
-            w.mc2_carpet_slot = pinned as u16;
-            w.g.mc2_pinned = crate::engine::features::Mc2Pinned(pinned as u16);
+            w.mc2_carpet_slot[Hx::FIRST] = pinned as u16;
+            w.g.mc2_pinned[Hx::FIRST] = crate::engine::features::Mc2Pinned(pinned as u16);
             let mut sim = Simulation::with_world(w);
-            sim.thrust_model = ThrustModel::Enhanced;
-            sim.altitude_model = AltitudeModel::ExtendedLift;
-            sim.flyer.x = 100.5 + tiles_out;
-            sim.flyer.z = 100.5;
-            sim.flyer.y = 100.0 / 8.0 + 2.0;
-            sim.flyer.yaw = 0.0;
-            sim.sync_carpet_from_flyer();
+            sim.thrust_model[Hx::FIRST] = ThrustModel::Enhanced;
+            sim.altitude_model[Hx::FIRST] = AltitudeModel::ExtendedLift;
+            sim.flyer[Hx::FIRST].x = 100.5 + tiles_out;
+            sim.flyer[Hx::FIRST].z = 100.5;
+            sim.flyer[Hx::FIRST].y = 100.0 / 8.0 + 2.0;
+            sim.flyer[Hx::FIRST].yaw = 0.0;
+            sim.sync_carpet_from_flyer(Hx::FIRST);
             sim
         };
         let thrust = FlightInput {
@@ -1946,32 +2123,33 @@ mod tests {
         // Far band: the tail visit publishes his own pose back. He
         // must keep making way north under thrust.
         let mut sim = rig(9.0);
-        let z0 = sim.flyer.z;
+        let z0 = sim.flyer[Hx::FIRST].z;
         for _ in 0..12 {
             sim.step(&thrust);
         }
         assert!(
-            z0 - sim.flyer.z > 1.0,
+            z0 - sim.flyer[Hx::FIRST].z > 1.0,
             "a far-band visit is not a rewind: advanced {} tiles",
-            z0 - sim.flyer.z
+            z0 - sim.flyer[Hx::FIRST].z
         );
         assert!(
-            sim.flyer.yaw.abs() < 1e-3,
+            sim.flyer[Hx::FIRST].yaw.abs() < 1e-3,
             "the far band writes no heading: {}",
-            sim.flyer.yaw
+            sim.flyer[Hx::FIRST].yaw
         );
         // Mid ring under the same column: swept and turned.
         let mut sim = rig(4.0);
-        let (x0, z0) = (sim.flyer.x, sim.flyer.z);
+        let (x0, z0) = (sim.flyer[Hx::FIRST].x, sim.flyer[Hx::FIRST].z);
         for _ in 0..3 {
             sim.step(&FlightInput::default());
         }
         assert!(
-            sim.flyer.yaw.abs() > 0.5,
+            sim.flyer[Hx::FIRST].yaw.abs() > 0.5,
             "the mid ring seizes the heading: {}",
-            sim.flyer.yaw
+            sim.flyer[Hx::FIRST].yaw
         );
-        let moved = ((sim.flyer.x - x0).powi(2) + (sim.flyer.z - z0).powi(2)).sqrt();
+        let moved =
+            ((sim.flyer[Hx::FIRST].x - x0).powi(2) + (sim.flyer[Hx::FIRST].z - z0).powi(2)).sqrt();
         assert!(moved > 0.5, "the mid ring sweeps: moved {moved} tiles");
     }
 
@@ -1982,10 +2160,10 @@ mod tests {
     #[test]
     fn suicide_key_kills_with_no_killer_even_invincible() {
         let mut sim = Simulation::with_world(flat_world(vec![100; 0x10000]));
-        sim.flyer.x = 112.5;
-        sim.flyer.z = 116.5;
-        sim.flyer.y = 100.0 / 8.0 + 3.0;
-        sim.sync_carpet_from_flyer();
+        sim.flyer[Hx::FIRST].x = 112.5;
+        sim.flyer[Hx::FIRST].z = 116.5;
+        sim.flyer[Hx::FIRST].y = 100.0 / 8.0 + 3.0;
+        sim.sync_carpet_from_flyer(Hx::FIRST);
         sim.world.as_mut().unwrap().set_invincible(true);
         let input = FlightInput {
             suicide: true,
@@ -1998,7 +2176,7 @@ mod tests {
             // t=2644 keeps f70 = 0) and only the bare -1 lands.
             let w = sim.world.as_ref().unwrap();
             assert_eq!(
-                w.vitals().state,
+                w.vitals(Hx::FIRST).state,
                 world::LifeState::Alive,
                 "the write tick itself stays action 0"
             );
@@ -2009,14 +2187,14 @@ mod tests {
             // (:55424-29): flip to the fall despite invincibility.
             let w = sim.world.as_ref().unwrap();
             assert_ne!(
-                w.vitals().state,
+                w.vitals(Hx::FIRST).state,
                 world::LifeState::Alive,
                 "the death arm must flip the tick after the write"
             );
         }
         for _ in 0..200 {
             sim.step(&FlightInput::default());
-            if sim.world.as_ref().unwrap().player_dead() {
+            if sim.world.as_ref().unwrap().player_dead(Hx::FIRST) {
                 return;
             }
         }
@@ -2028,14 +2206,14 @@ mod tests {
     #[test]
     fn death_fall_lands_under_mc1() {
         let mut sim = Simulation::with_world(flat_world(vec![100; 0x10000]));
-        sim.flyer.x = 112.5;
-        sim.flyer.z = 116.5;
-        sim.flyer.y = 100.0 / 8.0 + 3.0;
-        sim.sync_carpet_from_flyer();
-        sim.world.as_mut().unwrap().debug_kill_player();
+        sim.flyer[Hx::FIRST].x = 112.5;
+        sim.flyer[Hx::FIRST].z = 116.5;
+        sim.flyer[Hx::FIRST].y = 100.0 / 8.0 + 3.0;
+        sim.sync_carpet_from_flyer(Hx::FIRST);
+        sim.world.as_mut().unwrap().debug_kill_player(Hx::FIRST);
         for _ in 0..200 {
             sim.step(&FlightInput::default());
-            if sim.world.as_ref().unwrap().player_dead() {
+            if sim.world.as_ref().unwrap().player_dead(Hx::FIRST) {
                 return;
             }
         }
@@ -2056,22 +2234,22 @@ mod tests {
             }
         }
         let mut sim = Simulation::with_world(flat_world(height));
-        sim.thrust_model = ThrustModel::Enhanced;
-        sim.altitude_model = AltitudeModel::ExtendedLift;
+        sim.thrust_model[Hx::FIRST] = ThrustModel::Enhanced;
+        sim.altitude_model[Hx::FIRST] = AltitudeModel::ExtendedLift;
         // Carpet synced ON the plateau (level start)...
-        sim.flyer.x = 128.0;
-        sim.flyer.z = 128.0;
-        sim.flyer.y = 200.0 / 8.0 + 2.0;
-        sim.sync_carpet_from_flyer();
+        sim.flyer[Hx::FIRST].x = 128.0;
+        sim.flyer[Hx::FIRST].z = 128.0;
+        sim.flyer[Hx::FIRST].y = 200.0 / 8.0 + 2.0;
+        sim.sync_carpet_from_flyer(Hx::FIRST);
         // ...then the player flew to the lowland (enhanced never
         // re-syncs the integer carpet).
-        sim.flyer.x = 60.0;
-        sim.flyer.z = 60.0;
-        sim.flyer.y = 40.0 / 8.0 + 3.0;
-        sim.world.as_mut().unwrap().debug_kill_player();
+        sim.flyer[Hx::FIRST].x = 60.0;
+        sim.flyer[Hx::FIRST].z = 60.0;
+        sim.flyer[Hx::FIRST].y = 40.0 / 8.0 + 3.0;
+        sim.world.as_mut().unwrap().debug_kill_player(Hx::FIRST);
         for _ in 0..300 {
             sim.step(&FlightInput::default());
-            if sim.world.as_ref().unwrap().player_dead() {
+            if sim.world.as_ref().unwrap().player_dead(Hx::FIRST) {
                 return;
             }
         }
@@ -2086,12 +2264,12 @@ mod tests {
     #[test]
     fn dead_wizard_pins_at_the_grave_under_enhanced() {
         let mut sim = Simulation::with_world(flat_world(vec![80; MAP_TILES * MAP_TILES]));
-        sim.thrust_model = ThrustModel::Enhanced;
-        sim.altitude_model = AltitudeModel::ExtendedLift;
-        sim.flyer.x = 128.0;
-        sim.flyer.z = 128.0;
-        sim.flyer.y = 80.0 / 8.0 + 3.0;
-        sim.sync_carpet_from_flyer();
+        sim.thrust_model[Hx::FIRST] = ThrustModel::Enhanced;
+        sim.altitude_model[Hx::FIRST] = AltitudeModel::ExtendedLift;
+        sim.flyer[Hx::FIRST].x = 128.0;
+        sim.flyer[Hx::FIRST].z = 128.0;
+        sim.flyer[Hx::FIRST].y = 80.0 / 8.0 + 3.0;
+        sim.sync_carpet_from_flyer(Hx::FIRST);
         // Fly forward so the flyer carries real horizontal momentum.
         let fwd = FlightInput {
             thrust: 1.0,
@@ -2101,31 +2279,31 @@ mod tests {
             sim.step(&fwd);
         }
         assert!(
-            sim.flyer.vx.abs() + sim.flyer.vz.abs() > 0.1,
+            sim.flyer[Hx::FIRST].vx.abs() + sim.flyer[Hx::FIRST].vz.abs() > 0.1,
             "the wizard is moving before the mortal blow"
         );
-        sim.world.as_mut().unwrap().debug_kill_player();
+        sim.world.as_mut().unwrap().debug_kill_player(Hx::FIRST);
         for _ in 0..300 {
             sim.step(&FlightInput::default());
-            if sim.world.as_ref().unwrap().player_dead() {
+            if sim.world.as_ref().unwrap().player_dead(Hx::FIRST) {
                 break;
             }
         }
         assert!(
-            sim.world.as_ref().unwrap().player_dead(),
+            sim.world.as_ref().unwrap().player_dead(Hx::FIRST),
             "the corpse landed"
         );
-        let (x0, z0) = (sim.flyer.x, sim.flyer.z);
+        let (x0, z0) = (sim.flyer[Hx::FIRST].x, sim.flyer[Hx::FIRST].z);
         for _ in 0..60 {
             sim.step(&FlightInput::default());
         }
-        let drift = (sim.flyer.x - x0).abs() + (sim.flyer.z - z0).abs();
+        let drift = (sim.flyer[Hx::FIRST].x - x0).abs() + (sim.flyer[Hx::FIRST].z - z0).abs();
         assert!(
             drift < 1e-4,
             "the dead wizard slid {drift} tiles off the grave"
         );
-        assert_eq!(sim.flyer.vx, 0.0, "float velocity is pinned");
-        assert_eq!(sim.flyer.vz, 0.0, "float velocity is pinned");
+        assert_eq!(sim.flyer[Hx::FIRST].vx, 0.0, "float velocity is pinned");
+        assert_eq!(sim.flyer[Hx::FIRST].vz, 0.0, "float velocity is pinned");
     }
 
     /// Backspace full stop (retail action 0x27): both the actual and
@@ -2141,18 +2319,22 @@ mod tests {
         for _ in 0..10 {
             sim.step(&fwd);
         }
-        assert_eq!(sim.carpet.tgt_speed, 80);
-        assert_eq!(sim.carpet.act_speed, 80);
+        assert_eq!(sim.carpet[Hx::FIRST].tgt_speed, 80);
+        assert_eq!(sim.carpet[Hx::FIRST].act_speed, 80);
         sim.step(&FlightInput {
             full_stop: true,
             ..Default::default()
         });
-        assert_eq!(sim.carpet.tgt_speed, 0);
-        assert_eq!(sim.carpet.act_speed, 0);
+        assert_eq!(sim.carpet[Hx::FIRST].tgt_speed, 0);
+        assert_eq!(sim.carpet[Hx::FIRST].act_speed, 0);
         for _ in 0..30 {
             sim.step(&FlightInput::default());
         }
-        assert_eq!(sim.carpet.act_speed, 0, "no coast-back after the stop");
+        assert_eq!(
+            sim.carpet[Hx::FIRST].act_speed,
+            0,
+            "no coast-back after the stop"
+        );
     }
 
     /// The full stop must also SUPPRESS the Accelerate expiry edge:
@@ -2164,22 +2346,26 @@ mod tests {
         // A live boost last tick that vanished this tick (the shape
         // of a spell cancel): without full_stop this edge writes
         // tgt = act = +80 (:65191-97).
-        sim.accel_was_active = true;
-        sim.carpet.act_speed = 240;
-        sim.carpet.tgt_speed = 240;
+        sim.accel_was_active[Hx::FIRST] = true;
+        sim.carpet[Hx::FIRST].act_speed = 240;
+        sim.carpet[Hx::FIRST].tgt_speed = 240;
         sim.step(&FlightInput {
             full_stop: true,
             ..Default::default()
         });
-        assert_eq!(sim.carpet.tgt_speed, 0, "no +80 rebound over the stop");
-        assert_eq!(sim.carpet.act_speed, 0);
+        assert_eq!(
+            sim.carpet[Hx::FIRST].tgt_speed,
+            0,
+            "no +80 rebound over the stop"
+        );
+        assert_eq!(sim.carpet[Hx::FIRST].act_speed, 0);
     }
 
     /// The enhanced mover's analog: the float velocities stop dead.
     #[test]
     fn full_stop_zeroes_enhanced_velocity() {
         let mut sim = Simulation::new();
-        sim.thrust_model = ThrustModel::Enhanced;
+        sim.thrust_model[Hx::FIRST] = ThrustModel::Enhanced;
         let fwd = FlightInput {
             thrust: 1.0,
             ..Default::default()
@@ -2187,12 +2373,17 @@ mod tests {
         for _ in 0..30 {
             sim.step(&fwd);
         }
-        assert!(sim.flyer.vz.abs() > 0.1, "moving before the stop");
+        assert!(
+            sim.flyer[Hx::FIRST].vz.abs() > 0.1,
+            "moving before the stop"
+        );
         sim.step(&FlightInput {
             full_stop: true,
             ..Default::default()
         });
-        let v = sim.flyer.vx.abs() + sim.flyer.vy.abs() + sim.flyer.vz.abs();
+        let v = sim.flyer[Hx::FIRST].vx.abs()
+            + sim.flyer[Hx::FIRST].vy.abs()
+            + sim.flyer[Hx::FIRST].vz.abs();
         // One idle tick of drag may run after the zero; the stop
         // itself leaves at most that residue.
         assert!(v < 0.05, "stopped, |v| = {v}");
@@ -2201,7 +2392,7 @@ mod tests {
     #[test]
     fn steps_are_counted() {
         let mut sim = Simulation::new();
-        sim.thrust_model = ThrustModel::Enhanced;
+        sim.thrust_model[Hx::FIRST] = ThrustModel::Enhanced;
         for _ in 0..10 {
             sim.step(&FlightInput::default());
         }
@@ -2211,7 +2402,7 @@ mod tests {
     #[test]
     fn thrust_moves_and_drag_stops() {
         let mut sim = Simulation::new();
-        sim.thrust_model = ThrustModel::Enhanced;
+        sim.thrust_model[Hx::FIRST] = ThrustModel::Enhanced;
         let forward = FlightInput {
             thrust: 1.0,
             ..Default::default()
@@ -2220,22 +2411,25 @@ mod tests {
             sim.step(&forward);
         }
         assert!(
-            sim.flyer.z < 160.0,
+            sim.flyer[Hx::FIRST].z < 160.0,
             "forward thrust moves toward -Z, z = {}",
-            sim.flyer.z
+            sim.flyer[Hx::FIRST].z
         );
         let coast = FlightInput::default();
         for _ in 0..300 {
             sim.step(&coast);
         }
-        let speed = (sim.flyer.vx.powi(2) + sim.flyer.vy.powi(2) + sim.flyer.vz.powi(2)).sqrt();
+        let speed = (sim.flyer[Hx::FIRST].vx.powi(2)
+            + sim.flyer[Hx::FIRST].vy.powi(2)
+            + sim.flyer[Hx::FIRST].vz.powi(2))
+        .sqrt();
         assert!(speed < 1e-3, "velocity decays to ~zero, got {speed}");
     }
 
     #[test]
     fn terrain_clamps_altitude() {
         let mut sim = Simulation::with_terrain(vec![80u8; MAP_TILES * MAP_TILES]);
-        sim.thrust_model = ThrustModel::Enhanced;
+        sim.thrust_model[Hx::FIRST] = ThrustModel::Enhanced;
         let dive = FlightInput {
             thrust: 1.0,
             pitch_delta: -1.0,
@@ -2245,7 +2439,7 @@ mod tests {
             sim.step(&dive);
         }
         // Ground is 80/8 = 10 tiles everywhere.
-        assert!(sim.flyer.y >= 10.0 + MIN_CLEARANCE - 1e-4);
+        assert!(sim.flyer[Hx::FIRST].y >= 10.0 + MIN_CLEARANCE - 1e-4);
     }
 
     /// THE ALTITUDE ACCEPTANCE TEST (ROADMAP Phase 5): the authentic
@@ -2263,12 +2457,12 @@ mod tests {
             }
         }
         let mut sim = Simulation::with_terrain(th);
-        sim.flyer.x = 120.0;
-        sim.flyer.z = 128.0;
-        sim.flyer.y = 0.5;
-        sim.flyer.yaw = std::f32::consts::FRAC_PI_2; // east, toward the cliff
-        sim.flyer.pitch = 0.0;
-        sim.sync_carpet_from_flyer();
+        sim.flyer[Hx::FIRST].x = 120.0;
+        sim.flyer[Hx::FIRST].z = 128.0;
+        sim.flyer[Hx::FIRST].y = 0.5;
+        sim.flyer[Hx::FIRST].yaw = std::f32::consts::FRAC_PI_2; // east, toward the cliff
+        sim.flyer[Hx::FIRST].pitch = 0.0;
+        sim.sync_carpet_from_flyer(Hx::FIRST);
 
         // Phase 1 — ride the wall: hold accelerate into the cliff.
         let fwd = FlightInput {
@@ -2279,14 +2473,14 @@ mod tests {
             sim.step(&fwd);
         }
         assert!(
-            sim.flyer.x > 131.0,
+            sim.flyer[Hx::FIRST].x > 131.0,
             "reached the plateau, x={}",
-            sim.flyer.x
+            sim.flyer[Hx::FIRST].x
         );
         assert!(
-            (sim.flyer.y - 25.5).abs() < 0.1,
+            (sim.flyer[Hx::FIRST].y - 25.5).abs() < 0.1,
             "the floor carried the carpet up the face, y={}",
-            sim.flyer.y
+            sim.flyer[Hx::FIRST].y
         );
 
         // Phase 2 — dash away level: decelerate through zero into
@@ -2299,29 +2493,33 @@ mod tests {
             sim.step(&back);
         }
         assert!(
-            sim.flyer.x < 129.0,
+            sim.flyer[Hx::FIRST].x < 129.0,
             "back over the lowland, x={}",
-            sim.flyer.x
+            sim.flyer[Hx::FIRST].x
         );
         assert!(
-            sim.flyer.y > 25.0,
+            sim.flyer[Hx::FIRST].y > 25.0,
             "level flight HOLDS the stolen altitude, y={}",
-            sim.flyer.y
+            sim.flyer[Hx::FIRST].y
         );
 
         // Phase 3 — neutralize speed the authentic way (counter-
         // impulses; there is no stop key), then hover: 8/tick sink.
-        while sim.carpet.tgt_speed < 0 {
+        while sim.carpet[Hx::FIRST].tgt_speed < 0 {
             sim.step(&fwd);
         }
-        while sim.carpet.act_speed != 0 {
+        while sim.carpet[Hx::FIRST].act_speed != 0 {
             sim.step(&FlightInput::default());
         }
-        let z0 = sim.carpet.z;
+        let z0 = sim.carpet[Hx::FIRST].z;
         for _ in 0..10 {
             sim.step(&FlightInput::default());
         }
-        assert_eq!(sim.carpet.z, z0 - 80, "speed-0 hover bleeds 8/tick");
+        assert_eq!(
+            sim.carpet[Hx::FIRST].z,
+            z0 - 80,
+            "speed-0 hover bleeds 8/tick"
+        );
     }
 
     // ---- the enhanced-flight enhancements (2026-07-22 rulings):
@@ -2331,16 +2529,20 @@ mod tests {
     /// altitude seeded at `alt` tiles.
     fn lift_sim(alt: f32) -> Simulation {
         let mut sim = Simulation::with_terrain(vec![0u8; MAP_TILES * MAP_TILES]);
-        sim.altitude_model = AltitudeModel::ExtendedLift;
-        sim.flyer.y = alt;
-        sim.sync_carpet_from_flyer();
+        sim.altitude_model[Hx::FIRST] = AltitudeModel::ExtendedLift;
+        sim.flyer[Hx::FIRST].y = alt;
+        sim.sync_carpet_from_flyer(Hx::FIRST);
         sim
     }
 
     #[test]
     fn desired_altitude_qe_steps_fast_and_pins() {
         let mut sim = lift_sim(1.0);
-        assert_eq!(sim.lift_desired, 256, "seeded from the spawn pose");
+        assert_eq!(
+            sim.lift_desired[Hx::FIRST],
+            256,
+            "seeded from the spawn pose"
+        );
         let up = FlightInput {
             lift: 1.0,
             ..Default::default()
@@ -2349,13 +2551,21 @@ mod tests {
             sim.step(&up);
         }
         // The classic full-pitch climb rate, 56/tick.
-        assert_eq!(sim.carpet.z, 256 + 4 * 56);
-        assert_eq!(sim.lift_desired, 256 + 4 * 56, "desired climbs with you");
+        assert_eq!(sim.carpet[Hx::FIRST].z, 256 + 4 * 56);
+        assert_eq!(
+            sim.lift_desired[Hx::FIRST],
+            256 + 4 * 56,
+            "desired climbs with you"
+        );
         // Release: PINNED — the old idle settle-to-floor is gone.
         for _ in 0..50 {
             sim.step(&FlightInput::default());
         }
-        assert_eq!(sim.carpet.z, 256 + 4 * 56, "holds the pinned altitude");
+        assert_eq!(
+            sim.carpet[Hx::FIRST].z,
+            256 + 4 * 56,
+            "holds the pinned altitude"
+        );
     }
 
     #[test]
@@ -2370,8 +2580,8 @@ mod tests {
         }
         // Ruling 1: the cap is GROUND-RELATIVE — 1024 over terrain,
         // not the level's highest tile.
-        assert_eq!(sim.carpet.z, 1024, "band top over flat ground");
-        assert_eq!(sim.lift_desired, 1024);
+        assert_eq!(sim.carpet[Hx::FIRST].z, 1024, "band top over flat ground");
+        assert_eq!(sim.lift_desired[Hx::FIRST], 1024);
     }
 
     #[test]
@@ -2379,10 +2589,10 @@ mod tests {
         let mut th = vec![0u8; MAP_TILES * MAP_TILES];
         th[0] = 80; // a lone 10-tile peak far away
         let mut sim = Simulation::with_terrain(th);
-        sim.altitude_model = AltitudeModel::ExtendedLift;
+        sim.altitude_model[Hx::FIRST] = AltitudeModel::ExtendedLift;
         sim.weightless = true;
-        sim.flyer.y = 1.0;
-        sim.sync_carpet_from_flyer();
+        sim.flyer[Hx::FIRST].y = 1.0;
+        sim.sync_carpet_from_flyer(Hx::FIRST);
         let up = FlightInput {
             lift: 1.0,
             ..Default::default()
@@ -2392,27 +2602,40 @@ mod tests {
         }
         // The debug toggle restores the old absolute cap: highest
         // terrain (10 tiles) + the soft-ceiling band (4).
-        assert_eq!(sim.carpet.z, 14 * 256, "global ceiling, z={}", sim.carpet.z);
+        assert_eq!(
+            sim.carpet[Hx::FIRST].z,
+            14 * 256,
+            "global ceiling, z={}",
+            sim.carpet[Hx::FIRST].z
+        );
     }
 
     #[test]
     fn desired_altitude_toward_key_boosts_away_key_sets() {
         // Flung below desired (ruling 4's unified q/e rule).
         let mut sim = lift_sim(3.0);
-        assert_eq!(sim.lift_desired, 768);
-        sim.carpet.z = 300;
+        assert_eq!(sim.lift_desired[Hx::FIRST], 768);
+        sim.carpet[Hx::FIRST].z = 300;
         sim.step(&FlightInput {
             lift: 1.0,
             ..Default::default()
         });
-        assert_eq!(sim.carpet.z, 356, "the toward-key boosts at 56/tick");
-        assert_eq!(sim.lift_desired, 768, "…without moving desired");
+        assert_eq!(
+            sim.carpet[Hx::FIRST].z,
+            356,
+            "the toward-key boosts at 56/tick"
+        );
+        assert_eq!(sim.lift_desired[Hx::FIRST], 768, "…without moving desired");
         sim.step(&FlightInput {
             lift: -1.0,
             ..Default::default()
         });
-        assert_eq!(sim.carpet.z, 300);
-        assert_eq!(sim.lift_desired, 300, "the away-key SETS desired");
+        assert_eq!(sim.carpet[Hx::FIRST].z, 300);
+        assert_eq!(
+            sim.lift_desired[Hx::FIRST],
+            300,
+            "the away-key SETS desired"
+        );
     }
 
     #[test]
@@ -2420,16 +2643,16 @@ mod tests {
         // Ruling 6: desired is PINNED; the flyer recovers from ANY
         // displacement at the standard 8/tick drift.
         let mut sim = lift_sim(2.0);
-        sim.carpet.z = 900; // flung up
+        sim.carpet[Hx::FIRST].z = 900; // flung up
         sim.step(&FlightInput::default());
-        assert_eq!(sim.carpet.z, 892, "drifts down 8/tick");
+        assert_eq!(sim.carpet[Hx::FIRST].z, 892, "drifts down 8/tick");
         for _ in 0..100 {
             sim.step(&FlightInput::default());
         }
-        assert_eq!(sim.carpet.z, 512, "parks at the pinned desired");
-        sim.carpet.z = 200; // flung down
+        assert_eq!(sim.carpet[Hx::FIRST].z, 512, "parks at the pinned desired");
+        sim.carpet[Hx::FIRST].z = 200; // flung down
         sim.step(&FlightInput::default());
-        assert_eq!(sim.carpet.z, 208, "drifts back up 8/tick");
+        assert_eq!(sim.carpet[Hx::FIRST].z, 208, "drifts back up 8/tick");
     }
 
     #[test]
@@ -2443,29 +2666,33 @@ mod tests {
             }
         }
         let mut sim = Simulation::with_terrain(th);
-        sim.altitude_model = AltitudeModel::ExtendedLift;
-        sim.flyer.x = 50.0;
-        sim.flyer.z = 128.0;
-        sim.flyer.y = 2.0;
-        sim.sync_carpet_from_flyer();
-        assert_eq!(sim.lift_desired, 512);
+        sim.altitude_model[Hx::FIRST] = AltitudeModel::ExtendedLift;
+        sim.flyer[Hx::FIRST].x = 50.0;
+        sim.flyer[Hx::FIRST].z = 128.0;
+        sim.flyer[Hx::FIRST].y = 2.0;
+        sim.sync_carpet_from_flyer(Hx::FIRST);
+        assert_eq!(sim.lift_desired[Hx::FIRST], 512);
         // Warp over the plateau (a fling analog): the floor bumps the
         // carpet first, then the drift restores the 512 offset OVER
         // the new ground.
-        sim.carpet.x = 110 * 256;
+        sim.carpet[Hx::FIRST].x = 110 * 256;
         for _ in 0..200 {
             sim.step(&FlightInput::default());
         }
-        assert_eq!(sim.carpet.z, 512 + 512, "offset held over the plateau");
+        assert_eq!(
+            sim.carpet[Hx::FIRST].z,
+            512 + 512,
+            "offset held over the plateau"
+        );
     }
 
     #[test]
     fn desired_altitude_under_enhanced_thrust() {
         let mut sim = Simulation::with_terrain(vec![0u8; MAP_TILES * MAP_TILES]);
-        sim.thrust_model = ThrustModel::Enhanced;
-        sim.altitude_model = AltitudeModel::ExtendedLift;
-        sim.flyer.y = 1.0;
-        sim.sync_carpet_from_flyer();
+        sim.thrust_model[Hx::FIRST] = ThrustModel::Enhanced;
+        sim.altitude_model[Hx::FIRST] = AltitudeModel::ExtendedLift;
+        sim.flyer[Hx::FIRST].y = 1.0;
+        sim.sync_carpet_from_flyer(Hx::FIRST);
         let up = FlightInput {
             lift: 1.0,
             ..Default::default()
@@ -2474,18 +2701,18 @@ mod tests {
             sim.step(&up);
         }
         assert!(
-            (sim.flyer.y - 4.0).abs() < 0.01,
+            (sim.flyer[Hx::FIRST].y - 4.0).abs() < 0.01,
             "ground-relative cap on the float arm too, y={}",
-            sim.flyer.y
+            sim.flyer[Hx::FIRST].y
         );
         // Pinned on release — the old settle-to-floor is gone.
         for _ in 0..100 {
             sim.step(&FlightInput::default());
         }
         assert!(
-            (sim.flyer.y - 4.0).abs() < 0.01,
+            (sim.flyer[Hx::FIRST].y - 4.0).abs() < 0.01,
             "pinned, y={}",
-            sim.flyer.y
+            sim.flyer[Hx::FIRST].y
         );
         // q descends fast and drags desired with it; release holds.
         let down = FlightInput {
@@ -2495,28 +2722,28 @@ mod tests {
         for _ in 0..5 {
             sim.step(&down);
         }
-        let held = sim.flyer.y;
+        let held = sim.flyer[Hx::FIRST].y;
         assert!(held < 3.0, "q descends at the fast rate, y={held}");
         for _ in 0..50 {
             sim.step(&FlightInput::default());
         }
         assert!(
-            (sim.flyer.y - held).abs() < 0.01,
+            (sim.flyer[Hx::FIRST].y - held).abs() < 0.01,
             "desired followed q down, y={}",
-            sim.flyer.y
+            sim.flyer[Hx::FIRST].y
         );
     }
 
     #[test]
     fn chase_steering_converges_on_the_pointer() {
         let mut sim = Simulation::new();
-        sim.thrust_model = ThrustModel::Enhanced;
+        sim.thrust_model[Hx::FIRST] = ThrustModel::Enhanced;
         // One swipe pins a desired heading 0.4 rad right of the nose.
         sim.step(&FlightInput {
             yaw_delta: 0.4,
             ..Default::default()
         });
-        let first = sim.flyer.yaw;
+        let first = sim.flyer[Hx::FIRST].yaw;
         assert!(first > 0.0, "starts turning immediately");
         assert!(
             first < 0.4,
@@ -2524,14 +2751,14 @@ mod tests {
         );
         // The desired WORLD heading is pinned: yaw + lead is invariant
         // while the carpet converges with no further mouse motion.
-        let desired = sim.aim_yaw();
+        let desired = sim.aim_yaw(Hx::FIRST);
         assert!((desired - 0.4).abs() < 1e-5, "desired = the swipe");
         let mut prev_step = f32::MAX;
-        let mut prev_yaw = sim.flyer.yaw;
+        let mut prev_yaw = sim.flyer[Hx::FIRST].yaw;
         for _ in 0..60 {
             sim.step(&FlightInput::default());
-            let step = sim.flyer.yaw - prev_yaw;
-            prev_yaw = sim.flyer.yaw;
+            let step = sim.flyer[Hx::FIRST].yaw - prev_yaw;
+            prev_yaw = sim.flyer[Hx::FIRST].yaw;
             assert!(step >= 0.0, "never overshoots into a wobble");
             // Monotone ease-out — except the final snap that closes
             // the sub-1e-4 tail in one (imperceptible) step.
@@ -2541,24 +2768,24 @@ mod tests {
             );
             prev_step = step.max(1e-9);
             assert!(
-                (sim.aim_yaw() - desired).abs() < 1e-4,
+                (sim.aim_yaw(Hx::FIRST) - desired).abs() < 1e-4,
                 "the pointer stays world-pinned while chasing"
             );
         }
         assert!(
-            (sim.flyer.yaw - 0.4).abs() < 1e-3,
+            (sim.flyer[Hx::FIRST].yaw - 0.4).abs() < 1e-3,
             "arrives at the pointer, yaw={}",
-            sim.flyer.yaw
+            sim.flyer[Hx::FIRST].yaw
         );
-        let settled = sim.flyer.yaw;
+        let settled = sim.flyer[Hx::FIRST].yaw;
         sim.step(&FlightInput::default());
-        assert_eq!(sim.flyer.yaw, settled, "dead stop once closed");
+        assert_eq!(sim.flyer[Hx::FIRST].yaw, settled, "dead stop once closed");
     }
 
     #[test]
     fn chase_lead_clamps_on_screen_and_rate_caps() {
         let mut sim = Simulation::new();
-        sim.thrust_model = ThrustModel::Enhanced;
+        sim.thrust_model[Hx::FIRST] = ThrustModel::Enhanced;
         // Wild continuous swipes: the lead clamps at LEAD_MAX (the
         // crosshair stays on screen) and the per-tick turn never
         // exceeds the cap (≈ the classic model's own max turn rate).
@@ -2569,11 +2796,11 @@ mod tests {
         let mut prev = 0.0f32;
         for _ in 0..20 {
             sim.step(&swipe);
-            let d = sim.flyer.yaw - prev;
-            prev = sim.flyer.yaw;
+            let d = sim.flyer[Hx::FIRST].yaw - prev;
+            prev = sim.flyer[Hx::FIRST].yaw;
             assert!(d <= TURN_RATE_MAX * TICK_DT + 1e-5, "rate capped, d={d}");
             assert!(
-                sim.aim_yaw() - sim.flyer.yaw <= LEAD_MAX + 1e-5,
+                sim.aim_yaw(Hx::FIRST) - sim.flyer[Hx::FIRST].yaw <= LEAD_MAX + 1e-5,
                 "lead clamped on screen"
             );
         }
@@ -2582,7 +2809,7 @@ mod tests {
     #[test]
     fn bank_needs_motion_and_levels_out() {
         let mut sim = Simulation::new();
-        sim.thrust_model = ThrustModel::Enhanced;
+        sim.thrust_model[Hx::FIRST] = ThrustModel::Enhanced;
         // Turning in place: NO bank (ruling 5 — the departure from
         // retail's fixed velocity-independent bank).
         let turn = FlightInput {
@@ -2593,9 +2820,9 @@ mod tests {
             sim.step(&turn);
         }
         assert!(
-            sim.flyer.roll.abs() < 0.02,
+            sim.flyer[Hx::FIRST].roll.abs() < 0.02,
             "no bank standing, roll={}",
-            sim.flyer.roll
+            sim.flyer[Hx::FIRST].roll
         );
         // At cruise, a right turn banks right (positive roll).
         let fwd_turn = FlightInput {
@@ -2607,11 +2834,11 @@ mod tests {
             sim.step(&fwd_turn);
         }
         assert!(
-            sim.flyer.roll > 0.1,
+            sim.flyer[Hx::FIRST].roll > 0.1,
             "banks into a moving right turn, roll={}",
-            sim.flyer.roll
+            sim.flyer[Hx::FIRST].roll
         );
-        assert!(sim.flyer.roll <= BANK_MAX + 1e-6);
+        assert!(sim.flyer[Hx::FIRST].roll <= BANK_MAX + 1e-6);
         // Turn released: the bank levels out with the rate.
         let fwd = FlightInput {
             thrust: 1.0,
@@ -2621,9 +2848,9 @@ mod tests {
             sim.step(&fwd);
         }
         assert!(
-            sim.flyer.roll.abs() < 0.02,
+            sim.flyer[Hx::FIRST].roll.abs() < 0.02,
             "levels out, roll={}",
-            sim.flyer.roll
+            sim.flyer[Hx::FIRST].roll
         );
     }
 
@@ -2635,7 +2862,7 @@ mod tests {
         // per-strafe gate did, which read as a jarring straighten-and-
         // re-tilt).
         let mut sim = Simulation::new();
-        sim.thrust_model = ThrustModel::Enhanced;
+        sim.thrust_model[Hx::FIRST] = ThrustModel::Enhanced;
         // Establish a forward, banked right turn.
         let fwd_turn = FlightInput {
             thrust: 1.0,
@@ -2645,7 +2872,7 @@ mod tests {
         for _ in 0..40 {
             sim.step(&fwd_turn);
         }
-        let banked = sim.flyer.roll;
+        let banked = sim.flyer[Hx::FIRST].roll;
         assert!(banked > 0.1, "forward turn banks right, roll={banked}");
         // Add strafe: the bank must persist (no snap to level), staying
         // on the same side and comparable in magnitude.
@@ -2658,9 +2885,9 @@ mod tests {
         for _ in 0..30 {
             sim.step(&fwd_turn_strafe);
             assert!(
-                sim.flyer.roll > 0.1,
+                sim.flyer[Hx::FIRST].roll > 0.1,
                 "bank holds while strafing, roll={}",
-                sim.flyer.roll
+                sim.flyer[Hx::FIRST].roll
             );
         }
     }
@@ -2671,7 +2898,7 @@ mod tests {
         // strafe-aligned velocity, so strafing straight sideways with
         // no turn keeps the view level.
         let mut sim = Simulation::new();
-        sim.thrust_model = ThrustModel::Enhanced;
+        sim.thrust_model[Hx::FIRST] = ThrustModel::Enhanced;
         let strafe_only = FlightInput {
             strafe: 1.0,
             ..Default::default()
@@ -2680,20 +2907,24 @@ mod tests {
             sim.step(&strafe_only);
         }
         assert!(
-            sim.flyer.roll.abs() < 0.02,
+            sim.flyer[Hx::FIRST].roll.abs() < 0.02,
             "pure sideways drift does not bank, roll={}",
-            sim.flyer.roll
+            sim.flyer[Hx::FIRST].roll
         );
     }
 
     #[test]
     fn altitude_model_switch_seeds_desired_from_pose() {
         let mut sim = Simulation::with_terrain(vec![0u8; MAP_TILES * MAP_TILES]);
-        sim.flyer.y = 2.5;
-        sim.sync_carpet_from_flyer();
-        sim.lift_desired = 0; // stale
-        sim.set_altitude_model(AltitudeModel::ExtendedLift);
-        assert_eq!(sim.lift_desired, 640, "re-seeded at the live pose");
+        sim.flyer[Hx::FIRST].y = 2.5;
+        sim.sync_carpet_from_flyer(Hx::FIRST);
+        sim.lift_desired[Hx::FIRST] = 0; // stale
+        sim.set_altitude_model(Hx::FIRST, AltitudeModel::ExtendedLift);
+        assert_eq!(
+            sim.lift_desired[Hx::FIRST],
+            640,
+            "re-seeded at the live pose"
+        );
     }
 
     /// The 2026-07-19 ruling amendment: under Faithful altitude the
@@ -2703,9 +2934,9 @@ mod tests {
     #[test]
     fn faithful_altitude_dives_and_climbs_under_enhanced_thrust() {
         let mut sim = Simulation::new();
-        sim.thrust_model = ThrustModel::Enhanced;
-        sim.flyer.y = 2.0;
-        let z0 = sim.flyer.z;
+        sim.thrust_model[Hx::FIRST] = ThrustModel::Enhanced;
+        sim.flyer[Hx::FIRST].y = 2.0;
+        let z0 = sim.flyer[Hx::FIRST].z;
         // Aim hard down, then thrust: the raw-aim dive rides down to
         // the hover floor — at FULL horizontal speed.
         let dive = FlightInput {
@@ -2720,11 +2951,15 @@ mod tests {
         for _ in 0..60 {
             sim.step(&fwd);
         }
-        assert!(sim.flyer.y < 0.76, "dives to the floor, y={}", sim.flyer.y);
         assert!(
-            z0 - sim.flyer.z > 8.0,
+            sim.flyer[Hx::FIRST].y < 0.76,
+            "dives to the floor, y={}",
+            sim.flyer[Hx::FIRST].y
+        );
+        assert!(
+            z0 - sim.flyer[Hx::FIRST].z > 8.0,
             "no horizontal mobility loss, z={} from {}",
-            sim.flyer.z,
+            sim.flyer[Hx::FIRST].z,
             z0
         );
 
@@ -2739,21 +2974,25 @@ mod tests {
         for _ in 0..300 {
             sim.step(&fwd);
         }
-        assert!(sim.flyer.y > 2.0, "climbs, y={}", sim.flyer.y);
         assert!(
-            sim.flyer.y <= 4.05,
+            sim.flyer[Hx::FIRST].y > 2.0,
+            "climbs, y={}",
+            sim.flyer[Hx::FIRST].y
+        );
+        assert!(
+            sim.flyer[Hx::FIRST].y <= 4.05,
             "authority caps at the soft ceiling, y={}",
-            sim.flyer.y
+            sim.flyer[Hx::FIRST].y
         );
     }
 
     #[test]
     fn world_wraps() {
         let mut sim = Simulation::new();
-        sim.thrust_model = ThrustModel::Enhanced;
-        sim.flyer.x = 255.9;
-        sim.flyer.vx = 12.0;
+        sim.thrust_model[Hx::FIRST] = ThrustModel::Enhanced;
+        sim.flyer[Hx::FIRST].x = 255.9;
+        sim.flyer[Hx::FIRST].vx = 12.0;
         sim.step(&FlightInput::default());
-        assert!(sim.flyer.x < 256.0);
+        assert!(sim.flyer[Hx::FIRST].x < 256.0);
     }
 }

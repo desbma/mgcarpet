@@ -13,6 +13,7 @@
 //!
 //! Self-skips when the baked tree is absent (game data is optional).
 
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
 use mgc_sim::mc1::rivals::RivalConfig;
@@ -122,8 +123,8 @@ fn run(root: &std::path::Path) -> (Vec<u64>, Vec<u64>) {
 
     // D: combat over the ambush — dev spells, fireballs both hands
     // (projectiles, mailboxes, deaths, corpse mana balls).
-    w.set_dev_spells(true);
-    w.grant_all_spells();
+    w.set_dev_spells(Hx::FIRST, true);
+    w.grant_all_spells(Hx::FIRST);
     let equip = PlayerCommand {
         equip_left: Some(SpellId(0)),
         equip_right: Some(SpellId(23)),
@@ -181,11 +182,15 @@ fn bumped_pool_is_transparent_without_exhaustion() {
         fly(&mut w, 101.5, 117.5, 16, PlayerCommand::default());
         fly(&mut w, 95.5, 109.5, 64, PlayerCommand::default());
         let poses: Vec<_> = w
-            .live_poses()
+            .live_poses(Hx::FIRST)
             .iter()
             .map(|p| (p.type_index, (p.x * 256.0) as i32, (p.z * 256.0) as i32))
             .collect();
-        (w.planes().height.clone(), w.live_things().len(), poses)
+        (
+            w.planes().height.clone(),
+            w.live_things(Hx::FIRST).len(),
+            poses,
+        )
     };
     let pristine = observe(mgc_sim::chassis::ChassisParams::MC1);
     let bumped = observe(mgc_sim::chassis::ChassisParams {
@@ -987,10 +992,28 @@ fn level_005_golden_state_hashes() {
         // at ALL SIX (no graded lane reads the triple). Under
         // `MGC_NO_MC1_BOLT_DEST_STAMP=1 MGC_NO_MC1_RIVAL_EMIT_PITCH_MIRROR=1`
         // the previous D/E return.
-        0xfb8dcbbe3206fc3c, // post-init
-        0x90b203887bd17b07, // A
-        0xd4af10855811654e, // B
-        0xc85ab56b28a438fc, // C
+        // ⭐ RE-PINNED 2026-10-10 for THE HUMAN'S SLOT TAG (multiplayer stage 1):
+        // the human's owner tag is his carpet record's pool slot (retail's
+        // convention), no longer the out-of-pool 0xFFFF, and the record's own
+        // `+24` carries it. `MGC_NO_HUMAN_SLOT_TAG=1` restores every old pin.
+        // ⭐ RE-PINNED 2026-10-10 for THE HUMAN'S CARPET RECORD (multiplayer
+        // stage 2): the record at his slot is a live (3,0) wizard record mirroring
+        // him, a member of the tick-top class-3 roster and linked into his tile
+        // chain — the record's own bytes and its neighbours' `+20/+22` are hashed.
+        // Behaviour-neutral by measurement: under `MGC_HASH_EXCLUDE_CARPET=1` (the
+        // record spliced out and blanked before hashing) every checkpoint is
+        // identical with the stage on and off. `MGC_NO_HUMAN_RECORD_MIRROR=1`
+        // restores every old pin.
+        0x31a7aed342ecc4e2, // post-init
+        // Re-pinned 2026-10-13 (the first checkpoint holds) for MP STAGE 3 CH. 2:
+        // the human's (3,0) carpet record carries retail's probe-victim bit
+        // (`+16 & 8`, the recorded 0x20D) — `MGC_NO_HUMAN_POOL_VICTIM=1`
+        // reproduces the previous pins exactly, and under
+        // `MGC_HASH_EXCLUDE_CARPET=1` the values are identical switch on/off
+        // (the record's own word is the whole move).
+        0x5590331b9a6ec075, // A
+        0xdae6c237bc22eabe, // B
+        0x632c377baf58661a, // C
         // D/E re-pinned again with THE NATIVE JAR POLL'S "ALREADY
         // KNOWN" STAMP (round 154, w154k): `sub_55A40` :64780-97 sets
         // `+16 |= 1` on every authored jar whose spell the local human
@@ -1009,8 +1032,15 @@ fn level_005_golden_state_hashes() {
         // `MGC_NO_MC1_HIT_STAT_AIM_LATCH=1` moves the window, and under
         // it the previous D/E return. Post-init..C hold, OBSERVABLE
         // holds at ALL SIX.
-        0xbfb22fe0cb4dcb92, // D: 64 ticks of two-hand fireball combat
-        0xcae4937e19eb380a, // E: 100 aftermath ticks
+        // D/E re-pinned 2026-10-10 for THE HUMAN'S MAIL IN HIS RECORD
+        // (multiplayer stage-2 tail): the letters D's combat bills him
+        // land in his carpet record's own mailboxes, not the out-of-pool
+        // `player_mail` block. Under `MGC_HASH_EXCLUDE_CARPET=1` (which
+        // hashes the record's mail where the block sat) every checkpoint
+        // is unchanged; `MGC_NO_HUMAN_MAIL_IN_RECORD=1` restores the
+        // previous D/E.
+        0x82ee4e206c4b7e6d, // D: 64 ticks of two-hand fireball combat
+        0x43a6d5e7c313f3c4, // E: 100 aftermath ticks
     ];
     assert_eq!(
         got, GOLDEN,

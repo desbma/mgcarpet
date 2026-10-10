@@ -6,6 +6,7 @@
 //!
 //! Self-skips when the baked tree is absent (game data is optional).
 
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
 use mgc_sim::mc1::spells::SpellId;
@@ -72,8 +73,8 @@ fn create_castle_builds_on_clear_ground() {
         return;
     };
     let mut w = build_world(&root);
-    w.set_dev_spells(true);
-    w.grant_all_spells();
+    w.set_dev_spells(Hx::FIRST, true);
+    w.grant_all_spells(Hx::FIRST);
 
     let (cx, cy) = clear_spot(&w);
     // Hover 16 tiles south of the target, facing north (heading 0 =
@@ -169,7 +170,7 @@ fn create_castle_builds_on_clear_ground() {
         "the tower relief survives the leveler (min {hmin}, max {hmax})"
     );
 
-    let (_, cap1, lvl1) = w.loadout().castle.expect("castle panel data");
+    let (_, cap1, lvl1) = w.loadout(Hx::FIRST).castle.expect("castle panel data");
     assert_eq!((lvl1, cap1), (1, 10_000), "level 1, capacity ladder rung 1");
 
     // The RECAST on a standing castle is the UPGRADE (:65904-08):
@@ -189,7 +190,10 @@ fn create_castle_builds_on_clear_ground() {
     for _ in 0..200 {
         w.tick(pose, PlayerCommand::default());
     }
-    let (_, cap2, lvl2) = w.loadout().castle.expect("castle survives the upgrade");
+    let (_, cap2, lvl2) = w
+        .loadout(Hx::FIRST)
+        .castle
+        .expect("castle survives the upgrade");
     assert_eq!(
         (lvl2, cap2),
         (2, 20_000),
@@ -209,15 +213,19 @@ fn mc1_castle_spell_lock_tracks_the_build_not_a_fixed_timer() {
         return;
     };
     let mut w = build_world(&root);
-    w.set_dev_spells(true);
-    w.grant_all_spells();
+    w.set_dev_spells(Hx::FIRST, true);
+    w.grant_all_spells(Hx::FIRST);
     let (cx, cy) = clear_spot(&w);
     let px = cx as f32 + 0.5;
     let pz = cy as f32 + 16.5;
     let alt = w.ground_height_tiles(px, pz) + 2.0;
     let pose = PlayerPose::from_tiles(px, alt, pz, 0.0, 0.0, 0.0);
 
-    assert_eq!(w.debug_castle_lock(), 0, "lock clear before casting");
+    assert_eq!(
+        w.debug_castle_lock(Hx::FIRST),
+        0,
+        "lock clear before casting"
+    );
     w.tick(
         pose,
         PlayerCommand {
@@ -236,7 +244,7 @@ fn mc1_castle_spell_lock_tracks_the_build_not_a_fixed_timer() {
     let mut cleared_at = None;
     for t in 0..101 {
         w.tick(pose, PlayerCommand::default());
-        if w.debug_castle_lock() > 0 {
+        if w.debug_castle_lock(Hx::FIRST) > 0 {
             active_ticks += 1;
         } else if active_ticks > 0 && cleared_at.is_none() {
             cleared_at = Some(t);
@@ -254,7 +262,7 @@ fn mc1_castle_spell_lock_tracks_the_build_not_a_fixed_timer() {
         w.tick(pose, PlayerCommand::default());
     }
     assert_eq!(
-        w.debug_castle_lock(),
+        w.debug_castle_lock(Hx::FIRST),
         0,
         "the lock stays clear once the castle is established (f59 == 4)"
     );
@@ -271,8 +279,8 @@ fn final_destruction_flattens_the_tower_to_a_barren_square() {
         return;
     };
     let mut w = build_world(&root);
-    w.set_dev_spells(true);
-    w.grant_all_spells();
+    w.set_dev_spells(Hx::FIRST, true);
+    w.grant_all_spells(Hx::FIRST);
 
     let (cx, cy) = clear_spot(&w);
     let px = cx as f32 + 0.5;

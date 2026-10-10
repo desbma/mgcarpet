@@ -3,6 +3,7 @@
 //! that climbs to the 1999 cap and stays? Orbit the player to keep the
 //! roaming mobs aggroed; log live occupancy, peak, drops, and the pool
 //! composition at the busiest tick.
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
 use std::collections::BTreeMap;
@@ -46,7 +47,7 @@ fn main() {
         let y = 128.0 + 80.0 * a.sin();
         let alt = w.ground_height_tiles(x, y) + 2.0;
         w.tick(PlayerPose::from_tiles(x, alt, y, a + 1.57, 0.0, 0.0), idle);
-        w.take_teleport();
+        w.take_teleport(Hx::FIRST);
 
         let dropped = w.take_pool_exhausted();
         total_dropped += dropped;

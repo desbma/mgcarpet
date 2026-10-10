@@ -21,6 +21,7 @@
 //! pool refilled to its 1000 ceiling between ticks.
 
 use mgc_formats::{Thing, ThingKind};
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
 use mgc_sim::mc1::spells::SpellId;
@@ -86,8 +87,8 @@ fn armed_world() -> (World, PlayerPose) {
         par3: None,
     };
     let mut w = World::new(planes, &[marker], 1, synthetic_assets());
-    w.set_dev_spells(true);
-    w.grant_all_spells();
+    w.set_dev_spells(Hx::FIRST, true);
+    w.grant_all_spells(Hx::FIRST);
     let pose = PlayerPose::from_tiles(16.0, 40.0, 16.0, 0.0, 0.0, 0.0);
     (w, pose)
 }
@@ -105,7 +106,7 @@ fn equip(w: &mut World, pose: PlayerPose, id: u8) {
 /// One tick with the pool topped to the 1000 ceiling first (real-mana
 /// tests; a no-op refill under dev-spells).
 fn tick_full(w: &mut World, pose: PlayerPose, fire: bool) {
-    w.set_player_mana(1000);
+    w.set_player_mana(Hx::FIRST, 1000);
     w.tick(
         pose,
         PlayerCommand {
@@ -116,7 +117,10 @@ fn tick_full(w: &mut World, pose: PlayerPose, fire: bool) {
 }
 
 fn projectiles(w: &World) -> usize {
-    w.live_poses().iter().filter(|p| p.class == 9).count()
+    w.live_poses(Hx::FIRST)
+        .iter()
+        .filter(|p| p.class == 9)
+        .count()
 }
 
 /// A fresh press refires immediately, even while the prior burst
@@ -127,7 +131,7 @@ fn edge_spell_refires_on_every_fresh_press() {
     equip(&mut w, pose, 0);
     tick_full(&mut w, pose, true); // press arms the token
     assert!(
-        w.loadout().cooldown[0] > 0.0,
+        w.loadout(Hx::FIRST).cooldown[0] > 0.0,
         "the burst counter is live after the arm"
     );
     tick_full(&mut w, pose, false); // the token fires at arm+1
@@ -159,11 +163,14 @@ fn shield_channel_is_edge_only() {
     let (mut w, pose) = armed_world();
     equip(&mut w, pose, 4);
     tick_full(&mut w, pose, true);
-    assert!(w.loadout().cooldown[4] > 0.0, "the click arms the shield");
+    assert!(
+        w.loadout(Hx::FIRST).cooldown[4] > 0.0,
+        "the click arms the shield"
+    );
     let mut expired_while_held = false;
     for _ in 0..600 {
         tick_full(&mut w, pose, true);
-        if w.loadout().cooldown[4] == 0.0 {
+        if w.loadout(Hx::FIRST).cooldown[4] == 0.0 {
             expired_while_held = true;
             break;
         }
@@ -174,7 +181,10 @@ fn shield_channel_is_edge_only() {
     );
     tick_full(&mut w, pose, false);
     tick_full(&mut w, pose, true);
-    assert!(w.loadout().cooldown[4] > 0.0, "a fresh click re-arms it");
+    assert!(
+        w.loadout(Hx::FIRST).cooldown[4] > 0.0,
+        "a fresh click re-arms it"
+    );
 }
 
 /// 2 Accelerate stays a hold-to-channel toggle (+60==0).
@@ -186,7 +196,7 @@ fn accelerate_channel_holds() {
         tick_full(&mut w, pose, true);
     }
     assert!(
-        w.loadout().cooldown[2] > 0.0,
+        w.loadout(Hx::FIRST).cooldown[2] > 0.0,
         "holding keeps the accelerate channel armed past its burst"
     );
 }
@@ -261,8 +271,8 @@ fn lightning_stream_dies_dry_and_needs_a_reclick() {
     let (mut w, pose) = armed_world();
     // Blue-bless the granted spells (zeroes lightning's 25000 castle
     // ladder) and drop the dev bypass.
-    w.debug_bless_owned_spells();
-    w.set_dev_spells(false);
+    w.debug_bless_owned_spells(Hx::FIRST);
+    w.set_dev_spells(Hx::FIRST, false);
     equip(&mut w, pose, 15);
     // The launcher phase: the arm lands at the carpet's walk slot and
     // this token is ABOVE it, so it fires on the press tick.

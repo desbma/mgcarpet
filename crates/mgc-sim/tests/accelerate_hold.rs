@@ -12,6 +12,7 @@
 //! plumbing under test lives in lib.rs, which only these steps drive.
 
 use mgc_formats::{Thing, ThingKind};
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::World;
 use mgc_sim::mc1::spells::SpellId;
@@ -80,14 +81,14 @@ fn flat_world() -> World {
 #[test]
 fn mc1_thrust_model_keeps_accelerate_through_forward_hold() {
     let mut sim = Simulation::with_world(flat_world());
-    sim.thrust_model = ThrustModel::Mc1;
-    sim.world.as_mut().unwrap().set_dev_spells(true);
-    sim.world.as_mut().unwrap().grant_all_spells();
+    sim.thrust_model[Hx::FIRST] = ThrustModel::Mc1;
+    sim.world.as_mut().unwrap().set_dev_spells(Hx::FIRST, true);
+    sim.world.as_mut().unwrap().grant_all_spells(Hx::FIRST);
     sim.step(&FlightInput {
         equip_left: Some(SpellId(2)),
         ..Default::default()
     });
-    let boost = |sim: &Simulation| sim.world.as_ref().unwrap().accel_override();
+    let boost = |sim: &Simulation| sim.world.as_ref().unwrap().accel_override(Hx::FIRST);
 
     // CAST-AND-HOLD while flying forward: full boost every tick.
     //
@@ -210,14 +211,14 @@ fn mc1_thrust_model_keeps_accelerate_through_forward_hold() {
 #[test]
 fn enhanced_accelerate_does_not_survive_death_or_respawn() {
     let mut sim = Simulation::with_world(flat_world());
-    sim.thrust_model = ThrustModel::Enhanced;
-    sim.world.as_mut().unwrap().set_dev_spells(true);
-    sim.world.as_mut().unwrap().grant_all_spells();
+    sim.thrust_model[Hx::FIRST] = ThrustModel::Enhanced;
+    sim.world.as_mut().unwrap().set_dev_spells(Hx::FIRST, true);
+    sim.world.as_mut().unwrap().grant_all_spells(Hx::FIRST);
     sim.step(&FlightInput {
         equip_left: Some(SpellId(2)),
         ..Default::default()
     });
-    let boost = |sim: &Simulation| sim.world.as_ref().unwrap().accel_override();
+    let boost = |sim: &Simulation| sim.world.as_ref().unwrap().accel_override(Hx::FIRST);
     let hold = FlightInput {
         fire_left: true,
         thrust: 1.0,
@@ -227,7 +228,9 @@ fn enhanced_accelerate_does_not_survive_death_or_respawn() {
         sim.step(&hold);
     }
     assert_eq!(boost(&sim), Some(3.0), "held cast is boosting");
-    let speed = |sim: &Simulation| (sim.flyer.vx.powi(2) + sim.flyer.vz.powi(2)).sqrt();
+    let speed = |sim: &Simulation| {
+        (sim.flyer[Hx::FIRST].vx.powi(2) + sim.flyer[Hx::FIRST].vz.powi(2)).sqrt()
+    };
     assert!(speed(&sim) > 1.0, "the enhanced flyer is propelled");
 
     // Shift+K: the MC1 key pass lands `life = -1` post-walk and the
@@ -237,7 +240,7 @@ fn enhanced_accelerate_does_not_survive_death_or_respawn() {
         ..hold
     });
     let mut ticks = 0;
-    while !sim.world.as_ref().unwrap().player_dead() {
+    while !sim.world.as_ref().unwrap().player_dead(Hx::FIRST) {
         sim.step(&FlightInput::default());
         ticks += 1;
         assert!(ticks < 400, "the death fall must touch down");
@@ -253,7 +256,10 @@ fn enhanced_accelerate_does_not_survive_death_or_respawn() {
         respawn: true,
         ..Default::default()
     });
-    assert!(!sim.world.as_ref().unwrap().player_dead(), "respawned");
+    assert!(
+        !sim.world.as_ref().unwrap().player_dead(Hx::FIRST),
+        "respawned"
+    );
     for _ in 0..10 {
         sim.step(&FlightInput::default());
         assert_eq!(boost(&sim), None, "the respawn flies unboosted");

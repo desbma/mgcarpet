@@ -3,6 +3,7 @@
 //! and trigger firings — distinguishing the two chain-stall hypotheses
 //! (pool exhaustion vs kill-triggers misfiring on movement deaths).
 
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
 use std::collections::HashSet;
@@ -82,7 +83,7 @@ fn main() {
                 PlayerPose::from_tiles(x, alt, z, 0.0, 0.0, 0.0),
                 PlayerCommand::default(),
             );
-            w.take_teleport();
+            w.take_teleport(Hx::FIRST);
         }
         let after = stat(&w);
         println!(

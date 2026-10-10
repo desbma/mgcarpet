@@ -15,6 +15,7 @@
 //!
 //! Self-skips without baked mc2 data (game data is optional).
 
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::World;
 use mgc_sim::ids::GameId;
@@ -92,7 +93,7 @@ macro_rules! world {
 #[test]
 fn a_level_start_book_is_born_without_the_re_steal_lock() {
     let mut w = world!(0);
-    w.mc2_grant_start_book(&[0, 1, 9]);
+    w.mc2_grant_start_book(Hx::FIRST, &[0, 1, 9]);
     let toks = w.debug_spell_tokens();
     assert!(!toks.is_empty(), "the ctor floor alone mints two tokens");
     for (slot, model, _own, lock, _tier, _upkeep, ..) in &toks {
@@ -113,7 +114,7 @@ fn a_level_start_book_is_born_without_the_re_steal_lock() {
 #[test]
 fn the_level_start_book_is_minted_at_the_carpet_start_marker() {
     let mut w = world!(0);
-    w.mc2_grant_start_book(&[0, 1, 9]);
+    w.mc2_grant_start_book(Hx::FIRST, &[0, 1, 9]);
     let (mx, my) = w
         .debug_start_marker(0)
         .expect("level 000 authors a human start marker");
@@ -139,9 +140,9 @@ fn the_level_start_book_is_minted_at_the_carpet_start_marker() {
 #[test]
 fn spell_23_carries_the_set_default_spells_upkeep_column() {
     let mut w = world!(0);
-    w.mc2_grant_start_book(&[23]);
+    w.mc2_grant_start_book(Hx::FIRST, &[23]);
     assert_eq!(
-        w.debug_spell_mana_lanes(23).map(|l| l.0),
+        w.debug_spell_mana_lanes(Hx::FIRST, 23).map(|l| l.0),
         Some(50_000),
         "row 23 tier 0's upkeep is the PATCHED 50000, not the DAT's 300000"
     );

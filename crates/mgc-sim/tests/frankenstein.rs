@@ -10,6 +10,7 @@
 //! shared player-intake fallback; awake/movement/objective serve MC2
 //! natively).
 
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
 use mgc_sim::ids::GameId;
@@ -131,7 +132,10 @@ fn mc2_level_through_the_seam_no_crash_deterministic() {
     // The report (visible under --nocapture).
     println!("frankenstein profile: game={:?}", w.game());
     println!("misfits (class, model, count): {:?}", w.misfits());
-    println!("live things after census: {}", w.live_things().len());
+    println!(
+        "live things after census: {}",
+        w.live_things(Hx::FIRST).len()
+    );
 
     // The MC2 registry admits the full creature roster including the
     // MULTIPART subsystem (0/3/22/27) — the honest misfits left are
@@ -160,7 +164,7 @@ fn mc2_level_through_the_seam_no_crash_deterministic() {
          only (5,10) and (5,15) may be ledgered: {:?}",
         w.misfits()
     );
-    let poses = w.live_poses();
+    let poses = w.live_poses(Hx::FIRST);
     for model in [1u8, 13u8] {
         assert!(
             poses.iter().any(|p| p.class == 5 && p.model == model),

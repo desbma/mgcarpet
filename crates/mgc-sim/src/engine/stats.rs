@@ -20,10 +20,6 @@
 
 use crate::snapshot::{Reader, Snap, SnapshotError, Writer};
 
-/// The owner tag of the human (a victim's `f38` when the player
-/// killed it).
-const PLAYER_TAG: u16 = 0xFFFF;
-
 /// Retail's spell-offer census is a raw memory run: MC1 memsets 96
 /// bytes and bumps a DWORD at byte offset `model` (so a model up to
 /// 95 touches byte 98); MC2 memsets 104 (26 dwords).
@@ -244,12 +240,12 @@ impl super::features::Gen {
     /// unowned fire), a dead end, or the hop cap is the environment.
     pub(crate) fn stats_killer_of(&self, tag: u16) -> Killer {
         let wizard = |t: u16| -> Option<Killer> {
-            if t == PLAYER_TAG {
+            if self.is_human_tag(t) {
                 return Some(Killer::Player);
             }
             let s = self.rival_ents.iter().position(|&e| e != 0 && e == t)?;
             // `rival_ents` never holds the human (it is out of pool,
-            // tagged PLAYER_TAG above), so every hit is a rival — seat
+            // tagged `Gen::human_tag` above), so every hit is a rival — seat
             // 0 included when the human flies another seat.
             Some(Killer::Rival(s as u8))
         };
@@ -279,7 +275,7 @@ impl super::features::Gen {
     pub(crate) fn stats_note_death(&mut self, i: usize) {
         let hint = self.stats.0.take_hint(i);
         let e = &self.ent[i];
-        if !scored_model(e.model65) || e.id24 == PLAYER_TAG {
+        if !scored_model(e.model65) || self.is_human_tag(e.id24) {
             return;
         }
         let tag = if e.f38 != 0 { e.f38 } else { hint.unwrap_or(0) };
@@ -303,7 +299,7 @@ impl super::features::Gen {
             if e.class64 == 5
                 && !seg[i]
                 && scored_model(e.model65)
-                && e.id24 != PLAYER_TAG
+                && !self.is_human_tag(e.id24)
                 && e.act_life >= 0
             {
                 alive += 1;

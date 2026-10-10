@@ -38,7 +38,7 @@
 //! defenders on any hostile wizard (see docs/DEVIATIONS.md).
 
 use crate::engine::features::{Gen, HashSilent};
-use crate::engine::world::{LifeState, World};
+use crate::engine::world::{Hx, LifeState, World};
 use crate::mc1::behavior::BEHAVIOR;
 use crate::mc1::mobs::PLAYER_TARGET;
 use crate::mc1::spells::{SPELL_COUNT, SPELLS};
@@ -1498,9 +1498,8 @@ impl World {
     /// Slot 0 (the human) is ignored here — the human's book comes
     /// from the campaign/jar machinery.
     pub fn set_wizards(&mut self, configs: &[Option<RivalConfig>; 8], player_count: u16) {
-        let hs = self.g.human_seat();
         for slot in 0..player_count.min(8) as u8 {
-            if slot == hs {
+            if self.hx_at_wizard(slot).is_some() {
                 continue;
             }
             let Some(cfg) = &configs[slot as usize] else {
@@ -1525,19 +1524,21 @@ impl World {
         configs: &[Option<RivalConfig>; 8],
         player_count: u16,
     ) {
-        let hs = self.g.human_seat();
-        if hs == 0 {
+        // One human at seat 0: the constructor already popped him.
+        if let Some(hx) = self.hx_at_wizard(0)
+            && self.players.len() == 1
+        {
             if !human_book.is_empty() {
-                self.grant_level_book(human_book);
+                self.grant_level_book(hx, human_book);
             }
             self.set_wizards(configs, player_count);
             return;
         }
         for slot in 0..player_count.min(8) as u8 {
-            if slot == hs {
-                self.mc1_spawn_human_record();
+            if let Some(hx) = self.hx_at_wizard(slot) {
+                self.mc1_spawn_human_record(hx);
                 if !human_book.is_empty() {
-                    self.grant_level_book(human_book);
+                    self.grant_level_book(hx, human_book);
                 }
             } else if let Some(cfg) = &configs[slot as usize] {
                 self.spawn_rival(slot, cfg.clone());
@@ -1582,10 +1583,10 @@ impl World {
     /// on this path now. The constructor seats it; the book goes
     /// through [`World::grant_level_book`] BEFORE `set_wizards`.
     /// Set `MGC_NO_MC1_NATIVE_HUMAN_RECORD=1` for A/B.
-    pub fn mc1_spawn_human_record(&mut self) {
+    pub fn mc1_spawn_human_record(&mut self, hx: Hx) {
         if no_mc1_native_human_record()
             || matches!(self.game(), crate::ids::GameId::Mc2)
-            || self.mc1_carpet_slot != 0
+            || self.mc1_carpet_slot[hx] != 0
         {
             return;
         }
@@ -1599,7 +1600,7 @@ impl World {
         // with no `(3,4)` THING row is seated at (0, 0, ground+0x100)
         // exactly like a marker-less rival. See
         // [`no_mc1_markerless_human_seat`].
-        let (x, y) = match self.start_markers[self.g.human_seat() as usize] {
+        let (x, y) = match self.start_markers[self.g.human_seat(hx) as usize] {
             // `sub_44D30`'s pose: the marker's tile centre, ground +
             // 0x100 (:54838-42, the same snap `spawn_rival` uses).
             Some((mx, my)) => ((mx << 8).wrapping_add(128), (my << 8).wrapping_add(128)),
@@ -1614,18 +1615,22 @@ impl World {
         self.g.ent[i] = crate::engine::features::Ent::default();
         self.g.ent[i].rand = rand;
         let z = (self.g.ground_z(x, y) as i16).wrapping_add(0x100);
-        self.human_pose = (x, y, z);
-        self.human_pose_prev = self.human_pose;
-        self.mc1_cast_pose = crate::engine::world::PlayerPose {
-            x,
-            y,
-            z,
-            ..self.mc1_cast_pose
-        };
-        self.mc1_carpet_slot = i as u16;
-        self.g.mc1_pinned = crate::engine::features::Mc1Pinned(i as u16);
+        self.set_human_pose(hx, (x, y, z));
+        self.human_pose_prev[hx] = self.human_pose(hx);
+        self.set_mc1_cast_pose(
+            hx,
+            crate::engine::world::PlayerPose {
+                x,
+                y,
+                z,
+                ..self.mc1_cast_pose(hx)
+            },
+        );
+        self.mc1_carpet_slot[hx] = i as u16;
+        self.g.mc1_pinned[hx] = crate::engine::features::Mc1Pinned(i as u16);
+        self.g.set_human_tag_slot(hx, i as u16);
         if native_human_seat() {
-            self.g.player_relink(x, y);
+            self.g.player_relink(hx, x, y);
         }
     }
 
@@ -1658,7 +1663,8 @@ impl World {
         // Per-slot rival art (:54927-55): sprite-stats rows 273-279,
         // and seat 0 keeps 44 — reached only when the human flies
         // another seat. Draw type 0x11: 16 views by mirror.
-        self.g.set_sprite(i, if slot == 0 { 44 } else { 272 + slot as u16 });
+        self.g
+            .set_sprite(i, if slot == 0 { 44 } else { 272 + slot as u16 });
         self.g.refill_life(i);
         // Retail keeps a wizard's mana ON the entity (+140); the
         // port's authority is `Rival::mana`, with the entity as the
@@ -1879,7 +1885,7 @@ impl World {
 
     /// The rival's castle: (3,2) with id24 = the rival's entity (the
     /// original's Type_160.var_50, resolved by scan like
-    /// [`World::player_castle`]).
+    /// [`World::seat_castle`]).
     pub(crate) fn rival_castle(&self, ent: u16) -> Option<usize> {
         (1..self.g.ent.len()).find(|&j| {
             let e = &self.g.ent[j];
@@ -1936,8 +1942,8 @@ impl World {
     /// player slot: PLAYER_TARGET = 0 (the human), a live rival's
     /// entity slot = its player slot. Consults both rival columns.
     pub(crate) fn owner_slot(&self, owner: u16) -> Option<u8> {
-        if owner == PLAYER_TARGET {
-            return Some(self.g.human_seat());
+        if let Some(hx) = self.g.hx_of_tag(owner) {
+            return Some(self.g.human_seat(hx));
         }
         self.rivals
             .iter()
@@ -2306,7 +2312,10 @@ impl World {
         if grip_src != 0 {
             self.rivals[ri].regen_stall = 16;
             self.g.ent[i].mail[4] = (grip_amt, 0);
-            if self.owner_slot_of_source(grip_src) == Some(self.g.human_seat()) {
+            if let Some(hx) = self
+                .owner_slot_of_source(grip_src)
+                .and_then(|s| self.hx_at_wizard(s))
+            {
                 // u16_314/316/318 on the human: victim, counter,
                 // clamp(dist, 1024, 3072) (:55671-77). ⚠ THE HOLD IS
                 // 3-D — :55673 measures with `sub_42340_42680`, the
@@ -2318,12 +2327,14 @@ impl World {
                 let e = &self.g.ent[i];
                 let (vx, vy, vz) = (e.x, e.y, e.z);
                 let dist = if crate::engine::world::mc1_duel_grip_exact_off() {
-                    Gen::isqrt(Gen::dist2_sq(self.human_pose.0, self.human_pose.1, vx, vy) as u32)
+                    Gen::isqrt(
+                        Gen::dist2_sq(self.human_pose(hx).0, self.human_pose(hx).1, vx, vy) as u32,
+                    )
                 } else {
-                    crate::flight::mc1_duel_dist(self.human_pose, (vx, vy, vz)) as u32
+                    crate::flight::mc1_duel_dist(self.human_pose(hx), (vx, vy, vz)) as u32
                 };
                 let hold = dist.clamp(1024, 3072);
-                self.set_duel_latch(self.rivals[ri].ent, hold);
+                self.set_duel_latch(hx, self.rivals[ri].ent, hold);
             }
         }
         // ch3 mana steal (:55689-91): the victim's subtract is RAW —
@@ -2378,8 +2389,8 @@ impl World {
         // whatever its class. MC2's twin arm says the same thing
         // (EF:61037) and mc2l4 t=8541 proves it on the recording. The
         // `class64 != 0` here was an invented guard.
-        let attacker = if src == PLAYER_TARGET {
-            Some((self.human_pose.0, self.human_pose.1))
+        let attacker = if let Some(hx) = self.g.hx_of_tag(src) {
+            Some((self.human_pose(hx).0, self.human_pose(hx).1))
         } else {
             let s = src as usize;
             (s != 0 && s < self.g.ent.len())
@@ -2416,8 +2427,8 @@ impl World {
     /// sources carry the attacker's owner tag directly (our writers
     /// pass id24 through).
     pub(crate) fn owner_slot_of_source(&self, src: u16) -> Option<u8> {
-        if src == PLAYER_TARGET {
-            return Some(self.g.human_seat());
+        if let Some(hx) = self.g.hx_of_tag(src) {
+            return Some(self.g.human_seat(hx));
         }
         // A pool slot: use its owner tag; a wizard entity is its own.
         let e = self.g.ent.get(src as usize)?;
@@ -2512,7 +2523,7 @@ impl World {
                 continue;
             }
             let (own, tgt, model) = (e.id24, e.f146, e.model65);
-            let owner_ok = own == PLAYER_TARGET
+            let owner_ok = self.g.is_human_tag(own)
                 || (own != 0
                     && (own as usize) < self.g.ent.len()
                     && self.g.ent[own as usize].class64 == 3);
@@ -2523,7 +2534,7 @@ impl World {
             let Some(shooter) = self.owner_slot_of_source(own) else {
                 continue;
             };
-            if tgt == PLAYER_TARGET || tgt as usize >= self.g.ent.len() {
+            if self.g.is_human_tag(tgt) || tgt as usize >= self.g.ent.len() {
                 continue; // human tables unmodeled (see above)
             }
             let t = &self.g.ent[tgt as usize];
@@ -2559,7 +2570,7 @@ impl World {
                 if claimant == 0 {
                     continue;
                 }
-                let claimant_ok = claimant == PLAYER_TARGET
+                let claimant_ok = self.g.is_human_tag(claimant)
                     || ((claimant as usize) < self.g.ent.len()
                         && self.g.ent[claimant as usize].class64 == 3);
                 if !claimant_ok {
@@ -2611,12 +2622,13 @@ impl World {
                 self.game(),
                 crate::ids::GameId::Mc1 | crate::ids::GameId::Mc1Hw
             );
-        if owner == PLAYER_TARGET {
-            self.player.mana = if raw {
-                self.player.mana.wrapping_add(amount)
+        if let Some(hx) = self.hx_of_tag(owner) {
+            let m = if raw {
+                self.human_mana(hx).wrapping_add(amount)
             } else {
-                (self.player.mana + amount).min(self.player.mana_max)
+                (self.human_mana(hx) + amount).min(self.human_mana_max(hx))
             };
+            self.set_human_mana(hx, m);
             return;
         }
         if let Some(r) = self.rivals.iter_mut().find(|r| r.ent == owner) {
@@ -2770,7 +2782,11 @@ impl World {
         // …and :19394-99's walk starts from the roster HEAD, so a
         // seizure blank / a sever below the human's seat earlier this
         // tick parks the clock too (`Gen::mc1_human_on_wiz_chain`).
-        if !self.human_bucket_alive || !self.g.mc1_human_on_wiz_chain() {
+        // Any human seat on the roster runs it.
+        if !self.players.ixs().any(|hx| {
+            self.g
+                .mc1_human_roster_seen(hx, self.human_bucket_alive[hx])
+        }) {
             return;
         }
         for s in 0..SPELL_COUNT {
@@ -3957,8 +3973,9 @@ impl World {
         // target would blind the staleness test (sub_15440 is
         // sig-vs-stored ONLY): retail freezes on a target whose
         // record changed since the pick, and a recomputed sig always
-        // matches itself. The human target keeps the port's sentinel
-        // convention.
+        // matches itself. Only the out-of-pool sentinel world
+        // (`MGC_NO_HUMAN_SLOT_TAG`) keeps the port's sentinel for the
+        // human; with the slot tag his stored sig is retail's too.
         let sig = if target == PLAYER_TARGET {
             PLAYER_TARGET
         } else {
@@ -4173,22 +4190,31 @@ impl World {
     /// for the rest of the take).
     ///
     /// Resolving the sentinel back to the imported carpet slot puts
-    /// the recompute in retail's numbering. A NATIVE world has no
-    /// pooled carpet (`mc1_carpet_slot` 0); there the sentinel stays
-    /// and the arithmetic is merely self-consistent, which is all it
-    /// ever has to be — nothing imported can disagree with it.
+    /// the recompute in retail's numbering. Since the multiplayer
+    /// stage 1 the human's tag IS his carpet slot (`Gen::human_tag`),
+    /// so the human target itself takes retail's formula too; only a
+    /// world with no pooled carpet keeps the self-consistent sentinel.
     fn target_sig(&self, target: u16) -> u16 {
         if target == 0 {
             return 0;
         }
-        if target == PLAYER_TARGET {
-            return PLAYER_TARGET;
+        if self.g.is_human_tag(target) {
+            // The human carpet's RETAIL signature (`sub_15420`'s id +
+            // model + (class << 7) over the class-3 m0 carpet, whose
+            // id is its own slot) — the MC2 twin's law
+            // (`mc2_target_sig`). The out-of-pool sentinel world
+            // (`MGC_NO_HUMAN_SLOT_TAG`, a bare test world) keeps the
+            // port's old self-consistent sentinel.
+            return if target == PLAYER_TARGET {
+                PLAYER_TARGET
+            } else {
+                target.wrapping_add(3u16 << 7)
+            };
         }
         let e = &self.g.ent[target as usize];
-        let team = if e.id24 == PLAYER_TARGET && self.mc1_carpet_slot != 0 {
-            self.mc1_carpet_slot
-        } else {
-            e.id24
+        let team = match self.g.hx_of_tag(e.id24) {
+            Some(hx) if self.mc1_carpet_slot[hx] != 0 => self.mc1_carpet_slot[hx],
+            _ => e.id24,
         };
         team.wrapping_add(e.model65 as u16)
             .wrapping_add((e.class64 as u16) << 7)
@@ -4204,9 +4230,9 @@ impl World {
         if target == 0 {
             return false;
         }
-        if target == PLAYER_TARGET {
-            return sig == PLAYER_TARGET;
-        }
+        // The human's sig comes from `target_sig` like any record's —
+        // his carpet's id/model/class never change, so it survives
+        // death and respawn by construction.
         self.target_sig(target) == sig
     }
 
@@ -4466,8 +4492,8 @@ impl World {
             // falls through to arm 5, keeping `+146` = 569, while
             // the port raided the keep (`+146` 569 -> 23) and stayed
             // there for the next 298 segment heads.
-            let owner_pos = if e.id24 == PLAYER_TARGET {
-                Some(self.human_pose)
+            let owner_pos = if let Some(hx) = self.g.hx_of_tag(e.id24) {
+                Some(self.human_pose(hx))
             } else {
                 self.g.ent.get(e.id24 as usize).map(|o| (o.x, o.y, o.z))
             };
@@ -4476,7 +4502,7 @@ impl World {
             } else {
                 self.wizard_pos(owner)
             };
-            let parked_on = if e.id24 == PLAYER_TARGET {
+            let parked_on = if self.g.is_human_tag(e.id24) {
                 owner_pos.is_some_and(|(wx, wy, wz)| {
                     use crate::mc1::combat::{PLAYER_HH, PLAYER_HW};
                     let wd = |p: u16, q: u16| (p.wrapping_sub(q) as i16 as i32).abs();
@@ -4542,8 +4568,8 @@ impl World {
     /// `movswl +50` (0x6069E). No class, model or `flags & 2` test.
     pub(crate) fn mc1_respawn_reprice(&mut self, pc: usize) {
         let (own, lvl) = (self.g.ent[pc].id24, self.g.ent[pc].f26 as u16);
-        let tok = if own == PLAYER_TARGET {
-            (self.player.state == LifeState::Alive).then_some(self.player.owned[16])
+        let tok = if let Some(hx) = self.hx_of_tag(own) {
+            (self.human_state(hx) == LifeState::Alive).then_some(self.players[hx].owned[16])
         } else {
             let o = own as usize;
             (o != 0 && o < self.g.ent.len() && self.g.ent[o].tick70 <= 1)
@@ -4649,38 +4675,70 @@ impl World {
         // selector runs, and retail still picks the corpse) — AND the
         // human rides the chain's VISIBLE PREFIX like every pooled
         // carpet: see [`mc1_human_on_wiz_roster`].
-        let hs = self.g.human_seat();
-        let human_seen = self.human_bucket_alive && {
-            if mc1_human_on_wiz_roster() {
-                let hs = self.mc1_carpet_slot;
-                let hpos = self.g.wiz_chain.list.partition_point(|&s| s < hs);
-                hpos < self.g.wiz_chain.cut
-            } else {
-                true
+        // Every seat in turn. On the roster a human is judged at his
+        // own slot in the walk below (retail's chain order — a war pick
+        // is first-in-chain); off it, here.
+        for hx in self.players.ixs() {
+            let hs = self.g.human_seat(hx);
+            let on_chain = self.g.human_rides_chain(hx);
+            let human_seen = !on_chain && self.human_bucket_alive[hx] && {
+                if mc1_human_on_wiz_roster() {
+                    let hs = self.mc1_carpet_slot[hx];
+                    let hpos = self.g.wiz_chain.list.partition_point(|&s| s < hs);
+                    hpos < self.g.wiz_chain.cut
+                } else {
+                    true
+                }
+            };
+            if human_seen
+                && judge(
+                    self.g.human_tag[hx].0,
+                    self.human_pose(hx).0,
+                    self.human_pose(hx).1,
+                    self.ghost
+                        || self
+                            .mc1_invis_notice(self.players[hx].owned[12], self.human_invisible(hx)),
+                    self.human_mana_max(hx) as i64,
+                    purse(self.human_mana(hx)),
+                    // :18570-72 — the target's raw +50 register + owned
+                    // m16 token (sub_14E60), not the establishment latch.
+                    self.wiz_castle_reg(hs) == 0 && self.players[hx].owned[16] != 0,
+                    self.rivals[ri].hate[hs as usize] as i64,
+                    self.rivals[ri].war[hs as usize],
+                    &mut best,
+                )
+            {
+                war_pick = Some(self.g.human_tag[hx].0);
+                break;
             }
-        };
-        if human_seen
-            && judge(
-                PLAYER_TARGET,
-                self.human_pose.0,
-                self.human_pose.1,
-                self.ghost || self.mc1_invis_notice(self.player.owned[12], self.player.invisible),
-                self.player.mana_max as i64,
-                purse(self.player.mana),
-                // :18570-72 — the target's raw +50 register + owned
-                // m16 token (sub_14E60), not the establishment latch.
-                self.wiz_castle_reg(hs) == 0 && self.player.owned[16] != 0,
-                self.rivals[ri].hate[hs as usize] as i64,
-                self.rivals[ri].war[hs as usize],
-                &mut best,
-            )
-        {
-            war_pick = Some(PLAYER_TARGET);
         }
         if war_pick.is_none() {
             for c in 0..self.g.wiz_chain.visible_len() {
                 let j = self.g.wiz_chain.list[c] as usize;
                 let e = &self.g.ent[j];
+                if let Some(hx) = self.g.hx_of_rec(j) {
+                    let hs = self.g.human_seat(hx);
+                    if judge(
+                        self.g.human_tag[hx].0,
+                        self.human_pose(hx).0,
+                        self.human_pose(hx).1,
+                        self.ghost
+                            || self.mc1_invis_notice(
+                                self.players[hx].owned[12],
+                                self.human_invisible(hx),
+                            ),
+                        self.human_mana_max(hx) as i64,
+                        purse(self.human_mana(hx)),
+                        self.wiz_castle_reg(hs) == 0 && self.players[hx].owned[16] != 0,
+                        self.rivals[ri].hate[hs as usize] as i64,
+                        self.rivals[ri].war[hs as usize],
+                        &mut best,
+                    ) {
+                        war_pick = Some(self.g.human_tag[hx].0);
+                        break;
+                    }
+                    continue;
+                }
                 if e.model65 != 1 || e.id24 == me {
                     continue;
                 }
@@ -4844,7 +4902,7 @@ impl World {
             // record is not class 3 (the wild 0 included — slot 0 is
             // the scratch) takes the ungated wild arm, scored from
             // ME. PLAYER_TARGET is the port's human tag.
-            let owner_is_wiz = tag == PLAYER_TARGET
+            let owner_is_wiz = self.g.is_human_tag(tag)
                 || self.g.ent.get(tag as usize).is_some_and(|o| o.class64 == 3);
             if !owner_is_wiz {
                 let d = Gen::dist2_sq(px, py, bx, by) as u32;
@@ -4925,30 +4983,61 @@ impl World {
             // same id test — a human-owned manifestation (a BALLOON
             // stamps `+24` with the caster's carpet id) is not guarded
             // by its own caster. See `ball_guard_excludes_own_id`.
-            let human_is_own_id =
-                bid == PLAYER_TARGET || (self.mc1_carpet_slot != 0 && bid == self.mc1_carpet_slot);
-            let human_guard = if ball_guard_excludes_own_id() && human_is_own_id {
-                None
-            } else if ball_guard_is_tick_top() {
-                // …and inside the chain's visible prefix this tick
-                // (`Gen::mc1_human_on_wiz_chain`, the seizure-blank /
-                // sever law) — `sub_15340` walks bucket[0] like the
-                // wizard pick does.
-                (self.human_bucket_alive && !self.ghost && self.g.mc1_human_on_wiz_chain())
-                    .then_some(self.human_pose)
-            } else {
-                self.wizard_pos(self.g.human_seat())
+            // Per seat: is the ball's own id HIS (tag or carpet slot)?
+            let human_is_own_id = |hx: Hx| {
+                bid == self.g.human_tag[hx].0
+                    || (self.mc1_carpet_slot[hx] != 0 && bid == self.mc1_carpet_slot[hx])
             };
-            let mut guard: Option<u32> =
-                human_guard.map(|(hx, hy, _)| Gen::dist2_sq(bx, by, hx, hy) as u32);
+            // On the roster the tick-top human guard is met at his slot
+            // in the walk below.
+            let human_in_walk = |hx: Hx| ball_guard_is_tick_top() && self.g.human_rides_chain(hx);
+            // The nearest off-walk human seat guards first.
+            let mut guard: Option<u32> = None;
+            for hx in self.players.ixs() {
+                let human_guard =
+                    if (ball_guard_excludes_own_id() && human_is_own_id(hx)) || human_in_walk(hx) {
+                        None
+                    } else if ball_guard_is_tick_top() {
+                        // …and inside the chain's visible prefix this tick
+                        // (`Gen::mc1_human_on_wiz_chain`, the seizure-blank /
+                        // sever law) — `sub_15340` walks bucket[0] like the
+                        // wizard pick does.
+                        (!self.ghost
+                            && self
+                                .g
+                                .mc1_human_roster_seen(hx, self.human_bucket_alive[hx]))
+                        .then_some(self.human_pose(hx))
+                    } else {
+                        self.wizard_pos(self.g.human_seat(hx))
+                    };
+                if let Some(d) =
+                    human_guard.map(|(hpx, hpy, _)| Gen::dist2_sq(bx, by, hpx, hpy) as u32)
+                    && guard.is_none_or(|gd| d < gd)
+                {
+                    guard = Some(d);
+                }
+            }
             let mut castle: Option<(usize, u32)> = None;
             for k in 0..self.g.wiz_chain.visible_len() {
                 let w = self.g.wiz_chain.list[k] as usize;
                 let we = &self.g.ent[w];
+                let human = self.g.hx_of_rec(w);
+                if let Some(hx) = human
+                    && (!human_in_walk(hx)
+                        || self.ghost
+                        || (ball_guard_excludes_own_id() && human_is_own_id(hx)))
+                {
+                    continue;
+                }
                 if we.id24 == bid {
                     continue;
                 }
-                let d = Gen::dist2_sq(bx, by, we.x, we.y) as u32;
+                let (wx, wy) = if let Some(hx) = human {
+                    (self.human_pose(hx).0, self.human_pose(hx).1)
+                } else {
+                    (we.x, we.y)
+                };
+                let d = Gen::dist2_sq(bx, by, wx, wy) as u32;
                 if we.model65 <= 1 && we.id24 != me && guard.is_none_or(|gd| d < gd) {
                     guard = Some(d);
                 }
@@ -5034,8 +5123,8 @@ impl World {
     /// A wizard's live position by slot (the human's seat = the human,
     /// [`crate::engine::features::Gen::human_seat`]).
     pub(crate) fn wizard_pos(&self, slot: u8) -> Option<(u16, u16, i16)> {
-        if slot == self.g.human_seat() {
-            return (self.player.state == LifeState::Alive).then_some(self.human_pose);
+        if let Some(hx) = self.hx_at_wizard(slot) {
+            return (self.human_state(hx) == LifeState::Alive).then_some(self.human_pose(hx));
         }
         let ent = self
             .rivals
@@ -5054,8 +5143,8 @@ impl World {
 
     /// A wizard's mana ceiling (the wealth term in the hate gates).
     pub(crate) fn wizard_wealth(&self, slot: u8) -> u32 {
-        if slot == self.g.human_seat() {
-            return self.player.mana_max;
+        if let Some(hx) = self.hx_at_wizard(slot) {
+            return self.human_mana_max(hx);
         }
         self.rivals
             .iter()
@@ -5239,7 +5328,7 @@ impl World {
             // toward target + 512 runs only when the attempt FAILED.
             AiState::AttackWizard | AiState::RaidBalloon | AiState::HuntMana => {
                 let (tx, ty, tz) = match self.rivals[ri].target {
-                    PLAYER_TARGET => self.human_pose,
+                    ht if let Some(hx) = self.g.hx_of_tag(ht) => self.human_pose(hx),
                     t => {
                         let e = &self.g.ent[t as usize];
                         (e.x, e.y, e.z)
@@ -5266,7 +5355,7 @@ impl World {
                         let target = self.rivals[ri].target;
                         let model_only = war_clear_is_model_only();
                         let hit =
-                            target == PLAYER_TARGET
+                            self.g.is_human_tag(target)
                                 || self.g.ent.get(target as usize).is_some_and(|e| {
                                     e.model65 <= 1 && (model_only || e.class64 == 3)
                                 });
@@ -5698,9 +5787,12 @@ impl World {
                 }
         };
         let target_rebounds = vs_wizard
-            && match self.rivals[ri].target {
-                PLAYER_TARGET => token_live(self.player.owned[14]),
-                t => self
+            && match (
+                self.rivals[ri].target,
+                self.hx_of_tag(self.rivals[ri].target),
+            ) {
+                (_, Some(hx)) => token_live(self.players[hx].owned[14]),
+                (t, None) => self
                     .rivals
                     .iter()
                     .find(|r| r.ent == t)
@@ -5876,7 +5968,7 @@ impl World {
                 Gen::polar_step(&mut fwd, e.f30, 0, 4096);
                 fwd
             }
-            PLAYER_TARGET => self.human_pose,
+            ht if let Some(hx) = self.g.hx_of_tag(ht) => self.human_pose(hx),
             t => {
                 let e = &self.g.ent[t as usize];
                 (e.x, e.y, e.z)
@@ -6466,8 +6558,8 @@ impl World {
         // (the record's free stack turns into the descending
         // 33, 32, 31 … 19 run with a 79-deep recycle stack, and the
         // next (10,40) lands on slot 18 against our 65).
-        let pinned = self.mc1_carpet_slot;
-        self.g.mc1_rebuild_free(pinned);
+        let pinned = self.mc1_carpet_slots();
+        self.g.mc1_rebuild_free(&pinned);
         // :43836-58 — sub_37220 rebuilds BOTH halves: the recycle
         // stack collects every live record with 0x20400 (descending
         // push => the LOWEST victim on top), and the landing leaves
@@ -6487,8 +6579,10 @@ impl World {
             // wizard never runs (mc1l49 t=9641, retail 49 vs port
             // 50). The old "parity with the creature track" bump
             // survives only under the switch.
-            if k == 0 && no_mc1_rival_kill_no_tally() {
-                self.g.kills = self.g.kills.saturating_add(1);
+            if no_mc1_rival_kill_no_tally()
+                && let Some(hx) = self.hx_at_wizard(k)
+            {
+                self.g.kills[hx] = self.g.kills[hx].saturating_add(1);
             }
         }
         // Death message for the app ticker + toast (retail etext 54
@@ -6762,8 +6856,8 @@ impl World {
         // like retail's bare `pool[+38].pos` read (the same law
         // `raid_owner_pos_is_raw` carries). mc1l49's husks watch the
         // human, so this arm IS the corpus witness.
-        let (tx, ty, tz) = if w == PLAYER_TARGET {
-            self.human_pose
+        let (tx, ty, tz) = if let Some(hx) = self.g.hx_of_tag(w) {
+            self.human_pose(hx)
         } else if let Some(t) = self.g.ent.get(w as usize) {
             (t.x, t.y, t.z)
         } else {
@@ -6838,8 +6932,8 @@ impl World {
         // :54842 — `sub_44D30`'s first statement, whoever is
         // respawning: the same rebuild, so the re-minted book takes
         // the slots the scatter freed.
-        let pinned = self.mc1_carpet_slot;
-        self.g.mc1_rebuild_free(pinned);
+        let pinned = self.mc1_carpet_slots();
+        self.g.mc1_rebuild_free(&pinned);
         // The recycle half too (:43836-58) — the respawn's re-grant
         // loop allocates 24 times into a possibly-exhausted pool and
         // retail SACRIFICES 0x20400 victims ascending (hw:50910;
@@ -7190,7 +7284,9 @@ impl Snap for Rival {
 mod tests {
     use super::*;
     use crate::engine::features::{FeatureAssets, Planes};
+    use crate::engine::world::Hx;
     use crate::engine::world::{PlayerCommand, PlayerPose};
+    use crate::mc1::mobs::PLAYER_TARGET;
     use mgc_formats::{Thing, ThingKind};
 
     /// Diamond-ring SEARCH.DAT + a 4x4 building row — the same
@@ -7397,12 +7493,13 @@ mod tests {
         let w = World::new(planes, &things, 1, assets());
         assert_eq!(w.start_markers[0], None, "the human authors no marker");
         assert_ne!(
-            w.mc1_carpet_slot, 0,
+            w.mc1_carpet_slot[Hx::FIRST],
+            0,
             "the carpet is pooled anyway: :54845 reads str_9177[0] with no marker test"
         );
         let ground = w.g.ground_z(0, 0) as i16;
         assert_eq!(
-            w.human_pose,
+            w.human_pose(Hx::FIRST),
             (0, 0, ground.wrapping_add(256)),
             "the zeroed str_9177[0] seats the human at the ORIGIN (engine units, \
              not tile (0,0)'s centre), ground + 0x100 — not at colour 1's (120,120) \
@@ -8121,7 +8218,7 @@ mod tests {
             e.class64 = 3;
             e.model65 = 3;
             e.tick70 = 9;
-            e.id24 = PLAYER_TARGET;
+            e.id24 = w.g.human_tag[Hx::FIRST].0;
             e.max_life = 10000;
             e.act_life = 9000;
             e.f140 = 5000;
@@ -8288,17 +8385,16 @@ mod tests {
         // arithmetic.
         w.g.ent[me].flags |= 0x8000;
         let ctx = MobCtx {
-            px: 10,
-            py: 10,
-            pz: 200,
-            pyaw: 0,
-            pmana: 0,
-            pmana_max: 0,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: crate::patches::WorldPatches::RETAIL,
             mc2_turn: 0,
+        };
+        *w.g.view_mut(ctx.phx) = crate::engine::features::SeatView {
+            x: 10,
+            y: 10,
+            z: 200,
+            ..Default::default()
         };
 
         // ---- the affordable deflect -----------------------------------
@@ -8403,24 +8499,23 @@ mod tests {
         let wz = (w.g.ground_z(wx, wy) as i16).wrapping_add(400);
         w.g.move_relink(me, wx, wy, wz);
         let ctx = MobCtx {
-            px: 10,
-            py: 10,
-            pz: 200,
-            pyaw: 0,
-            pmana: 0,
-            pmana_max: 0,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: crate::patches::WorldPatches::RETAIL,
             mc2_turn: 0,
+        };
+        *w.g.view_mut(ctx.phx) = crate::engine::features::SeatView {
+            x: 10,
+            y: 10,
+            z: 200,
+            ..Default::default()
         };
         // ---- the pool arm: a human bolt off the rival's shield ------
         let bolt = w.g.spawn_fireball(wx, wy, wz).expect("bolt slot");
         w.g.move_relink(bolt, wx, wy, wz);
         {
             let e = &mut w.g.ent[bolt];
-            e.id24 = PLAYER_TARGET;
+            e.id24 = w.g.human_tag[Hx::FIRST].0;
             e.f146 = 0;
             e.flags |= 2; // acquire spent, untargeted: no homing step before the hit
             e.f126 = 0;
@@ -8447,7 +8542,7 @@ mod tests {
             w.g.move_relink(b, wx, wy, wz);
             {
                 let e = &mut w.g.ent[b];
-                e.id24 = PLAYER_TARGET;
+                e.id24 = w.g.human_tag[Hx::FIRST].0;
                 e.f146 = 0;
                 e.flags |= 2;
                 e.f126 = 0;
@@ -8464,14 +8559,21 @@ mod tests {
             assert_eq!(w.g.ent[b].f36, want, "target pitch at {pitch}");
         }
         // ---- the human arm: a rival bolt off the carpet's Rebound ----
-        w.g.player_rebound = true;
+        w.g.set_player_rebound(Hx::FIRST, true);
         let (px, py, pz) = (80u16 << 8, 80u16 << 8, 3000i16);
+        // The walkers read him off his record (slice 5c).
+        w.set_human_pose(Hx::FIRST, (px, py, pz));
+        w.set_human_mana(Hx::FIRST, 5000);
         let hctx = MobCtx {
-            px,
-            py,
-            pz,
-            pmana: 5000,
+            phx: crate::engine::world::Hx::FIRST,
             ..ctx
+        };
+        *w.g.view_mut(hctx.phx) = crate::engine::features::SeatView {
+            x: px,
+            y: py,
+            z: pz,
+            mana: 5000,
+            ..*w.g.view(hctx.phx)
         };
         let bolt = w.g.spawn_fireball(px, py, pz).expect("bolt slot");
         w.g.move_relink(bolt, px, py, pz);
@@ -8488,7 +8590,11 @@ mod tests {
         w.g.proj_tick(bolt, &hctx);
         {
             let e = &w.g.ent[bolt];
-            assert_eq!(e.id24, PLAYER_TARGET, "premise: the human arm deflected");
+            assert_eq!(
+                e.id24,
+                w.g.human_tag[Hx::FIRST].0,
+                "premise: the human arm deflected"
+            );
             assert_eq!(e.f32, 1948, "the live pitch is reversed");
             assert_eq!(
                 e.f36, 1948,
@@ -8629,7 +8735,7 @@ mod tests {
             w.wizard_pos(0).is_some(),
             "test premise: the human is alive (his pose seeds the guard election)"
         );
-        let (hx, hy) = (w.human_pose.0, w.human_pose.1);
+        let (hx, hy) = (w.human_pose(Hx::FIRST).0, w.human_pose(Hx::FIRST).1);
         // A neutral human-owned ball 20,000 out from the human — far
         // beyond the 5120 guard disc, so retail reads it UNGUARDED.
         let b = w.g.new_event().expect("ball slot");
@@ -8698,10 +8804,10 @@ mod tests {
         // the phantom site at the HUMAN's antipode too and the SIGNED
         // undefended test read it "defended" — masking the election
         // (this pin probed VACUOUS in that geometry).
-        w.human_pose = (
-            rx.wrapping_add(20_000),
-            ry.wrapping_add(20_000),
-            w.human_pose.2,
+        let hz = w.human_pose(Hx::FIRST).2;
+        w.set_human_pose(
+            Hx::FIRST,
+            (rx.wrapping_add(20_000), ry.wrapping_add(20_000), hz),
         );
         w.rivals[ri].hate[0] = 60_000;
         let fake_castle = |w: &mut World, x: u16, y: u16| {
@@ -8709,7 +8815,7 @@ mod tests {
             let e = &mut w.g.ent[c];
             e.class64 = 3;
             e.model65 = 2;
-            e.id24 = PLAYER_TARGET;
+            e.id24 = w.g.human_tag[Hx::FIRST].0;
             e.act_life = 1000;
             e.flags &= !0x10;
             c
@@ -8720,7 +8826,7 @@ mod tests {
         let c1 = fake_castle(&mut w, rx.wrapping_add((v28 + 5_000) as u16), ry);
         // The phantom: the rival's exact antipode.
         fake_castle(&mut w, rx ^ 0x8000, ry ^ 0x8000);
-        let (hx, hy) = (w.human_pose.0, w.human_pose.1);
+        let (hx, hy) = (w.human_pose(Hx::FIRST).0, w.human_pose(Hx::FIRST).1);
         let (c1x, c1y) = (w.g.ent[c1].x, w.g.ent[c1].y);
         assert!(
             Gen::dist2_sq(c1x, c1y, hx, hy) as u32 > 7_680 * 7_680,
@@ -8772,15 +8878,15 @@ mod tests {
             let e = &mut w.g.ent[c];
             e.class64 = 3;
             e.model65 = 2;
-            e.id24 = PLAYER_TARGET;
+            e.id24 = w.g.human_tag[Hx::FIRST].0;
             e.act_life = 1000;
             e.flags &= !0x10;
         }
         let (cx, cy) = (w.g.ent[c].x, w.g.ent[c].y);
         w.g.rebuild_wiz_chain();
         // THE OWNER IS MID-DEATH-FALL — and parked 4,000 from his keep.
-        w.player.state = LifeState::Falling;
-        w.human_pose = (cx.wrapping_add(4_000), cy, rz);
+        w.set_human_state(Hx::FIRST, LifeState::Falling);
+        w.set_human_pose(Hx::FIRST, (cx.wrapping_add(4_000), cy, rz));
         assert!(
             w.wizard_pos(0).is_none(),
             "test premise: the live-state lookup has already dropped him"
@@ -8791,7 +8897,7 @@ mod tests {
              record's +72, not its life state"
         );
         // NON-VACUITY: the same dead owner, now 20,000 out.
-        w.human_pose = (cx.wrapping_add(20_000), cy, rz);
+        w.set_human_pose(Hx::FIRST, (cx.wrapping_add(20_000), cy, rz));
         assert!(
             w.rival_pick_castle_target(ri, i),
             "20,000 is past the 7680 disc — the keep IS undefended"
@@ -8832,7 +8938,7 @@ mod tests {
             e.model65 = 39;
             e.tick70 = 41;
             e.f140 = 512;
-            e.f144 = PLAYER_TARGET; // neutral-owned (no hate latched)
+            e.f144 = w.g.human_tag[Hx::FIRST].0; // neutral-owned (no hate latched)
             e.act_life = 300;
             e.max_life = 300;
         }
@@ -8853,9 +8959,9 @@ mod tests {
         w.g.rebuild_ball_chain();
         // The human took his fatal hit AFTER the tick top: dead now,
         // but still a chain member, and parked 2,000 from the ball.
-        w.player.state = LifeState::Falling;
-        w.human_bucket_alive = true;
-        w.human_pose = (bx.wrapping_add(2_000), by, rz);
+        w.set_human_state(Hx::FIRST, LifeState::Falling);
+        w.human_bucket_alive[Hx::FIRST] = true;
+        w.set_human_pose(Hx::FIRST, (bx.wrapping_add(2_000), by, rz));
         assert!(
             w.wizard_pos(0).is_none(),
             "test premise: the live-state lookup has already dropped him"
@@ -8866,7 +8972,7 @@ mod tests {
              is GUARDED for the rest of this tick"
         );
         // NON-VACUITY: he was already out of the chain at the tick top.
-        w.human_bucket_alive = false;
+        w.human_bucket_alive[Hx::FIRST] = false;
         assert!(
             w.rival_pick_ball_target(ri, i),
             "off the tick-top chain he does not guard, and the only \
@@ -8966,10 +9072,12 @@ mod tests {
             "and the rival still lacks Fireball"
         );
         // The human's own-spell hide must not be what hides it.
-        w.player.owned[0] = 0;
+        w.players[Hx::FIRST].owned[0] = 0;
         let drawn = |w: &World| {
-            w.live_poses().iter().any(|p| p.class == 12 && p.model == 0)
-                || w.live_things()
+            w.live_poses(Hx::FIRST)
+                .iter()
+                .any(|p| p.class == 12 && p.model == 0)
+                || w.live_things(Hx::FIRST)
                     .iter()
                     .any(|t| t.class == 12 && t.model == 0)
         };
@@ -9047,8 +9155,8 @@ mod tests {
         let ri = 0;
         let i = w.rivals[ri].ent as usize;
         w.g.rebuild_wiz_chain();
-        w.human_bucket_alive = true;
-        w.player.invisible = false;
+        w.human_bucket_alive[Hx::FIRST] = true;
+        w.set_human_invisible(Hx::FIRST, false);
         // The war arm is first-in-chain and RANGELESS (:18563-68), so
         // the election turns on candidacy alone.
         w.rivals[ri].war[0] = true;
@@ -9058,7 +9166,7 @@ mod tests {
             "an intact roster seats the human: the war arm must elect him"
         );
         assert_eq!(w.rivals[ri].state, AiState::AttackWizard);
-        assert_eq!(w.rivals[ri].target, PLAYER_TARGET);
+        assert_eq!(w.rivals[ri].target, w.g.human_tag[Hx::FIRST].0);
 
         // Now blank the head, exactly as a mid-tick seizure does
         // (`Gen::new_event` :43885-91 nulls all four roster heads).
@@ -9807,13 +9915,13 @@ mod tests {
         }];
         let mut w = World::new(planes, &things, 1, assets());
         let cell = crate::engine::features::tile(120, 120);
-        assert_ne!(w.mc1_carpet_slot, 0, "rig: the carpet is pooled");
-        let seat = w.g.player_chain;
+        assert_ne!(w.mc1_carpet_slot[Hx::FIRST], 0, "rig: the carpet is pooled");
+        let seat = w.g.player_chain[Hx::FIRST];
         assert_eq!(
             seat.cell, cell,
             "seated on his start tile by the constructor"
         );
-        w.grant_spells(&[0, 3]);
+        w.grant_spells(Hx::FIRST, &[0, 3]);
         let head = w.g.map_entity[cell] as usize;
         assert_eq!(
             (w.g.ent[head].class64, w.g.ent[head].model65),
@@ -9821,11 +9929,13 @@ mod tests {
             "rig: the book's last token heads his tile"
         );
         assert_eq!(
-            w.g.player_chain, seat,
+            w.g.player_chain[Hx::FIRST],
+            seat,
             "and the tokens went in AHEAD of him: his successor did not move"
         );
         assert_ne!(
-            w.g.player_chain.next as usize, head,
+            w.g.player_chain[Hx::FIRST].next as usize,
+            head,
             "he is not the head's predecessor"
         );
     }
@@ -10366,20 +10476,20 @@ mod tests {
         let i = w.rivals[ri].ent as usize;
         let law = !crate::engine::features::no_mc1_rival_bully_signed_purse();
         w.g.rebuild_wiz_chain();
-        w.human_bucket_alive = true;
-        w.player.invisible = false;
-        w.player.owned[12] = 0;
+        w.human_bucket_alive[Hx::FIRST] = true;
+        w.set_human_invisible(Hx::FIRST, false);
+        w.players[Hx::FIRST].owned[12] = 0;
         // The human is an unbound castle-knower (:18570-71) …
-        w.player.owned[16] = 1;
+        w.players[Hx::FIRST].owned[16] = 1;
         assert_eq!(w.wiz_castle_reg(0), 0);
         // … never hated, never at war: only the bully leg can elect him.
         w.rivals[ri].hate[0] = 0;
         w.rivals[ri].war[0] = false;
         w.rivals[ri].owned[16] = 0; // the picker's own self-test passes
         let e = &w.g.ent[i];
-        w.human_pose = (e.x, e.y, e.z);
+        w.set_human_pose(Hx::FIRST, (e.x, e.y, e.z));
         // 1. The CANDIDATE's purse is wrapped (a corpse's held shortfall).
-        w.player.mana = (-400i32) as u32;
+        w.set_human_mana(Hx::FIRST, (-400i32) as u32);
         w.rivals[ri].mana = 5_000;
         w.rivals[ri].state = AiState::Cruise;
         let picked = w.rival_pick_wizard_target(ri, i);
@@ -10388,7 +10498,7 @@ mod tests {
             "−400 + 32·(255−200) = 1360 < 5000 bullies the corpse; the u32 arm reads ~4.29e9"
         );
         // 2. The PICKER's own purse is wrapped (its fatal tick).
-        w.player.mana = 0;
+        w.set_human_mana(Hx::FIRST, 0);
         w.rivals[ri].mana = (-400i32) as u32;
         w.rivals[ri].state = AiState::Cruise;
         let picked = w.rival_pick_wizard_target(ri, i);
@@ -10670,14 +10780,18 @@ mod tests {
         let ri = 0;
         let i = w.rivals[ri].ent as usize;
         let slot = w.rivals[ri].slot as usize;
-        w.g.ent[i].f38 = PLAYER_TARGET;
-        w.g.kills = 5;
+        w.g.ent[i].f38 = w.g.human_tag[Hx::FIRST].0;
+        w.g.kills[Hx::FIRST] = 5;
         w.rival_death_impact(ri, i);
         assert_eq!(
             w.kill_tally[0][slot], 1,
             "the killer's per-victim +30 tally"
         );
-        assert_eq!(w.g.kills, 5, "+359 is the creature handoff's alone");
+        assert_eq!(
+            w.g.kills[Hx::FIRST],
+            5,
+            "+359 is the creature handoff's alone"
+        );
     }
 
     /// The knock BEARING is stored raw at :55714 — `sub_42150` can
@@ -10727,7 +10841,7 @@ mod tests {
             "+24 = kraken→rival bearing + 0x400"
         );
         assert_eq!(
-            w.g.player_knock,
+            w.g.player_knock[Hx::FIRST],
             (0, 0),
             "the human's register is not the target's"
         );
@@ -10769,7 +10883,7 @@ mod tests {
 /// Self-skips without baked data.
 #[cfg(test)]
 mod human_seat_tests {
-    use super::{PLAYER_TARGET, RivalConfig};
+    use super::RivalConfig;
     use crate::engine::features::{FeatureAssets, Planes};
     use crate::engine::world::World;
     use crate::ids::GameId;
@@ -10859,8 +10973,8 @@ mod human_seat_tests {
 
     fn sim(w: World) -> Simulation {
         let mut s = Simulation::with_world(w);
-        s.thrust_model = ThrustModel::Mc1;
-        s.sync_carpet_from_flyer();
+        s.thrust_model[crate::engine::world::Hx::FIRST] = ThrustModel::Mc1;
+        s.sync_carpet_from_flyer(crate::engine::world::Hx::FIRST);
         s
     }
 
@@ -10898,13 +11012,16 @@ mod human_seat_tests {
         let Some(a) = arena() else { return };
         assert!(a.count >= 5, "level 50 seats eight wizards");
         let w = build(&a, 4);
-        assert_eq!(w.g.human_seat(), 4);
+        assert_eq!(w.g.human_seat(crate::engine::world::Hx::FIRST), 4);
 
         // The human sits on colour 4's marker, the rivals on every
         // other seat — 0 included, 4 excluded.
         let (mx, my) = w.start_markers[4].expect("level 50 authors colour 4");
         assert_eq!(
-            (w.human_pose.0, w.human_pose.1),
+            (
+                w.human_pose(crate::engine::world::Hx::FIRST).0,
+                w.human_pose(crate::engine::world::Hx::FIRST).1
+            ),
             ((mx << 8) | 128, (my << 8) | 128)
         );
         let mut seats: Vec<u8> = w.rivals.iter().map(|r| r.slot).collect();
@@ -10915,18 +11032,32 @@ mod human_seat_tests {
         // Retail's pop order: wizard 0..7 in seat order, the human's
         // carpet record between seats 3 and 5.
         let ent_of = |s: u8| w.rivals.iter().find(|r| r.slot == s).unwrap().ent;
-        let hs = w.mc1_carpet_slot;
-        assert!(ent_of(3) < hs && hs < ent_of(5), "{} < {hs} < {}", ent_of(3), ent_of(5));
+        let hs = w.mc1_carpet_slot[crate::engine::world::Hx::FIRST];
+        assert!(
+            ent_of(3) < hs && hs < ent_of(5),
+            "{} < {hs} < {}",
+            ent_of(3),
+            ent_of(5)
+        );
 
         // Every seat resolver answers the human's seat for his tag,
         // and seat 0 for the rival flying it.
-        assert_eq!(w.g.owner_team(PLAYER_TARGET), Some(4));
-        assert_eq!(w.owner_slot(PLAYER_TARGET), Some(4));
+        assert_eq!(
+            w.g.owner_team(w.g.human_tag[crate::engine::world::Hx::FIRST].0),
+            Some(4)
+        );
+        assert_eq!(
+            w.owner_slot(w.g.human_tag[crate::engine::world::Hx::FIRST].0),
+            Some(4)
+        );
         assert_eq!(w.owner_slot(ent_of(0)), Some(0));
         assert_eq!(w.g.owner_team(ent_of(0)), Some(0));
         assert_eq!(
             w.wizard_pos(4).map(|p| (p.0, p.1)),
-            Some((w.human_pose.0, w.human_pose.1))
+            Some((
+                w.human_pose(crate::engine::world::Hx::FIRST).0,
+                w.human_pose(crate::engine::world::Hx::FIRST).1
+            ))
         );
         let r0 = &w.g.ent[ent_of(0) as usize];
         assert_eq!(w.wizard_pos(0), Some((r0.x, r0.y, r0.z)));
@@ -10956,7 +11087,15 @@ mod human_seat_tests {
         // The stream carries the seat itself…
         let mut other = sim(build(&a, 0));
         other.restore(&bytes).expect("restore");
-        assert_eq!(other.world.as_ref().unwrap().g.human_seat(), 4);
+        assert_eq!(
+            other
+                .world
+                .as_ref()
+                .unwrap()
+                .g
+                .human_seat(crate::engine::world::Hx::FIRST),
+            4
+        );
         // …but, like every save, it restores onto a world BUILT the
         // same way: the load-static pins (`ImportPin` — the carpet
         // slot, the castle register) come from the build, and a
@@ -10970,6 +11109,9 @@ mod human_seat_tests {
             assert_eq!(live.state_hash(), restored.state_hash(), "tick {t}");
         }
         // A seated world hashes apart from the seat-0 one.
-        assert_ne!(sim(build(&a, 4)).state_hash(), sim(build(&a, 0)).state_hash());
+        assert_ne!(
+            sim(build(&a, 4)).state_hash(),
+            sim(build(&a, 0)).state_hash()
+        );
     }
 }

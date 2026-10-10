@@ -46,6 +46,9 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
+/// The human seat this app presents and drives — one local human.
+pub(crate) const LOCAL_HX: mgc_sim::Hx = mgc_sim::Hx::FIRST;
+
 const FOV_Y: f32 = 60.0_f32.to_radians();
 const MOUSE_SENSITIVITY: f32 = 0.0022;
 /// MC1 virtual-stick gain: stick units (±127 full deflection) per
@@ -1513,7 +1516,7 @@ fn load_level(
         };
         match &world {
             Some(w) => {
-                let poses = w.live_poses();
+                let poses = w.live_poses(LOCAL_HX);
                 (
                     // Load-time set: no fire exists at level start, so
                     // the enhanced-fire sprite suppression is moot here,
@@ -1553,21 +1556,24 @@ fn load_level(
         println!(
             "mc2 boot: {} billboards / {} live poses",
             billboards.len(),
-            world.as_ref().map_or(0, |w| w.live_poses().len())
+            world.as_ref().map_or(0, |w| w.live_poses(LOCAL_HX).len())
         );
     }
 
     // The original's spawn: the class-3 m4 start marker's position
     // (both games), hovering over the (post-feature) terrain, facing
     // north.
-    let start = entities::player_start_seat(game_id, &package.things.things, human_seat).map(|(x, z)| Flyer {
-        x,
-        y: entities::ground_at(&height, x, z) + entities::START_HOVER,
-        z,
-        yaw: 0.0,
-        pitch: 0.0,
-        ..Flyer::default()
-    });
+    let start =
+        entities::player_start_seat(game_id, &package.things.things, human_seat).map(|(x, z)| {
+            Flyer {
+                x,
+                y: entities::ground_at(&height, x, z) + entities::START_HOVER,
+                z,
+                yaw: 0.0,
+                pitch: 0.0,
+                ..Flyer::default()
+            }
+        });
 
     let ui_assets = bundle.ui_sprites.as_ref().map(|(idx, px)| {
         ui::UiAssets::build(
@@ -2829,7 +2835,7 @@ impl App {
                 let sess = self.session.as_deref_mut().ok_or("level did not install")?;
                 if let Some(snap) = &snap {
                     sess.sim.restore(snap).map_err(|e| e.to_string())?;
-                    sess.prev_flyer = sess.sim.flyer;
+                    sess.prev_flyer = sess.sim.flyer[LOCAL_HX];
                     sess.pose_prev = Vec::new();
                     sess.pose_cur = Vec::new();
                     sess.fire_blasts.clear();
@@ -3390,7 +3396,7 @@ impl App {
                     // captures its miniature here too.
                     let mut icons_grew = false;
                     if let Some(w) = &sess.sim.world {
-                        let poses = w.live_poses();
+                        let poses = w.live_poses(LOCAL_HX);
                         if self.cfg.render.enhancement.map_marker_icons {
                             icons_grew = capture_marker_icons(&mut sess.level, &poses);
                         }
@@ -3409,7 +3415,7 @@ impl App {
                             sess.level.game,
                             &poses,
                             &sess.level.map_icons,
-                            w.beyond_sight(),
+                            w.beyond_sight(LOCAL_HX),
                             self.cfg.render.enhancement.expose_jar_spells,
                             self.cfg.render.enhancement.map_marker_icons,
                         );
@@ -3434,7 +3440,7 @@ impl App {
                     // inactive mover's state is stale and reads back
                     // as a phantom warp/velocity.
                     sess.sim
-                        .set_thrust_model(sim_thrust(self.cfg.controls.models.thrust));
+                        .set_thrust_model(LOCAL_HX, sim_thrust(self.cfg.controls.models.thrust));
                 }
                 self.queue_rec_toggle(
                     "thrust_model",
@@ -3448,8 +3454,10 @@ impl App {
                 if let Some(sess) = self.session.as_deref_mut() {
                     // The setter re-seeds the desired altitude at the
                     // live pose when entering the enhanced tier.
-                    sess.sim
-                        .set_altitude_model(sim_altitude(self.cfg.controls.models.altitude));
+                    sess.sim.set_altitude_model(
+                        LOCAL_HX,
+                        sim_altitude(self.cfg.controls.models.altitude),
+                    );
                     // `mc2_leviathan_high_lunge` follows the altitude
                     // model (`world_patches`); a live recording or
                     // replay keeps its pinned arms.
@@ -3480,7 +3488,7 @@ impl App {
                     .as_deref_mut()
                     .and_then(|s| s.sim.world.as_mut())
                 {
-                    w.set_dev_spells(self.cfg.gameplay.cheat.dev_spells);
+                    w.set_dev_spells(LOCAL_HX, self.cfg.gameplay.cheat.dev_spells);
                 }
                 self.queue_rec_toggle("dev_spells", self.cfg.gameplay.cheat.dev_spells.into());
             }
@@ -3500,7 +3508,7 @@ impl App {
                     .as_deref_mut()
                     .and_then(|s| s.sim.world.as_mut())
                 {
-                    w.set_ghost(self.cfg.gameplay.cheat.ghost);
+                    w.set_ghost(LOCAL_HX, self.cfg.gameplay.cheat.ghost);
                 }
                 self.queue_rec_toggle("ghost", self.cfg.gameplay.cheat.ghost.into());
             }
@@ -3909,7 +3917,7 @@ impl App {
         let Some(sess) = self.session.as_deref_mut() else {
             return;
         };
-        let f = &sess.sim.flyer;
+        let f = &sess.sim.flyer[LOCAL_HX];
         let pose =
             mgc_sim::engine::world::PlayerPose::from_tiles(f.x, f.y, f.z, f.yaw, f.pitch, 0.0);
         // ⭐ THE REQUEST-TIME LISTENER. `sub_55370_558A0` (CARPET.EXE
@@ -3933,7 +3941,7 @@ impl App {
             yaw: listener_pose.heading,
         };
         if let Some(w) = &mut sess.sim.world {
-            let frame = w.take_audio(pose);
+            let frame = w.take_audio(LOCAL_HX, pose);
             if self.cfg.audio.sound {
                 for e in frame.events {
                     let source = if e.player {
@@ -4004,7 +4012,7 @@ impl App {
         }
         let listener = match self.session.as_deref() {
             Some(sess) => {
-                let f = &sess.sim.flyer;
+                let f = &sess.sim.flyer[LOCAL_HX];
                 let pose = mgc_sim::engine::world::PlayerPose::from_tiles(
                     f.x, f.y, f.z, f.yaw, f.pitch, 0.0,
                 );
@@ -4066,16 +4074,19 @@ impl App {
             }
             w.terrain_dirty = true;
             w.entities_dirty = true;
-            let (thrust, altitude) = (sess.sim.thrust_model, sess.sim.altitude_model);
+            let (thrust, altitude) = (
+                sess.sim.thrust_model[LOCAL_HX],
+                sess.sim.altitude_model[LOCAL_HX],
+            );
             sess.sim = Simulation::with_world(w);
-            sess.sim.thrust_model = thrust;
-            sess.sim.altitude_model = altitude;
+            sess.sim.thrust_model[LOCAL_HX] = thrust;
+            sess.sim.altitude_model[LOCAL_HX] = altitude;
             sess.sim.weightless = self.cfg.gameplay.cheat.weightless;
             if let Some(start) = sess.level.start {
-                sess.sim.flyer = start;
-                sess.sim.sync_carpet_from_flyer();
+                sess.sim.flyer[LOCAL_HX] = start;
+                sess.sim.sync_carpet_from_flyer(LOCAL_HX);
             }
-            sess.prev_flyer = sess.sim.flyer;
+            sess.prev_flyer = sess.sim.flyer[LOCAL_HX];
             // Fresh world, fresh generations — a stale snapshot could
             // coincidentally pair (slot, generation) across the restart.
             sess.pose_prev = Vec::new();
@@ -4223,7 +4234,7 @@ impl App {
                 .sim
                 .world
                 .as_ref()
-                .map(|w| w.player_mana_share_pct())
+                .map(|w| w.player_mana_share_pct(LOCAL_HX))
                 .unwrap_or(0);
             // Mid-level, the WORLD's cycle ring is the live one
             // (run.mc1_ring only refreshes at the won edge) — keep
@@ -4231,7 +4242,7 @@ impl App {
             if run.id != campaign::CampaignId::Mc2
                 && let Some(w) = sess.sim.world.as_ref()
             {
-                let ring = w.loadout().ring;
+                let ring = w.loadout(LOCAL_HX).ring;
                 package.header.mc1_spell_ring = (ring != [0; 24]).then_some(ring);
             }
             package.snapshot = Some(sess.sim.snapshot());
@@ -4241,8 +4252,8 @@ impl App {
                 snapshot_version: mgc_sim::snapshot::SNAPSHOT_VERSION,
                 tick: sess.sim.tick,
                 mana_pct,
-                thrust_model: Some(format!("{:?}", sess.sim.thrust_model)),
-                altitude_model: Some(format!("{:?}", sess.sim.altitude_model)),
+                thrust_model: Some(format!("{:?}", sess.sim.thrust_model[LOCAL_HX])),
+                altitude_model: Some(format!("{:?}", sess.sim.altitude_model[LOCAL_HX])),
             });
         }
 
@@ -4362,7 +4373,7 @@ impl App {
         // The flyer needs no re-derivation: it and the carpet are both
         // in the payload, so they come back mutually consistent.
         if let Some(sess) = self.session.as_deref_mut() {
-            sess.prev_flyer = sess.sim.flyer;
+            sess.prev_flyer = sess.sim.flyer[LOCAL_HX];
             sess.pose_prev = Vec::new();
             sess.pose_cur = Vec::new();
             sess.fire_blasts.clear();
@@ -4526,16 +4537,16 @@ impl App {
             }
             None => Simulation::with_terrain(level.height.clone()),
         };
-        sim.thrust_model = sim_thrust(self.cfg.controls.models.thrust);
-        sim.altitude_model = sim_altitude(self.cfg.controls.models.altitude);
+        sim.thrust_model[LOCAL_HX] = sim_thrust(self.cfg.controls.models.thrust);
+        sim.altitude_model[LOCAL_HX] = sim_altitude(self.cfg.controls.models.altitude);
         // Weightless cheat: unclamp the enhanced-altitude band to the
         // global lift ceiling (highest terrain + the 4-tile margin).
         sim.weightless = self.cfg.gameplay.cheat.weightless;
         if let Some(start) = level.start {
-            sim.flyer = start;
-            sim.sync_carpet_from_flyer();
+            sim.flyer[LOCAL_HX] = start;
+            sim.sync_carpet_from_flyer(LOCAL_HX);
         }
-        let prev_flyer = sim.flyer;
+        let prev_flyer = sim.flyer[LOCAL_HX];
         // A button held across the level change must not resume its
         // autofire chain in the new world.
         self.autofire.halt();
@@ -4649,7 +4660,7 @@ impl App {
                 .session
                 .as_deref()
                 .and_then(|s| s.sim.world.as_ref())
-                .is_some_and(|w| w.player_falling() || w.player_dead())
+                .is_some_and(|w| w.player_falling(LOCAL_HX) || w.player_dead(LOCAL_HX))
     }
 
     /// While the wizard is down, the view is the main view and nothing
@@ -4728,7 +4739,7 @@ impl App {
         if self
             .session
             .as_ref()
-            .is_some_and(|s| s.sim.barrel_rolling())
+            .is_some_and(|s| s.sim.barrel_rolling(LOCAL_HX))
         {
             self.stick.x = 0.0;
         }
@@ -4813,8 +4824,11 @@ impl App {
         if self.cfg.controls.preferences.autofire
             && let Some(s) = self.session.as_deref()
         {
-            let hands = (s.sim.autofire_hand(false), s.sim.autofire_hand(true));
-            let level_over = s.sim.world.as_ref().is_some_and(|w| w.completed());
+            let hands = (
+                s.sim.autofire_hand(LOCAL_HX, false),
+                s.sim.autofire_hand(LOCAL_HX, true),
+            );
+            let level_over = s.sim.world.as_ref().is_some_and(|w| w.completed(LOCAL_HX));
             (input.fire_left, input.fire_right) =
                 self.autofire
                     .tick((input.fire_left, input.fire_right), hands, level_over);
@@ -4865,7 +4879,12 @@ impl App {
         if !self.cfg.render.enhancement.mc2_fancy_exit {
             return None;
         }
-        self.session.as_deref()?.sim.world.as_ref()?.mc2_end_view()
+        self.session
+            .as_deref()?
+            .sim
+            .world
+            .as_ref()?
+            .mc2_end_view(LOCAL_HX)
     }
 
     /// Is the player's own carpet on screen? Under `--thirdperson`
@@ -4960,7 +4979,7 @@ impl App {
             self.replay.as_ref(),
             subject,
             sess.level.game,
-            interp_carpet(&sess.prev_flyer, &sess.sim.flyer, alpha),
+            interp_carpet(&sess.prev_flyer, &sess.sim.flyer[LOCAL_HX], alpha),
             self.chase.bank_now(),
             &dims,
         );
@@ -5084,7 +5103,7 @@ impl App {
         // pane frame the tier NAME and the shift-commit tier were read
         // from a value the sim had rejected.
         if matches!(level.game, mgc_sim::ids::GameId::Mc2) {
-            self.spell_levels = w.mc2_book_view().sel;
+            self.spell_levels = w.mc2_book_view(LOCAL_HX).sel;
         }
         for slot in w.take_rival_deaths() {
             // The retail death broadcast ("%name% <str 54>",
@@ -5126,7 +5145,7 @@ impl App {
         let mut lights = Vec::new();
         let mut icons_grew = false;
         if entities {
-            let poses = w.live_poses();
+            let poses = w.live_poses(LOCAL_HX);
             // Dynamic light sources (retail's Dynamic Lighting
             // option): fireballs/explosions/standing fire brighten
             // the terrain, Night/Cave only (retail's MapType gate —
@@ -5174,7 +5193,7 @@ impl App {
                 level.game,
                 &poses,
                 &level.map_icons,
-                w.beyond_sight(),
+                w.beyond_sight(LOCAL_HX),
                 self.cfg.render.enhancement.expose_jar_spells,
                 self.cfg.render.enhancement.map_marker_icons,
             );
@@ -5197,7 +5216,7 @@ impl App {
             let (reveal_dots, reveal_stamps) = entities::rival_reveals(
                 level.game,
                 &rival_views,
-                w.beyond_sight_tier(),
+                w.beyond_sight_tier(LOCAL_HX),
                 level.mc2_env,
                 &level.palette_rgba,
                 &level.map_icons,
@@ -5216,7 +5235,8 @@ impl App {
             // is up — a ripple settling out keeps the areas it had. An
             // area whose trigger fired meanwhile settles out on its
             // own (`sight::SightAreas`).
-            if self.cfg.render.enhancement.map_beyond_sight_areas && w.beyond_sight_tier().is_some()
+            if self.cfg.render.enhancement.map_beyond_sight_areas
+                && w.beyond_sight_tier(LOCAL_HX).is_some()
             {
                 level
                     .sight
@@ -5227,7 +5247,7 @@ impl App {
             // arrow. Empty off-MC2 (mc2_stages empty), so MC1/HW draw
             // nothing.
             level.objective_marks = w
-                .mc2_objective_targets()
+                .mc2_objective_targets(LOCAL_HX)
                 .into_iter()
                 .map(|t| mgc_render::ObjectiveMark {
                     x: t.x,
@@ -5255,7 +5275,7 @@ impl App {
                         .and_then(|i| i.sprites.get(id as usize))
                         .map(|s| (s.width, s.height, s.flags))
                 };
-                let f = &sim.flyer;
+                let f = &sim.flyer[LOCAL_HX];
                 push_replay_instruments(
                     &mut set,
                     self.replay.as_ref(),
@@ -5318,7 +5338,7 @@ impl App {
             // reach here — the teardown clears these layers.
             r.set_map_stamps(level.map_stamps.clone());
             r.set_map_path(self.castle_pos.map(|(cx, cz)| mgc_render::MapPath {
-                from: (sim.flyer.x, sim.flyer.z),
+                from: (sim.flyer[LOCAL_HX].x, sim.flyer[LOCAL_HX].z),
                 to: (cx, cz),
                 phase: (sim.tick & 3) as u8,
             }));
@@ -5371,12 +5391,12 @@ impl App {
                 .1
                 .take()
                 .map(mgc_sim::mc1::spells::SpellId);
-            w.equip_hands(l, r);
+            w.equip_hands(LOCAL_HX, l, r);
             if let Some((spell, tier, hand)) = self.pending_mc2_select.take() {
-                w.mc2_select_spell(spell, tier, hand);
+                w.mc2_select_spell(LOCAL_HX, spell, tier, hand);
             }
             if let Some((spell, val)) = self.pending_ring.take() {
-                w.spell_ring_set(spell, val);
+                w.spell_ring_set(LOCAL_HX, spell, val);
             }
         }
     }
@@ -5389,9 +5409,9 @@ impl App {
         };
         let s = spell as usize;
         if self.is_mc2() {
-            w.mc2_book_view().ring.get(s).copied().unwrap_or(0)
+            w.mc2_book_view(LOCAL_HX).ring.get(s).copied().unwrap_or(0)
         } else {
-            w.loadout().ring.get(s).copied().unwrap_or(0)
+            w.loadout(LOCAL_HX).ring.get(s).copied().unwrap_or(0)
         }
     }
 
@@ -5408,7 +5428,7 @@ impl App {
         };
         let side = hand + 1;
         let (ring, owned, cur, sel) = if self.is_mc2() {
-            let bv = w.mc2_book_view();
+            let bv = w.mc2_book_view(LOCAL_HX);
             let mut owned = bv.owned;
             if self.cfg.gameplay.cheat.dev_spells {
                 owned = [true; 26];
@@ -5421,7 +5441,7 @@ impl App {
                 bv.sel.to_vec(),
             )
         } else {
-            let l = w.loadout();
+            let l = w.loadout(LOCAL_HX);
             let mut owned = l.owned;
             if self.cfg.gameplay.cheat.dev_spells {
                 owned.fill(true); // the overlay: the bind mints on demand
@@ -7064,7 +7084,7 @@ impl App {
             self.accumulator -= TICK_DT;
             {
                 let sess = sess!(self);
-                sess.prev_flyer = sess.sim.flyer;
+                sess.prev_flyer = sess.sim.flyer[LOCAL_HX];
             }
             // Replay playback replaces the live input wholesale; when
             // the take ends, control hands back to the player.
@@ -7076,7 +7096,7 @@ impl App {
                         // (slot, generation) pose pairs must not
                         // survive it (the resume path's law).
                         let sess = sess!(self);
-                        sess.prev_flyer = sess.sim.flyer;
+                        sess.prev_flyer = sess.sim.flyer[LOCAL_HX];
                         sess.pose_prev = Vec::new();
                         sess.pose_cur = Vec::new();
                     }
@@ -7138,7 +7158,7 @@ impl App {
             // this step STARTED from, captured before the step can
             // teleport it.
             let requested_at = if request_time_listener() {
-                let f = &sess!(self).sim.flyer;
+                let f = &sess!(self).sim.flyer[LOCAL_HX];
                 Some(mgc_sim::engine::world::PlayerPose::from_tiles(
                     f.x, f.y, f.z, f.yaw, f.pitch, 0.0,
                 ))
@@ -7181,7 +7201,7 @@ impl App {
                 let sess = sess!(self);
                 if let Some(w) = &sess.sim.world {
                     sess.pose_prev = std::mem::take(&mut sess.pose_cur);
-                    sess.pose_cur = w.live_poses();
+                    sess.pose_cur = w.live_poses(LOCAL_HX);
                     // PROTOTYPE fire: track blast drivers (one
                     // tick per step; dead ones keep aging so
                     // their smoke choreography finishes).
@@ -7213,7 +7233,7 @@ impl App {
             // once, in that order. MC1-key schemes only —
             // MC2 controls have no quickselect bank.
             if self.selector.map_book {
-                let owned = w.loadout().owned;
+                let owned = w.loadout(LOCAL_HX).owned;
                 for &s in &SPELL_CANON {
                     let s = s as usize;
                     if owned[s] && !self.prev_owned[s] && !self.quick_binds.contains(&Some(s as u8))
@@ -7312,7 +7332,7 @@ impl App {
         self.apply_smooth_motion(alpha);
         self.apply_effects(alpha);
         let sess = sess_ref!(self);
-        let (a, b) = (&sess.prev_flyer, &sess.sim.flyer);
+        let (a, b) = (&sess.prev_flyer, &sess.sim.flyer[LOCAL_HX]);
         // Positions may wrap across the 256-tile seam; take the
         // short way around for interpolation (`interp_carpet`).
         let (carpet_x, carpet_y, carpet_z, carpet_yaw) = interp_carpet(a, b, alpha);
@@ -7323,7 +7343,7 @@ impl App {
             .sim
             .world
             .as_ref()
-            .map(|w| w.knock_magnitude() as f32 / 8.0 * (std::f32::consts::TAU / 2048.0))
+            .map(|w| w.knock_magnitude(LOCAL_HX) as f32 / 8.0 * (std::f32::consts::TAU / 2048.0))
             .unwrap_or(0.0);
         // The faithful camera renders at HALF the aim pitch
         // (remc1 :52434: pitch_8 = u16_329/2) — casts still
@@ -7453,10 +7473,10 @@ impl App {
                 .map(|win| win.inner_size())
                 .map(|s| (s.width as f32, s.height as f32))
                 .unwrap_or((1280.0, 960.0));
-            let loadout = w.loadout();
-            let vitals = w.vitals();
+            let loadout = w.loadout(LOCAL_HX);
+            let vitals = w.vitals(LOCAL_HX);
             let is_mc2 = matches!(sess.level.game, mgc_sim::ids::GameId::Mc2);
-            let mc2_book = is_mc2.then(|| w.mc2_book_view());
+            let mc2_book = is_mc2.then(|| w.mc2_book_view(LOCAL_HX));
             // Retail's HUD blink bank (str_93/colorIndex_121[k] =
             // (Turn/k)&1, :48548-53 / EF:37563-66): index [1] =
             // Turn&1 drives the alert marbles, hit flashes and the
@@ -7537,7 +7557,7 @@ impl App {
                         // tiers, real GetSpellManaCost costs
                         // and the quick-slot binds all come
                         // from the sim's class-15 machinery.
-                        let bv = Some(w.mc2_book_view());
+                        let bv = Some(w.mc2_book_view(LOCAL_HX));
                         if let Some(bv) = bv {
                             for s in 0..n {
                                 owned[s] = bv.owned[s] || self.cfg.gameplay.cheat.dev_spells;
@@ -7692,7 +7712,7 @@ impl App {
                         rows[0] = Some(ui::RosterEntry {
                             name,
                             mana: loadout.mana_max,
-                            kills: w.player_kill_row(),
+                            kills: w.player_kill_row(LOCAL_HX),
                             box_c: colors[0].0,
                             text_c: colors[0].1,
                         });
@@ -7718,7 +7738,7 @@ impl App {
                 // while the web counter is live — spider
                 // webs + the (9,21) spit. Hard on/off, no
                 // fade, exactly retail.
-                if sess.sim.carpet_mc2.mobilize > 0 && assets.has_web() {
+                if sess.sim.carpet_mc2[LOCAL_HX].mobilize > 0 && assets.has_web() {
                     quads.extend(assets.web_quads(size.0, size.1));
                 }
                 // The stagger GREEN tint (`SetPalette
@@ -7730,7 +7750,7 @@ impl App {
                 // blended green quad at the retail
                 // subtraction magnitude (≈12/17/22%) is the
                 // RGBA approximation of the palette edit.
-                let ms = sess.sim.carpet_mc2.move_speed;
+                let ms = sess.sim.carpet_mc2[LOCAL_HX].move_speed;
                 if ms > 0 {
                     let count = (171.0 * ms as f32 / 3.0 + 85.0).min(256.0);
                     let a = count * 56.0 / 65536.0;
@@ -7944,7 +7964,7 @@ impl App {
                 && self.fancy_exit_t.is_none()
                 && vitals.state == mgc_sim::engine::world::LifeState::Alive
             {
-                let f = &sess.sim.flyer;
+                let f = &sess.sim.flyer[LOCAL_HX];
                 // The aim heading. Enhanced chase steering:
                 // the crosshair sits at the DESIRED heading
                 // (yaw + lead) and the autoaim preview scans
@@ -7966,7 +7986,7 @@ impl App {
                 let (neutral_yaw, pose_yaw) = match self.cfg.controls.models.thrust {
                     config::ThrustModel::Classic => (eye.yaw, f.yaw),
                     config::ThrustModel::Enhanced => {
-                        let lead = (sess.sim.aim_yaw() + self.mouse.yaw - eye.yaw)
+                        let lead = (sess.sim.aim_yaw(LOCAL_HX) + self.mouse.yaw - eye.yaw)
                             .clamp(-mgc_sim::LEAD_MAX, mgc_sim::LEAD_MAX);
                         let a = eye.yaw + lead;
                         (a, a)
@@ -7992,7 +8012,7 @@ impl App {
                     let pose = mgc_sim::engine::world::PlayerPose::from_tiles(
                         f.x, f.y, f.z, pose_yaw, f.pitch, 0.0,
                     );
-                    w.aim_preview(pose).map(|l| {
+                    w.aim_preview(LOCAL_HX, pose).map(|l| {
                         l.and_then(|l| {
                             // Lock markers honor the fog wall
                             // too (relevant when fog_distance
@@ -8053,7 +8073,7 @@ impl App {
                 // colour-cycles the ink unless zoomed out —
                 // the static black remap slot [1] is the
                 // baseline.
-                if !is_mc2 && w.completed() && !w.player_dead() {
+                if !is_mc2 && w.completed(LOCAL_HX) && !w.player_dead(LOCAL_HX) {
                     let (ax, ay) = assets.hud_notification_anchor();
                     // Uniform HUD scale (`ui::HudFrame`): the
                     // toast rides under the LEFT-anchored panel
@@ -8098,7 +8118,11 @@ impl App {
                     is_mc2
                         .then(|| {
                             let (row, _) = w.mc2_objective_view();
-                            let seg = if w.completed() { 9 } else { row as u8 + 1 };
+                            let seg = if w.completed(LOCAL_HX) {
+                                9
+                            } else {
+                                row as u8 + 1
+                            };
                             mc2_narration_etext(sess.level.level_number, seg)
                                 .and_then(|idx| sess.level.etext.get(idx))
                                 .filter(|s| !s.is_empty())
@@ -8136,7 +8160,7 @@ impl App {
                 // The performance screen's numbers (MC1/HW — MC2's
                 // table rides the save; see `campaign_complete`).
                 if w.game() != mgc_sim::ids::GameId::Mc2 {
-                    let st = w.level_stats();
+                    let st = w.level_stats(LOCAL_HX);
                     use mgc_sim::engine::stats::fmt10;
                     let [castle, houses, unclaimed] = st.mana_rows();
                     println!(
@@ -8193,7 +8217,7 @@ impl App {
                     quads.push(ui::solid([0.0, 0.0, size.0, size.1], [1.0, 1.0, 1.0, a]));
                 }
             }
-            let fade = w.end_fade().max(self.quit_fade.unwrap_or(0.0));
+            let fade = w.end_fade(LOCAL_HX).max(self.quit_fade.unwrap_or(0.0));
             if fade > 0.0 {
                 quads.push(ui::solid([0.0, 0.0, size.0, size.1], [0.0, 0.0, 0.0, fade]));
             }
@@ -8367,7 +8391,7 @@ impl App {
                 .session
                 .as_deref()
                 .and_then(|s| s.sim.world.as_ref())
-                .is_some_and(|w| w.beyond_sight_tier().is_some());
+                .is_some_and(|w| w.beyond_sight_tier(LOCAL_HX).is_some());
         let sight_step = dt / sight::FADE_SECS;
         self.sight_strength = if sight_up {
             (self.sight_strength + sight_step).min(1.0)
@@ -8784,9 +8808,9 @@ impl ApplicationHandler for App {
                                             .and_then(|s| s.sim.world.as_ref());
                                         world.is_some_and(|w| {
                                             if mc2 {
-                                                w.mc2_book_view().owned[c as usize]
+                                                w.mc2_book_view(LOCAL_HX).owned[c as usize]
                                             } else {
-                                                w.loadout().owned[c as usize]
+                                                w.loadout(LOCAL_HX).owned[c as usize]
                                             }
                                         })
                                     })
@@ -8841,7 +8865,7 @@ impl ApplicationHandler for App {
                             .session
                             .as_deref()
                             .and_then(|s| s.sim.world.as_ref())
-                            .map(|w| w.loadout().owned)
+                            .map(|w| w.loadout(LOCAL_HX).owned)
                             .unwrap_or([false; 24]);
                         if let Some(spell) = self.hovered {
                             if owned[spell.0 as usize] {
@@ -10341,10 +10365,7 @@ fn parse_args() -> Result<Args, String> {
     // A seat is a property of the level BUILD, and neither the
     // campaign nor a recording carries one yet.
     if seat != 0
-        && (campaign_id.is_some()
-            || record.is_some()
-            || replay.is_some()
-            || replay_check.is_some())
+        && (campaign_id.is_some() || record.is_some() || replay.is_some() || replay_check.is_some())
     {
         return Err("--seat: a plain --level launch only (not with --campaign, \
                     --record, --replay or --replay-check)"
@@ -10958,16 +10979,16 @@ fn apply_instruments(
 ) {
     w.set_patches(patches);
     if dev_spells {
-        w.set_dev_spells(true);
+        w.set_dev_spells(LOCAL_HX, true);
     }
     if !plausible_book_mc2.is_empty() {
-        w.mc2_grant_plausible(plausible_book_mc2);
+        w.mc2_grant_plausible(LOCAL_HX, plausible_book_mc2);
     }
     if invincible {
         w.set_invincible(true);
     }
     if ghost {
-        w.set_ghost(true);
+        w.set_ghost(LOCAL_HX, true);
     }
     if inert {
         w.set_inert(true);
@@ -11107,10 +11128,10 @@ fn apply_campaign_book(
                 .map(|s| (s as u8, book.xp[s]))
                 .partition(|&(s, _)| mc2_blocked[s as usize]);
             if !grants.is_empty() {
-                w.mc2_grant_plausible(&grants);
+                w.mc2_grant_plausible(LOCAL_HX, &grants);
             }
             if !withheld.is_empty() {
-                w.mc2_bank_withheld(&withheld);
+                w.mc2_bank_withheld(LOCAL_HX, &withheld);
             }
             // The rest of retail's sub_549A0 carry: selected tiers +
             // the cycle ring (raw), hands kept where still possessed
@@ -11123,7 +11144,7 @@ fn apply_campaign_book(
             } else {
                 (book.left, book.right)
             };
-            w.mc2_install_selector_carry(&book.sel, &book.ring, left, right);
+            w.mc2_install_selector_carry(LOCAL_HX, &book.sel, &book.ring, left, right);
         }
         _ => {
             if run.save.mc1().is_none() {
@@ -11132,7 +11153,7 @@ fn apply_campaign_book(
             // Cycle-ring carry (native-only sidecar; kept RAW like
             // MC2's — unavailable members are skipped at cycle time,
             // not dropped).
-            w.install_mc1_ring(run.mc1_ring);
+            w.install_mc1_ring(LOCAL_HX, run.mc1_ring);
         }
     }
 }
@@ -11179,7 +11200,7 @@ fn campaign_complete(
             // mana, seconds] into the main table by level, or the
             // secret table by portal index. The ENHANCED rows (see
             // `engine::stats`), like MC1's performance screen.
-            let st = w.level_stats();
+            let st = w.level_stats(LOCAL_HX);
             // Retail's integer row carries the enhanced tenths rounded
             // to whole percent; the tail keeps the absolutes the map
             // table derives its tenths from.
@@ -11227,7 +11248,7 @@ fn campaign_complete(
             }
             // Book carry: serialize the live book into str_611 (all
             // XP banked — the between-levels shape).
-            let v = w.mc2_book_view();
+            let v = w.mc2_book_view(LOCAL_HX);
             // KNOWN is monotonic in retail (`array_0x3E9` is never
             // cleared; the level end only ORs this level's book and
             // finds into it, EF:43784-89), so the carry keeps every
@@ -11251,7 +11272,7 @@ fn campaign_complete(
                 right: v.right,
                 ring: v.ring,
             });
-            let exit = w.mc2_exit_model();
+            let exit = w.mc2_exit_model(LOCAL_HX);
             if campaign::mc2_is_secret(level) {
                 // A completed secret: portal → completed (sprite
                 // 305) AND the parent main is only NOW promoted —
@@ -11319,7 +11340,7 @@ fn campaign_complete(
             };
             // Commit collected spells to the persistent flags (the
             // retail level-completion commit into var_15318).
-            let loadout = w.loadout();
+            let loadout = w.loadout(LOCAL_HX);
             for s in 0..24 {
                 if loadout.owned[s] {
                     save.blob24[s] = 1;
@@ -11390,7 +11411,7 @@ fn run_screenshot(
     // Objective-guide marks in map-view captures (steady, no blink).
     if let Some(w) = &level.world {
         let marks: Vec<_> = w
-            .mc2_objective_targets()
+            .mc2_objective_targets(LOCAL_HX)
             .into_iter()
             .map(|t| mgc_render::ObjectiveMark {
                 x: t.x,
@@ -11434,7 +11455,7 @@ fn run_screenshot(
         && level.mc2_env != entities::Mc2MapEnv::Day
         && let Some(w) = &level.world
     {
-        renderer.set_lights(&entities::lights_from_poses(&w.live_poses()));
+        renderer.set_lights(&entities::lights_from_poses(&w.live_poses(LOCAL_HX)));
     }
     // HUD transparency: the config decides (same path as live play);
     // MGC_HUD_OPAQUE overrides for A/B captures — by VALUE, so
@@ -11484,9 +11505,9 @@ fn run_screenshot(
             false,
             mgc_sim::WorldPatches::RETAIL,
         );
-        let loadout = w.loadout();
-        let vitals = w.vitals();
-        let mc2_book = shot_is_mc2.then(|| w.mc2_book_view());
+        let loadout = w.loadout(LOCAL_HX);
+        let vitals = w.vitals(LOCAL_HX);
+        let mc2_book = shot_is_mc2.then(|| w.mc2_book_view(LOCAL_HX));
         let quads = if map_view {
             if shot_is_mc2 {
                 // MC2's map screen has no book half; the split layout
@@ -12152,7 +12173,7 @@ pub fn game_main(event_loop: Option<EventLoop<()>>) -> std::process::ExitCode {
             // pin so a recorded pin still overrides them. The MC1 set
             // was granted by the world build itself (round 154).
             if !level.plausible_book_mc2.is_empty() {
-                w.mc2_grant_plausible(&level.plausible_book_mc2);
+                w.mc2_grant_plausible(LOCAL_HX, &level.plausible_book_mc2);
             }
             // The snapshot restored the pool and the terrain but not
             // the MODE they were established in. No key in the header

@@ -22,6 +22,7 @@
 //! tick that mattered.
 
 use mgc_formats::mgcr::{RetailMc1, RetailMc2};
+use mgc_sim::Hx;
 use mgc_sim::engine::world::World;
 use mgc_sim::engine::world::conformance::{
     norm_retail_ai_state_mc1, norm_retail_ai_state_mc2, retail_ent_lanes_mc2,
@@ -480,7 +481,11 @@ impl Shadow {
         self.board_n += 1;
         let (cur, rows) = world.mc2_objective_view();
         for (name, want, got) in [
-            ("completed", board[0] as i64, world.completed() as i64),
+            (
+                "completed",
+                board[0] as i64,
+                world.completed(Hx::FIRST) as i64,
+            ),
             ("cursor", board[1] as i64, cur as i64),
             ("pause", board[2] as i64, world.mc2_objective_pause() as i64),
         ] {
@@ -1380,8 +1385,12 @@ impl Shadow {
                 self.chain_n.1 += list.len() as u64;
                 continue;
             }
+            // Since the multiplayer stage 2 the human's (3,0) record
+            // rides the port's class-3 list itself: then his own link
+            // and every link naming him are graded like any member's.
+            let human_in = human_slot != 0 && list.contains(&human_slot);
             for (k, &s) in list.iter().enumerate() {
-                if s == human_slot || s == PLAYER_TARGET_U16 {
+                if (s == human_slot && !human_in) || s == PLAYER_TARGET_U16 {
                     continue;
                 }
                 let Some(r) = st.ents.get(s as usize) else {
@@ -1396,7 +1405,7 @@ impl Shadow {
                 let got = list.get(k + 1).copied().unwrap_or(0) as i64;
                 // Retail's chain threads THROUGH the human's record;
                 // the port's list has no such member.
-                if want == human_slot as i64 && got != want {
+                if !human_in && want == human_slot as i64 && got != want {
                     continue;
                 }
                 if want != got {

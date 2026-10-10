@@ -36,9 +36,8 @@
 //! NOT re-derive tiers (that is [`Cheat::SpellXp`]'s job, which is why
 //! a take exercising tier 1/2 needs both cheats).
 
-use super::{PLAYER_LIFE_MAX, World};
+use super::{Hx, PLAYER_LIFE_MAX, World};
 use crate::ids::GameId;
-use crate::mc1::mobs::PLAYER_TARGET;
 use crate::mc1::spells::{SPELL_COUNT, SpellId};
 use mgc_formats::recover::Cheat;
 
@@ -61,11 +60,11 @@ impl World {
     /// gates several ordinary-looking behaviours on its tester flag
     /// (`setting_byte2_23 < 0`), which is not in the captured closure —
     /// but a cheat firing at all proves the flag is set.
-    pub fn apply_cheat(&mut self, cheat: Cheat) -> bool {
+    pub fn apply_cheat(&mut self, hx: Hx, cheat: Cheat) -> bool {
         self.cheat_mode = true;
         match self.game() {
-            GameId::Mc2 => self.mc2_apply_cheat(cheat),
-            _ => self.mc1_apply_cheat(cheat),
+            GameId::Mc2 => self.mc2_apply_cheat(hx, cheat),
+            _ => self.mc1_apply_cheat(hx, cheat),
         }
     }
 
@@ -89,24 +88,24 @@ impl World {
 
     /// remc1 :48836-49010 — the MC1 cheat menu (sub-codes 1..7,
     /// bound to ALT+F1..F7).
-    fn mc1_apply_cheat(&mut self, cheat: Cheat) -> bool {
+    fn mc1_apply_cheat(&mut self, hx: Hx, cheat: Cheat) -> bool {
         match cheat {
             // :48838-48884 — mint the owned manifestation of every
             // spell not already held. `grant_spell` IS this ctor loop
             // (class-12 record + `mc1_acq_push`), and like retail it
             // leaves the hands alone.
             Cheat::AllSpells => {
-                self.mc1_cheat_all_spells();
+                self.mc1_cheat_all_spells(hx);
                 true
             }
             // :48906-48915.
             Cheat::MoreMana => {
-                self.cheat_mana_sphere();
+                self.cheat_mana_sphere(hx);
                 true
             }
             // :48993 — `actLife = <full>`.
             Cheat::Heal => {
-                self.player.life = PLAYER_LIFE_MAX;
+                self.set_human_life(hx, PLAYER_LIFE_MAX);
                 true
             }
             // PORT-ONLY sub-code 11 — retail's TESTER KEY `'c'`
@@ -119,7 +118,7 @@ impl World {
             // (Retail's sibling `'f'` — `|= 4`, won outright with no
             // Space — is deliberately not bound.)
             Cheat::WinLevel => {
-                self.completed = true;
+                self.completed[hx] = true;
                 true
             }
             _ => false,
@@ -128,21 +127,21 @@ impl World {
 
     /// remc2 EF:37786-37893 — the MC2 cheat menu (sub-codes 1..10,
     /// bound to ALT+F1..F10).
-    fn mc2_apply_cheat(&mut self, cheat: Cheat) -> bool {
+    fn mc2_apply_cheat(&mut self, hx: Hx, cheat: Cheat) -> bool {
         match cheat {
             // EF:37789-37816.
             Cheat::AllSpells => {
-                self.mc2_cheat_all_spells();
+                self.mc2_cheat_all_spells(hx);
                 true
             }
             // EF:37820-37827.
             Cheat::MoreMana => {
-                self.cheat_mana_sphere();
+                self.cheat_mana_sphere(hx);
                 true
             }
             // EF:37857 — `life = maxLife`.
             Cheat::Heal => {
-                self.player.life = PLAYER_LIFE_MAX;
+                self.set_human_life(hx, PLAYER_LIFE_MAX);
                 true
             }
             // EF:37864-37870: +100 volatile XP on every spell, then
@@ -151,10 +150,10 @@ impl World {
             // the whole batch before re-levelling any of it.
             Cheat::SpellXp => {
                 for s in 0..26 {
-                    self.mc2_book.xp_vol[s] += CHEAT_XP_STEP;
+                    self.mc2_book[hx].xp_vol[s] += CHEAT_XP_STEP;
                 }
                 for s in 0..26 {
-                    self.mc2_relevel(s, false, false);
+                    self.mc2_relevel(hx, s, false, false);
                 }
                 true
             }
@@ -177,7 +176,7 @@ impl World {
             // ends a level through the endseq marker, so the cheat
             // reveals the exit rather than teleporting through it.
             Cheat::WinLevel => {
-                self.completed = true;
+                self.completed[hx] = true;
                 true
             }
             _ => false,
@@ -210,15 +209,15 @@ impl World {
     /// back: mc1l0-test slot 139 (a ground Possess jar at walk slot
     /// 139) is exactly this — retail holds it at flags 4 through the
     /// cheat tick, the eager port pushed it to 5.
-    fn mc1_cheat_all_spells(&mut self) {
-        let (x, y, z) = self.human_pose;
-        let owned_before = self.player.owned;
+    fn mc1_cheat_all_spells(&mut self, hx: Hx) {
+        let (x, y, z) = self.human_pose(hx);
+        let owned_before = self.players[hx].owned;
         for s in 0..SPELL_COUNT as u8 {
             if owned_before[s as usize] != 0 {
                 continue;
             }
             // The pool can refuse; retail simply skips that spell.
-            let Some(m) = self.grant_spell(SpellId(s)) else {
+            let Some(m) = self.grant_spell(hx, SpellId(s)) else {
                 continue;
             };
             // The mint is the ctor at `human_pose` since round 154
@@ -229,7 +228,7 @@ impl World {
             }
             self.g.ent[m].flags |= 0x0004_0001;
         }
-        self.player.owned = owned_before;
+        self.players[hx].owned = owned_before;
         self.cheat_clear_class11_bit0();
     }
 
@@ -238,11 +237,11 @@ impl World {
     /// [`CHEAT_SPHERE_MANA`] and stamped as ALREADY CLAIMED by the
     /// caster, then the wizard's own pool topped to its (now much
     /// higher) ceiling.
-    fn cheat_mana_sphere(&mut self) {
-        let (x, y, z) = self.human_pose;
+    fn cheat_mana_sphere(&mut self, hx: Hx) {
+        let (x, y, z) = self.human_pose(hx);
         if let Some(b) = self.g.spawn_mana_ball(x, y, z) {
             self.g.ent[b].f140 = CHEAT_SPHERE_MANA;
-            self.g.ent[b].f144 = PLAYER_TARGET;
+            self.g.ent[b].f144 = self.g.human_tag[hx].0;
             // NO re-resize: retail's case-2 body (:48907-13) writes
             // +140/+144 and stops — the sphere keeps the ctor's
             // 512-mana box (family 52 size 1, f84 25) for exactly
@@ -255,17 +254,17 @@ impl World {
         // Retail assigns the CEILING word verbatim; the ceiling is
         // recomputed from the claimed set every tick, so the sphere
         // above is what actually makes this large.
-        self.player.mana = self.player.mana_max;
+        self.set_human_mana(hx, self.human_mana_max(hx));
     }
 
     /// remc2 EF:37789-37816 — grant every unheld spell as a real
     /// class-15 manifestation parented to the player, with its mana
     /// upkeep zeroed. NOT a pickup: no cooldown, no hand rebind, no
     /// tier derive (see the module doc).
-    fn mc2_cheat_all_spells(&mut self) {
-        let (x, y, z) = self.human_pose;
+    fn mc2_cheat_all_spells(&mut self, hx: Hx) {
+        let (x, y, z) = self.human_pose(hx);
         for s in 0..26usize {
-            if self.mc2_book.ent[s] != 0 {
+            if self.mc2_book[hx].ent[s] != 0 {
                 continue;
             }
             // The pool can refuse; retail simply skips that spell.
@@ -276,9 +275,9 @@ impl World {
                 let e = &mut self.g.ent[m];
                 // `manaRegen_0x88 = 0` + `parentId_0x28 = caster`.
                 e.f136 = 0;
-                e.id24 = PLAYER_TARGET;
+                e.id24 = self.g.human_tag[hx].0;
             }
-            self.mc2_book.ent[s] = m as u16;
+            self.mc2_book[hx].ent[s] = m as u16;
         }
         self.cheat_clear_class11_bit0();
     }

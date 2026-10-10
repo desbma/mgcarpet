@@ -12,6 +12,7 @@
 //! and the mc2_slice level-000 goldens are untouched — shared chassis,
 //! separate fixtures). Self-skips without baked mc2 data.
 
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
 use mgc_sim::ids::GameId;
@@ -159,7 +160,7 @@ fn run(root: &std::path::Path) -> Option<(Vec<u64>, Vec<u64>)> {
     // the cavern — the (9,30) manifestation detonates on the nearest
     // wall/ceiling and the (10,89) radial collapse runs to
     // completion (wave 227 → 1024 at +22/tick ≈ 37 ticks).
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let select = PlayerCommand {
         mc2_select: Some((25, 0, 0)),
         ..Default::default()
@@ -300,7 +301,7 @@ fn mc2_cave_behaviors_and_goldens() {
     // the launch tick, authentically), the (10,89) collapse appears
     // and the ceiling under the burst moves (terrain is the weapon).
     let ceiling_before: Vec<u8> = w.ceiling_plane().to_vec();
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     let select = PlayerCommand {
         mc2_select: Some((25, 0, 0)),
         ..Default::default()
@@ -825,7 +826,11 @@ fn mc2_cave_behaviors_and_goldens() {
             // both: mc2:15's terrain, phase-aligned at t=120, matches
             // retail on all five planes, 65,536/65,536
             // (`terrain-diff --settle`, ROUND 109).
-            0x780e23a675dd20b7_u64,
+            // ⭐ RE-PINNED 2026-10-10 for THE HUMAN'S SLOT TAG (multiplayer stage 1):
+            // the human's owner tag is his carpet record's pool slot (retail's
+            // convention), no longer the out-of-pool 0xFFFF, and the record's own
+            // `+24` carries it. `MGC_NO_HUMAN_SLOT_TAG=1` restores every old pin.
+            0x46d3c771d2719de5_u64,
             // ⭐ CHECKPOINTS B, C AND D RE-PINNED (A HOLDS BYTE-FOR-
             // BYTE) FOR THE MANA AURA'S PULL STAMP. `sub_38D80`
             // (EF:28353-83, shipped `NETHERW.EXE` 0x5d5bd-0x5d610)
@@ -855,7 +860,21 @@ fn mc2_cave_behaviors_and_goldens() {
             // laws (`MGC_NO_SUMMON_HEAD_VICTIM`,
             // `MGC_NO_MC2_PAINTER_OOB_RESIDUE`) still in, and neither
             // of those moves any checkpoint on its own.
-            0xcac9292aa6e25cb6,
+            // ⭐ RE-PINNED 2026-10-10 for THE HUMAN'S CARPET RECORD (multiplayer
+            // stage 2): the record at his slot is a live (3,0) wizard record mirroring
+            // him, a member of the tick-top class-3 roster and linked into his tile
+            // chain — the record's own bytes and its neighbours' `+20/+22` are hashed.
+            // Behaviour-neutral by measurement: under `MGC_HASH_EXCLUDE_CARPET=1` (the
+            // record spliced out and blanked before hashing) every checkpoint is
+            // identical with the stage on and off. `MGC_NO_HUMAN_RECORD_MIRROR=1`
+            // restores every old pin.
+            // Re-pinned 2026-10-13 (the first checkpoint holds) for MP STAGE 3 CH. 2:
+            // the human's (3,0) carpet record carries retail's probe-victim bit
+            // (`+16 & 8`, the recorded 0x20D) — `MGC_NO_HUMAN_POOL_VICTIM=1`
+            // reproduces the previous pins exactly, and under
+            // `MGC_HASH_EXCLUDE_CARPET=1` the values are identical switch on/off
+            // (the record's own word is the whole move).
+            0x3f1f32978d0b4093,
             // ⭐⭐⭐ CHECKPOINTS C AND D RE-PINNED 2026-09-06 (ROUND 108),
             // A/B HOLD — TWO SEPARATE, SEPARATELY ATTRIBUTED CAUSES.
             //
@@ -902,7 +921,7 @@ fn mc2_cave_behaviors_and_goldens() {
             // reproduces the previous C and D pins exactly, and the
             // OBSERVABLE digests below hold — the world is unchanged,
             // only the mirror is.
-            0x3e50300ef9c6aabf, // was 0x57237f7c82d36989
+            0xbcdf82b98d45cc38, // was 0x57237f7c82d36989
             // Checkpoint D re-pinned 2026-09-10 (A/B/C hold BYTE-FOR-
             // BYTE) for THE (10,77) FIRE-ORB SATELLITE'S CLONED @0x2C —
             // the SAME CLASS as checkpoint A's 2026-09-02 fire-ctor
@@ -954,7 +973,7 @@ fn mc2_cave_behaviors_and_goldens() {
             // natively spawned whirlwind / fire-orb record writes the admit
             // mask into BOTH of its port homes; state-only, OBSERVABLE holds).
             // With that switch alone the pin is 0x5f504759165dbf93.
-            0xc61496350e7b205b, // was 0x5f504759165dbf93 / 0x06f940b92d340c8b / 0xb81708d1a4f89892 (2026-09-17); 0x7387656e3a5ccc62 (2026-09-15, see C)
+            0x5aa1d00924cc72ab, // was 0x5f504759165dbf93 / 0x06f940b92d340c8b / 0xb81708d1a4f89892 (2026-09-17); 0x7387656e3a5ccc62 (2026-09-15, see C)
         ],
         "cave goldens moved — re-pin ONLY for an intended fidelity change"
     );
@@ -1188,12 +1207,12 @@ fn mc2_cave_wall_hug_holds_the_clamp_band() {
     let fx = x as f32 + 0.5;
     let fz = zw as f32 + 5.5;
     let g0 = sim.world.as_ref().unwrap().ground_height_tiles(fx, fz);
-    sim.flyer.x = fx;
-    sim.flyer.z = fz;
-    sim.flyer.y = g0 + 1.5;
-    sim.flyer.yaw = 0.0; // -Z: straight at the wall
-    sim.flyer.pitch = 0.0;
-    sim.sync_carpet_from_flyer();
+    sim.flyer[Hx::FIRST].x = fx;
+    sim.flyer[Hx::FIRST].z = fz;
+    sim.flyer[Hx::FIRST].y = g0 + 1.5;
+    sim.flyer[Hx::FIRST].yaw = 0.0; // -Z: straight at the wall
+    sim.flyer[Hx::FIRST].pitch = 0.0;
+    sim.sync_carpet_from_flyer(Hx::FIRST);
 
     let mut worst_floor = f32::MAX;
     let mut worst_ceil = f32::MAX;
@@ -1202,7 +1221,7 @@ fn mc2_cave_wall_hug_holds_the_clamp_band() {
             thrust: 1.0,
             ..Default::default()
         });
-        let f = sim.flyer;
+        let f = sim.flyer[Hx::FIRST];
         let ex = ((f.x.rem_euclid(256.0)) * 256.0) as u16;
         let ez = ((f.z.rem_euclid(256.0)) * 256.0) as u16;
         let eye = f.y * 256.0;
@@ -1272,19 +1291,19 @@ fn mc2_cave_enhanced_funnel_never_breaches_ceiling() {
     eprintln!("funnel: pinch at ({x},{zw}), corridor south");
 
     let mut sim = mgc_sim::Simulation::with_world(w);
-    sim.thrust_model = mgc_sim::ThrustModel::Enhanced;
+    sim.thrust_model[Hx::FIRST] = mgc_sim::ThrustModel::Enhanced;
     // Hug the pinch CORNER (the height/ceiling bytes live on tile
     // corners): the tile-center line interpolates away from the
     // narrowest point and misses the squeeze.
     let fx = x as f32 + 0.05;
     let fz = zw as f32 + 5.5;
     let g0 = sim.world.as_ref().unwrap().ground_height_tiles(fx, fz);
-    sim.flyer.x = fx;
-    sim.flyer.z = fz;
-    sim.flyer.y = g0 + 1.5;
-    sim.flyer.yaw = 0.0; // -Z: straight into the wall
-    sim.flyer.pitch = 0.0;
-    sim.sync_carpet_from_flyer();
+    sim.flyer[Hx::FIRST].x = fx;
+    sim.flyer[Hx::FIRST].z = fz;
+    sim.flyer[Hx::FIRST].y = g0 + 1.5;
+    sim.flyer[Hx::FIRST].yaw = 0.0; // -Z: straight into the wall
+    sim.flyer[Hx::FIRST].pitch = 0.0;
+    sim.sync_carpet_from_flyer(Hx::FIRST);
 
     let mut worst: f32 = f32::MAX; // min (ceiling - eye), engine units
     for _ in 0..250 {
@@ -1292,7 +1311,7 @@ fn mc2_cave_enhanced_funnel_never_breaches_ceiling() {
             thrust: 1.0,
             ..Default::default()
         });
-        let f = sim.flyer;
+        let f = sim.flyer[Hx::FIRST];
         let ex = ((f.x.rem_euclid(256.0)) * 256.0) as u16;
         let ez = ((f.z.rem_euclid(256.0)) * 256.0) as u16;
         let w = sim.world.as_ref().unwrap();
@@ -1349,24 +1368,24 @@ fn mc2_cave_enhanced_lift_reaches_the_retail_cave_ceiling() {
             panic!("no tall chamber found on level-014");
         };
         let mut sim = mgc_sim::Simulation::with_world(w);
-        sim.thrust_model = thrust;
-        sim.set_altitude_model(mgc_sim::AltitudeModel::ExtendedLift);
+        sim.thrust_model[Hx::FIRST] = thrust;
+        sim.set_altitude_model(Hx::FIRST, mgc_sim::AltitudeModel::ExtendedLift);
         let (fx, fz) = (x as f32 + 2.0, zw as f32 + 2.0);
         let g0 = sim.world.as_ref().unwrap().ground_height_tiles(fx, fz);
-        sim.flyer.x = fx;
-        sim.flyer.z = fz;
-        sim.flyer.y = g0 + 1.0;
-        sim.flyer.pitch = 0.0;
-        sim.sync_carpet_from_flyer();
-        sim.set_altitude_model(mgc_sim::AltitudeModel::Faithful);
-        sim.set_altitude_model(mgc_sim::AltitudeModel::ExtendedLift);
+        sim.flyer[Hx::FIRST].x = fx;
+        sim.flyer[Hx::FIRST].z = fz;
+        sim.flyer[Hx::FIRST].y = g0 + 1.0;
+        sim.flyer[Hx::FIRST].pitch = 0.0;
+        sim.sync_carpet_from_flyer(Hx::FIRST);
+        sim.set_altitude_model(Hx::FIRST, mgc_sim::AltitudeModel::Faithful);
+        sim.set_altitude_model(Hx::FIRST, mgc_sim::AltitudeModel::ExtendedLift);
         for _ in 0..200 {
             sim.step(&mgc_sim::FlightInput {
                 lift: 1.0,
                 ..Default::default()
             });
         }
-        let f = sim.flyer;
+        let f = sim.flyer[Hx::FIRST];
         let g = sim.world.as_ref().unwrap().ground_height_tiles(f.x, f.z);
         let over = (f.y - g) * 256.0;
         eprintln!("{thrust:?}: chamber ({x},{zw}), held {over:.1} over ground");
@@ -1429,29 +1448,42 @@ fn mc2_cave_wall_cancels_speed_under_both_controls() {
             panic!("no sealed cave wall found on level-014");
         };
         let mut sim = mgc_sim::Simulation::with_world(w);
-        sim.thrust_model = thrust;
+        sim.thrust_model[Hx::FIRST] = thrust;
         let (fx, fz) = (x as f32 + 0.5, zw as f32 + 3.5);
         let g0 = sim.world.as_ref().unwrap().ground_height_tiles(fx, fz);
-        sim.flyer.x = fx;
-        sim.flyer.z = fz;
-        sim.flyer.y = g0 + 1.5;
-        sim.flyer.yaw = 0.0; // -Z: straight at the wall
-        sim.flyer.pitch = 0.0;
-        sim.sync_carpet_from_flyer();
-        sim.world.as_mut().unwrap().debug_arm_mc2_speed(3);
+        sim.flyer[Hx::FIRST].x = fx;
+        sim.flyer[Hx::FIRST].z = fz;
+        sim.flyer[Hx::FIRST].y = g0 + 1.5;
+        sim.flyer[Hx::FIRST].yaw = 0.0; // -Z: straight at the wall
+        sim.flyer[Hx::FIRST].pitch = 0.0;
+        sim.sync_carpet_from_flyer(Hx::FIRST);
+        sim.world
+            .as_mut()
+            .unwrap()
+            .debug_arm_mc2_speed(Hx::FIRST, 3);
         let fly = mgc_sim::FlightInput {
             thrust: 1.0,
             ..Default::default()
         };
         sim.step(&fly);
         assert!(
-            sim.world.as_ref().unwrap().accel_override().is_some(),
+            sim.world
+                .as_ref()
+                .unwrap()
+                .accel_override(Hx::FIRST)
+                .is_some(),
             "{thrust:?}: the boost is live before the wall"
         );
         let mut hit = None;
         for t in 0..120 {
             sim.step(&fly);
-            if sim.world.as_ref().unwrap().accel_override().is_none() {
+            if sim
+                .world
+                .as_ref()
+                .unwrap()
+                .accel_override(Hx::FIRST)
+                .is_none()
+            {
                 hit = Some(t);
                 break;
             }

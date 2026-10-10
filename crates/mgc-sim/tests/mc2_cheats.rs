@@ -13,6 +13,7 @@
 //! Self-skips without baked mc2 data (game data is optional).
 
 use mgc_formats::recover::Cheat;
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::World;
 use mgc_sim::ids::GameId;
@@ -80,8 +81,8 @@ macro_rules! world {
 #[test]
 fn all_spells_mints_every_manifestation_and_confers_no_tier() {
     let mut w = world!();
-    assert!(w.apply_cheat(Cheat::AllSpells));
-    let view = w.mc2_book_view();
+    assert!(w.apply_cheat(Hx::FIRST, Cheat::AllSpells));
+    let view = w.mc2_book_view(Hx::FIRST);
     assert!(
         view.owned.iter().all(|&o| o),
         "every one of the 26 spells must be owned after the cheat"
@@ -106,11 +107,11 @@ fn all_spells_mints_every_manifestation_and_confers_no_tier() {
 #[test]
 fn spell_xp_raises_tiers_and_leaves_the_castle_unclamped() {
     let mut w = world!();
-    assert!(w.apply_cheat(Cheat::AllSpells));
+    assert!(w.apply_cheat(Hx::FIRST, Cheat::AllSpells));
     for _ in 0..8 {
-        assert!(w.apply_cheat(Cheat::SpellXp));
+        assert!(w.apply_cheat(Hx::FIRST, Cheat::SpellXp));
     }
-    let view = w.mc2_book_view();
+    let view = w.mc2_book_view(Hx::FIRST);
     assert!(
         view.xp[2] >= 800,
         "castle XP must not clamp to 7 under the cheat, got {}",
@@ -135,16 +136,18 @@ fn spell_xp_raises_tiers_and_leaves_the_castle_unclamped() {
 #[test]
 fn free_spell_reaches_newly_built_manifestations_only() {
     let mut w = world!();
-    assert!(w.apply_cheat(Cheat::AllSpells));
-    let paid = w.debug_spell_mana_lanes(2).expect("castle manifestation");
+    assert!(w.apply_cheat(Hx::FIRST, Cheat::AllSpells));
+    let paid = w
+        .debug_spell_mana_lanes(Hx::FIRST, 2)
+        .expect("castle manifestation");
     assert!(
         paid.1 > 1,
         "a normally built castle spell charges more than 1, got {paid:?}"
     );
 
-    assert!(w.apply_cheat(Cheat::FreeSpell));
+    assert!(w.apply_cheat(Hx::FIRST, Cheat::FreeSpell));
     assert_eq!(
-        w.debug_spell_mana_lanes(2),
+        w.debug_spell_mana_lanes(Hx::FIRST, 2),
         Some(paid),
         "the toggle must not re-stamp an already-built manifestation"
     );
@@ -152,21 +155,21 @@ fn free_spell_reaches_newly_built_manifestations_only() {
     // Grant AFTER the toggle, so the manifestations are BUILT under
     // the flag — the way a mid-take jar pickup would be.
     let mut on = world!();
-    assert!(on.apply_cheat(Cheat::FreeSpell));
-    assert!(on.apply_cheat(Cheat::AllSpells));
+    assert!(on.apply_cheat(Hx::FIRST, Cheat::FreeSpell));
+    assert!(on.apply_cheat(Hx::FIRST, Cheat::AllSpells));
     assert_eq!(
-        on.debug_spell_mana_lanes(2),
+        on.debug_spell_mana_lanes(Hx::FIRST, 2),
         Some((0, 1)),
         "built under free-spell: upkeep 0, one mana a shot"
     );
 
     // ...and it is a TOGGLE, so twice is off again.
     let mut off = world!();
-    assert!(off.apply_cheat(Cheat::FreeSpell));
-    assert!(off.apply_cheat(Cheat::FreeSpell));
-    assert!(off.apply_cheat(Cheat::AllSpells));
+    assert!(off.apply_cheat(Hx::FIRST, Cheat::FreeSpell));
+    assert!(off.apply_cheat(Hx::FIRST, Cheat::FreeSpell));
+    assert!(off.apply_cheat(Hx::FIRST, Cheat::AllSpells));
     assert_eq!(
-        off.debug_spell_mana_lanes(2),
+        off.debug_spell_mana_lanes(Hx::FIRST, 2),
         Some(paid),
         "toggled back off before the grant"
     );

@@ -43,12 +43,13 @@
 use super::behavior::BEHAVIOR;
 use super::multipart::GuardV34;
 use crate::engine::features::Gen;
-use crate::mc1::mobs::{MobCtx, PLAYER_TARGET};
+use crate::engine::world::Hx;
+use crate::mc1::mobs::MobCtx;
 
 /// `sub_1F6D0`'s vertical servo lifts the target by its
 /// `array_0x52_82.yaw` — including the human carpet, whose lift is
 /// [`crate::mc1::combat::PLAYER_HH`]. `MGC_NO_M2_PLAYER_LIFT=1`
-/// restores the pre-2026-09-03 bare-`ctx.pz` stand-in.
+/// restores the pre-2026-09-03 bare-`view.z` stand-in.
 fn m2_player_lift() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("MGC_NO_M2_PLAYER_LIFT").is_none())
@@ -705,7 +706,7 @@ impl Gen {
 
     /// Target-is-a-wizard check (class 3 model 0|1; the human counts).
     pub(crate) fn mc2_is_wizard(&self, t: u16) -> bool {
-        t == PLAYER_TARGET
+        self.is_human_tag(t)
             || ((t as usize) < self.ent.len()
                 && t != 0
                 && self.ent[t as usize].class64 == 3
@@ -727,7 +728,7 @@ impl Gen {
     /// only this pointer test and then run arms that WRITE before the
     /// chase ever resolves the target.
     fn mc2_target_ptr(&self, t: u16) -> bool {
-        t == PLAYER_TARGET || (t != 0 && (t as usize) < self.ent.len())
+        self.is_human_tag(t) || (t != 0 && (t as usize) < self.ent.len())
     }
 
     /// `KillEntity_1C930`'s corpse effect is the (10,1) explosion
@@ -975,12 +976,12 @@ impl Gen {
                     // record's measured `ayaw` is exactly 100 — see
                     // `mc1::combat::PLAYER_HH`), the same constant
                     // `mc2_rebound_deflect`, `mc2_proj_land` and
-                    // `mc2_autoaim` already add to `ctx.pz`.
+                    // `mc2_autoaim` already add to `view.z`.
                     // Dropping it flips the servo's sign whenever the
                     // goat sits within 100 units above the carpet:
                     // retail lifts +32, we sank -32, 64 per tick.
                     // `MGC_NO_M2_PLAYER_LIFT=1` restores the old
-                    // bare-`ctx.pz` stand-in.
+                    // bare-`view.z` stand-in.
                     //
                     // ⭐⭐⭐ THE RECORD IS READ RAW — NO LIFE, NO REAP,
                     // NO CLASS TEST. `sub_1F6D0` dereferences
@@ -1000,16 +1001,18 @@ impl Gen {
                     // mc2l22 pair 72->73, 25 z rows at -32 on slots
                     // 13..45 the tick rival wizard 477 hit life -625.
                     // That was the take's ENTIRE horizon wall.
-                    // ⚠ The `pdead` gate `mc2_target` carries for the
+                    // ⚠ The `dead` gate `mc2_target` carries for the
                     // human is a law of the CHASE site (EF:16360), not
                     // of this one.
                     let tslot = self.ent[i].f146 as usize;
-                    if self.ent[i].f146 == PLAYER_TARGET || tslot < self.ent.len() {
-                        let top = if self.ent[i].f146 == PLAYER_TARGET {
+                    if self.is_human_tag(self.ent[i].f146) || tslot < self.ent.len() {
+                        let top = if let Some(hx) = self.hx_of_tag(self.ent[i].f146) {
                             if m2_player_lift() {
-                                ctx.pz.wrapping_add(crate::mc1::combat::PLAYER_HH as i16)
+                                self.seat_at(ctx, hx)
+                                    .2
+                                    .wrapping_add(crate::mc1::combat::PLAYER_HH as i16)
                             } else {
-                                ctx.pz
+                                self.seat_at(ctx, hx).2
                             }
                         } else {
                             let t = &self.ent[tslot];
@@ -1114,7 +1117,7 @@ impl Gen {
             self.ent[i].tick70 = M9_BASE + 1;
             return;
         }
-        let (c, m) = if t == PLAYER_TARGET {
+        let (c, m) = if self.is_human_tag(t) {
             (3, 0)
         } else if (t as usize) < self.ent.len() {
             (self.ent[t as usize].class64, self.ent[t as usize].model65)
@@ -1236,14 +1239,26 @@ impl Gen {
                 best = Some((slot, d2));
             }
         };
-        // ⚠ `pdead` is `dword_38519`'s ENTRY test (EF:39975), which the
+        // ⚠ `dead` is `dword_38519`'s ENTRY test (EF:39975), which the
         // pool arm below applies itself and the out-of-pool human
         // cannot — see [`Gen::mc2_wizard_scan`].
-        if !self.player_invisible && !ctx.pdead {
-            consider(ctx.px, ctx.py, PLAYER_TARGET);
+        for hx in self
+            .human_tag
+            .ixs()
+            .filter(|&hx| !self.player_cloaked(hx) && !self.seat_dead(ctx, hx))
+        {
+            consider(
+                self.seat_at(ctx, hx).0,
+                self.seat_at(ctx, hx).1,
+                self.human_tag[hx].0,
+            );
         }
         for (j, c) in self.ent.iter().enumerate().skip(1) {
-            if c.class64 == 3 && c.id24 != my_id && c.act_life >= 0 && c.flags & (0x400 | 0x20) == 0
+            if c.class64 == 3
+                && c.id24 != my_id
+                && c.act_life >= 0
+                && c.flags & (0x400 | 0x20) == 0
+                && self.hx_of_rec(j).is_none()
             {
                 consider(c.x, c.y, j as u16);
             }
@@ -1519,7 +1534,7 @@ impl Gen {
                         // PITCH extent (:12551 — array_0x52_82.pitch,
                         // the second of the extent trio).
                         let range = row.v_28 as u32
-                            + if slot != PLAYER_TARGET
+                            + if !self.is_human_tag(slot)
                                 && (slot as usize) < self.ent.len()
                                 && self.ent[slot as usize].class64 == 3
                                 && self.ent[slot as usize].model65 == 2
@@ -1885,7 +1900,7 @@ impl Gen {
                 if if wanted_any_wizard() {
                     self.mc2_is_wizard(killer)
                 } else {
-                    killer == PLAYER_TARGET
+                    self.is_human_tag(killer)
                 } {
                     self.mc2_arm_wanted(killer);
                 }
@@ -2199,7 +2214,7 @@ impl Gen {
                 if if wanted_any_wizard() {
                     self.mc2_is_wizard(killer)
                 } else {
-                    killer == PLAYER_TARGET
+                    self.is_human_tag(killer)
                 } {
                     self.mc2_arm_wanted(killer);
                 }
@@ -2559,16 +2574,43 @@ impl Gen {
         // `byte[0] & 0x20` — see
         // `features::no_mc2_m15_scan_roster`. The roster's ENTRY test
         // (`life >= 0`) is the only mortality test, and the out-of-pool
-        // human must take it here (`ctx.pdead`), as in
+        // human must take it here (`view.dead`), as in
         // [`Gen::mc2_class3_scan`].
         let roster = !crate::engine::features::no_mc2_m15_scan_roster();
-        if !self.player_invisible && own != PLAYER_TARGET && !(roster && ctx.pdead) {
-            consider(ctx.px, ctx.py, PLAYER_TARGET, &mut best);
+        let human_ok = |hx: Hx| {
+            !self.player_cloaked(hx)
+                && self.human_tag[hx].0 != own
+                && !(roster && self.seat_dead(ctx, hx))
+        };
+        // (On the roster the human is met at his own slot below.)
+        let in_walk = |hx: Hx| roster && self.human_rides_chain(hx);
+        for hx in self
+            .human_tag
+            .ixs()
+            .filter(|&hx| !in_walk(hx) && human_ok(hx))
+        {
+            consider(
+                self.seat_at(ctx, hx).0,
+                self.seat_at(ctx, hx).1,
+                self.human_tag[hx].0,
+                &mut best,
+            );
         }
         if roster {
             for c in 0..self.wiz_chain.visible_len() {
                 let j = self.wiz_chain.list[c] as usize;
                 let w = &self.ent[j];
+                if let Some(hx) = self.hx_of_rec(j) {
+                    if human_ok(hx) {
+                        consider(
+                            self.seat_at(ctx, hx).0,
+                            self.seat_at(ctx, hx).1,
+                            self.human_tag[hx].0,
+                            &mut best,
+                        );
+                    }
+                    continue;
+                }
                 if j != i && w.id24 != own && w.flags & 0x20 == 0 {
                     consider(w.x, w.y, j as u16, &mut best);
                 }
@@ -2577,6 +2619,7 @@ impl Gen {
         }
         for (j, c) in self.ent.iter().enumerate().skip(1) {
             if j != i
+                && self.hx_of_rec(j).is_none()
                 && c.class64 == 3
                 && c.id24 != own
                 && c.act_life >= 0
@@ -2602,7 +2645,7 @@ impl Gen {
             1 => {
                 // (:15060-70) — retarget ONLY on a class-3 source.
                 let src = self.ent[i].f40;
-                let is_c3 = src == PLAYER_TARGET
+                let is_c3 = self.is_human_tag(src)
                     || ((src as usize) < self.ent.len()
                         && src != 0
                         && self.ent[src as usize].class64 == 3);
@@ -2621,8 +2664,8 @@ impl Gen {
                 let own = self.ent[i].id24;
                 let foreign = if crate::mc2::mobs::no_mc2_m15_hit_owner_gate() {
                     src != own
-                } else if src == PLAYER_TARGET {
-                    PLAYER_TARGET != own
+                } else if self.is_human_tag(src) {
+                    !self.is_human_tag(own)
                 } else if (src as usize) < self.ent.len() {
                     self.ent[src as usize].id24 != own
                 } else {
@@ -2670,17 +2713,24 @@ impl Gen {
         let (ex, ey, own) = (e.x, e.y, e.id24);
         // Same membership as `m15_scan` (`no_mc2_m15_scan_roster`).
         let roster = !crate::engine::features::no_mc2_m15_scan_roster();
-        if !self.player_invisible
-            && own != PLAYER_TARGET
-            && !(roster && ctx.pdead)
-            && Self::dist2_sq(ex, ey, ctx.px, ctx.py) <= range
-        {
+        let human_hit = |hx: Hx| {
+            !self.player_cloaked(hx)
+                && self.human_tag[hx].0 != own
+                && !(roster && self.seat_dead(ctx, hx))
+                && Self::dist2_sq(ex, ey, self.seat_at(ctx, hx).0, self.seat_at(ctx, hx).1) <= range
+        };
+        // (On the roster the human counts only as a visible member.)
+        let in_walk = |hx: Hx| roster && self.human_rides_chain(hx);
+        if self.human_tag.ixs().any(|hx| !in_walk(hx) && human_hit(hx)) {
             return true;
         }
         if roster {
             return (0..self.wiz_chain.visible_len()).any(|c| {
                 let j = self.wiz_chain.list[c] as usize;
                 let w = &self.ent[j];
+                if let Some(hx) = self.hx_of_rec(j) {
+                    return human_hit(hx);
+                }
                 j != i
                     && w.id24 != own
                     && w.flags & 0x20 == 0
@@ -2689,6 +2739,7 @@ impl Gen {
         }
         self.ent.iter().enumerate().skip(1).any(|(j, c)| {
             j != i
+                && self.hx_of_rec(j).is_none()
                 && c.class64 == 3
                 && c.id24 != own
                 && c.act_life >= 0
@@ -2719,8 +2770,8 @@ impl Gen {
         self.ent[a].f146 = self.ent[i].f146;
         self.ent[a].f66 = self.ent[i].f66;
         self.ent[a].f67 = self.ent[i].f67;
-        if target == PLAYER_TARGET {
-            self.player_danger = 100; // sub_5EF70
+        if let Some(hx) = self.hx_of_tag(target) {
+            self.player_danger[hx] = 100; // sub_5EF70
         }
         // No shots++: retail's volley (EF:15154-66) never touches
         // the player stat — the counter is the PLAYER's own.
@@ -3352,7 +3403,7 @@ impl Gen {
                             let e = &self.ent[i];
                             let far = Self::mc2_dist3((e.x, e.y, e.z), (tx, ty, tz)) >= 0x200;
                             let is_c3 =
-                                slot == PLAYER_TARGET || self.ent[slot as usize].class64 == 3;
+                                self.is_human_tag(slot) || self.ent[slot as usize].class64 == 3;
                             if is_c3 || far {
                                 let e = &self.ent[i];
                                 self.ent[i].f34 = Self::angle_between(e.x, e.y, tx, ty);
@@ -4015,8 +4066,8 @@ impl Gen {
     fn m19_flank(&mut self, i: usize, ctx: &MobCtx, jitter: bool) -> Option<(u16, u16, i16)> {
         let slot = self.ent[i].f146;
         let (tx, ty, tz) = self.mc2_target(slot, ctx)?;
-        let tyaw = if slot == PLAYER_TARGET {
-            ctx.pyaw
+        let tyaw = if let Some(hx) = self.hx_of_tag(slot) {
+            self.seat_yaw(ctx, hx)
         } else {
             self.ent[slot as usize].f30
         };
@@ -4422,13 +4473,13 @@ impl Gen {
                         } else {
                             t0
                         };
-                        let wizard = t == PLAYER_TARGET
+                        let wizard = self.is_human_tag(t)
                             || (t != 0
                                 && (t as usize) < self.ent.len()
                                 && self.ent[t as usize].class64 == 3
                                 && self.ent[t as usize].model65 == 0);
                         let commit = if wizard {
-                            self.mc2_mobilize.0 != 0
+                            self.mc2_mobilize[self.hx_of_tag(t).unwrap_or(ctx.phx)].0 != 0
                         } else {
                             hit
                         };
@@ -5267,19 +5318,24 @@ impl Gen {
                 best = Some((slot, pos, d));
             }
         };
-        if !ctx.pdead {
+        for hx in self.human_tag.ixs().filter(|&hx| !self.seat_dead(ctx, hx)) {
             let wd = |p: u16, q: u16| (p.wrapping_sub(q) as i16 as i32).abs();
-            let parked = self.mc2_castle_of(PLAYER_TARGET).is_some_and(|c| {
+            let (hpx, hpy, _) = self.seat_at(ctx, hx);
+            let parked = self.mc2_castle_of(self.human_tag[hx].0).is_some_and(|c| {
                 let h = &self.ent[c];
-                wd(h.x, ctx.px) < h.f80 as i32 + crate::mc1::combat::MC2_PLAYER_HW
-                    && wd(h.y, ctx.py) < h.f82 as i32 + crate::mc1::combat::MC2_PLAYER_HW
+                wd(h.x, hpx) < h.f80 as i32 + crate::mc1::combat::MC2_PLAYER_HW
+                    && wd(h.y, hpy) < h.f82 as i32 + crate::mc1::combat::MC2_PLAYER_HW
             });
             if !parked {
-                consider(PLAYER_TARGET, (ctx.px, ctx.py, ctx.pz));
+                consider(self.human_tag[hx].0, self.seat_at(ctx, hx));
             }
         }
         for (j, c) in self.ent.iter().enumerate().skip(1) {
-            if c.class64 != 3 || c.act_life < 0 || c.flags & 0x400 != 0 {
+            if c.class64 != 3
+                || c.act_life < 0
+                || c.flags & 0x400 != 0
+                || self.hx_of_rec(j).is_some()
+            {
                 continue;
             }
             let owner = match c.model65 {
@@ -5923,8 +5979,8 @@ impl Gen {
     /// The castle of a wizard slot (class 3 model 2 keyed on id24;
     /// the human's is id24 == PLAYER_TARGET).
     pub(crate) fn mc2_castle_of(&self, wiz: u16) -> Option<usize> {
-        let want = if wiz == PLAYER_TARGET {
-            PLAYER_TARGET
+        let want = if let Some(hx) = self.hx_of_tag(wiz) {
+            self.human_tag[hx].0
         } else if (wiz as usize) < self.ent.len() {
             self.ent[wiz as usize].id24
         } else {
@@ -5984,8 +6040,8 @@ impl Gen {
         // port keeps the same word per TEAM in `Gen::castle_reg`,
         // so resolve the wizard record to its team the way
         // `mc2_castle_of` resolves it to its `id24` owner tag.
-        let own = if wiz == PLAYER_TARGET {
-            PLAYER_TARGET
+        let own = if let Some(hx) = self.hx_of_tag(wiz) {
+            self.human_tag[hx].0
         } else if (wiz as usize) < self.ent.len() {
             self.ent[wiz as usize].id24
         } else {
@@ -6016,8 +6072,10 @@ impl Gen {
             5 => {
                 // :19187 — kill/score (the shared 1C890 gate:
                 // human killer + self-id exclusion).
-                if self.ent[i].f38 == PLAYER_TARGET && self.ent[i].id24 != PLAYER_TARGET {
-                    self.kills += 1;
+                if let Some(hx) = self.hx_of_tag(self.ent[i].f38)
+                    && self.ent[i].id24 != self.human_tag[hx].0
+                {
+                    self.kills[hx] += 1;
                 }
                 if self.ent[i].f71 != 0 {
                     self.mc2_kill(i);
@@ -6443,8 +6501,8 @@ impl Gen {
                     // Post the victim; World applies it at THIS
                     // walk slot (`mc2_rival_leech_apply`) — the
                     // human rides the SAME mailbox, as PLAYER_TARGET.
-                    if slot == PLAYER_TARGET {
-                        self.mc2_player_drain.0 += 14; // legacy tally, no reader
+                    if let Some(hx) = self.hx_of_tag(slot) {
+                        self.mc2_player_drain[hx].0 += 14; // legacy tally, no reader
                     }
                     self.mc2_rival_leech.0 = slot as i32;
                     if self.ent[i].f63 & 3 == 0 {
@@ -6453,7 +6511,7 @@ impl Gen {
                         let row = &BEHAVIOR[e.row156 as usize];
                         if v10 <= row.v_28 as u32 {
                             let target_is_avatar =
-                                slot == PLAYER_TARGET || self.ent[slot as usize].model65 == 0;
+                                self.is_human_tag(slot) || self.ent[slot as usize].model65 == 0;
                             // ALL in-range paths STAY DRAINING: every
                             // `return sub_293D0` is a state no-op at
                             // 210 (EF:19338-76 + 19426-40) — the only
@@ -6472,7 +6530,7 @@ impl Gen {
                                 // (retail model-0 targets only).
                                 self.rand = self.rand.wrapping_mul(9377).wrapping_add(9439);
                                 let roll = self.rand % 63;
-                                if slot == PLAYER_TARGET && (roll == 4 || roll == 5) {
+                                if self.is_human_tag(slot) && (roll == 4 || roll == 5) {
                                     self.mc2_steal_mail.0.push((i as u16, (roll - 3) as u8));
                                 }
                             }
@@ -6709,8 +6767,11 @@ impl Gen {
     /// displacement ([`Gen::player_vel`]); any other target's follows
     /// its speed word (`+126`) along its yaw, backwards if it backs.
     fn m28_lead(&self, slot: u16, tyaw: u16) -> (i16, i16) {
-        if slot == PLAYER_TARGET {
-            let (dx, dy) = (self.player_vel.0.0 as i32, self.player_vel.0.1 as i32);
+        if let Some(hx) = self.hx_of_tag(slot) {
+            let (dx, dy) = (
+                self.player_vel[hx].0.0 as i32,
+                self.player_vel[hx].0.1 as i32,
+            );
             let speed = Self::isqrt((dx * dx) as u32 + (dy * dy) as u32) as i32;
             // Past the cap (Speed Up, or a warp's one-tick jump) the
             // lead keeps its direction and retail's length.
@@ -6821,8 +6882,8 @@ impl Gen {
                 }
                 // Chase the point 768 ahead of the target's facing
                 // (`mc2_leviathan_true_aim`: ahead by its speed).
-                let tyaw = if slot == PLAYER_TARGET {
-                    ctx.pyaw
+                let tyaw = if let Some(hx) = self.hx_of_tag(slot) {
+                    self.seat_yaw(ctx, hx)
                 } else {
                     self.ent[slot as usize].f30
                 };
@@ -7005,8 +7066,9 @@ mod tests {
         }
         // A non-zero mobilize counter is what the WIZARD arm would
         // commit on — it must never be consulted here.
-        g.mc2_mobilize.0 = 1;
-        g.m20_tick(m, &m14_ctx());
+        g.mc2_mobilize[crate::engine::world::Hx::FIRST].0 = 1;
+        let rig_ctx = m14_ctx(&mut g);
+        g.m20_tick(m, &rig_ctx);
         assert_eq!(
             g.ent[m].f146,
             crate::mc1::mobs::PLAYER_TARGET,
@@ -7076,16 +7138,13 @@ mod tests {
         );
     }
 
-    fn m14_ctx() -> MobCtx {
+    fn m14_ctx(g: &mut crate::engine::features::Gen) -> MobCtx {
+        *g.view_mut(crate::engine::world::Hx::FIRST) = crate::engine::features::SeatView {
+            z: 100,
+            ..Default::default()
+        };
         MobCtx {
-            px: 0,
-            py: 0,
-            pz: 100,
-            pyaw: 0,
-            pmana: 0,
-            pmana_max: 0,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: crate::patches::WorldPatches::RETAIL,
             mc2_turn: 0,
@@ -7141,7 +7200,7 @@ mod tests {
         // THE REAP-BLIND LAW: a dwelling flagged for the free pass
         // this tick is still class 10 / model 45, so the rally stands.
         let mut g = m14_flat_gen();
-        let ctx = m14_ctx();
+        let ctx = m14_ctx(&mut g);
         let d = g.new_event().expect("dwelling slot");
         {
             let e = &mut g.ent[d];

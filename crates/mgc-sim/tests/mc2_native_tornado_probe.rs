@@ -3,6 +3,7 @@
 //! own construction path (`new_full_env` + the MC2 setters) and the
 //! app's own `Simulation::step`. Prints the carpet pose per tick.
 
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::World;
 use mgc_sim::ids::GameId;
@@ -121,13 +122,13 @@ fn native_tornado_probe() {
         }
     }
     let mut sim = Simulation::with_world(w);
-    sim.thrust_model = if std::env::var_os("PROBE_ENHANCED").is_some() {
-        sim.altitude_model = mgc_sim::AltitudeModel::ExtendedLift;
+    sim.thrust_model[Hx::FIRST] = if std::env::var_os("PROBE_ENHANCED").is_some() {
+        sim.altitude_model[Hx::FIRST] = mgc_sim::AltitudeModel::ExtendedLift;
         ThrustModel::Enhanced
     } else {
         ThrustModel::Mc1
     };
-    sim.flyer = Flyer {
+    sim.flyer[Hx::FIRST] = Flyer {
         x: start.0,
         y: gz as f32 / 256.0 + 1.0,
         z: start.1,
@@ -135,16 +136,16 @@ fn native_tornado_probe() {
         pitch: 0.0,
         ..Flyer::default()
     };
-    sim.sync_carpet_from_flyer();
+    sim.sync_carpet_from_flyer(Hx::FIRST);
     if let Ok(v) = std::env::var("PROBE_AT") {
         let p: Vec<i32> = v.split(',').map(|s| s.parse().unwrap()).collect();
-        sim.carpet.x = p[0] as u16;
-        sim.carpet.y = p[1] as u16;
-        sim.carpet.z = p[2] as i16;
-        sim.carpet.yaw = p[3] as u16;
-        sim.carpet.act_speed = 80;
-        sim.carpet.tgt_speed = 80;
-        sim.sync_flyer_from_carpet();
+        sim.carpet[Hx::FIRST].x = p[0] as u16;
+        sim.carpet[Hx::FIRST].y = p[1] as u16;
+        sim.carpet[Hx::FIRST].z = p[2] as i16;
+        sim.carpet[Hx::FIRST].yaw = p[3] as u16;
+        sim.carpet[Hx::FIRST].act_speed = 80;
+        sim.carpet[Hx::FIRST].tgt_speed = 80;
+        sim.sync_flyer_from_carpet(Hx::FIRST);
         eprintln!("PARKED at {:?}", p);
     }
     let forced: Option<u16> = std::env::var("PROBE_FORCE_TILES")
@@ -169,22 +170,24 @@ fn native_tornado_probe() {
         let hs = heads(w);
         if let (Some(tiles), false, Some(h)) = (forced, placed, hs.first()) {
             // Park the carpet `tiles` east of the funnel, facing north.
-            sim.carpet.x = h.1.wrapping_add(tiles * 256);
-            sim.carpet.y = h.2;
-            sim.carpet.z = h.3 + 300;
-            sim.carpet.yaw = 0;
-            sim.sync_flyer_from_carpet();
+            sim.carpet[Hx::FIRST].x = h.1.wrapping_add(tiles * 256);
+            sim.carpet[Hx::FIRST].y = h.2;
+            sim.carpet[Hx::FIRST].z = h.3 + 300;
+            sim.carpet[Hx::FIRST].yaw = 0;
+            sim.sync_flyer_from_carpet(Hx::FIRST);
             placed = true;
             eprintln!(
                 "t={t} PLACED carpet at ({}, {}) next to head {:?}",
-                sim.carpet.x, sim.carpet.y, h
+                sim.carpet[Hx::FIRST].x,
+                sim.carpet[Hx::FIRST].y,
+                h
             );
         }
-        let c = sim.carpet;
+        let c = sim.carpet[Hx::FIRST];
         if hs.is_empty() && t % 20 != 0 {
             continue;
         }
-        let f = sim.flyer;
+        let f = sim.flyer[Hx::FIRST];
         eprintln!(
             "t={t} carpet ({}, {}, {}) yaw {} act {} tgt {} strafe {} roll_f {} | flyer ({:.1}, {:.1}, {:.1}) yaw {:.2} v ({:.2}, {:.2}) | heads {:?}",
             c.x,

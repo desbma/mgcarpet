@@ -23,6 +23,7 @@
 //! casting with an ODD carpet speed.
 
 use mgc_formats::{Thing, ThingKind};
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
 use mgc_sim::mc1::spells::SpellId;
@@ -86,8 +87,8 @@ fn armed_world() -> (World, PlayerPose) {
         par3: None,
     };
     let mut w = World::new(planes, &[marker], 1, synthetic_assets());
-    w.set_dev_spells(true);
-    w.grant_all_spells();
+    w.set_dev_spells(Hx::FIRST, true);
+    w.grant_all_spells(Hx::FIRST);
     let pose = PlayerPose::from_tiles(16.0, 40.0, 16.0, 0.0, 0.0, 0.0);
     (w, pose)
 }

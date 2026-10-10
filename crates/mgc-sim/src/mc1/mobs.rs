@@ -23,12 +23,16 @@ use crate::engine::features::{
     Gen, HashSilent, Raw48, no_mc1_build_site_chain, no_mc1_vulture_death_mover, no_mc1_wake_dy48,
 };
 use crate::mc1::behavior::{BEHAVIOR, BehaviorRow};
-use crate::mc1::combat::{Inbox, MailTarget};
+use crate::mc1::combat::Inbox;
 use crate::mc1::sprite_stats::SPRITE_STATS;
 use crate::mc1::tables::{COS, SIN};
 
-/// Sentinel chase-target slot for the player's carpet (the original
-/// chases a class-3 pool entity; our player lives outside the pool).
+/// The OUT-OF-POOL sentinel owner/target tag for the human — the
+/// fallback [`crate::engine::features::Gen::human_tag`] keeps when no
+/// carpet record is seated (a bare test world) or under
+/// `MGC_NO_HUMAN_SLOT_TAG`. Since the multiplayer stage 1 the live tag
+/// is the carpet record's pool slot, retail's own convention; sim code
+/// reads `Gen::human_tag`, never this constant.
 pub(crate) const PLAYER_TARGET: u16 = 0xFFFF;
 
 /// The `+146` a class-10 explosion child carries when its probe found
@@ -278,39 +282,16 @@ fn no_mc1_wyvern_house_hunt_on_hit() -> bool {
     *V.get_or_init(|| std::env::var_os("MGC_NO_MC1_WYVERN_HOUSE_HUNT_ON_HIT").is_some())
 }
 
-/// Per-tick context the creature handlers need: the player's position
-/// in engine units (the wizard list of the original, reduced to the
-/// one human player until AI wizards land).
+/// Per-tick context the creature handlers need: the seat the walk
+/// serves and the world's rule flags.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MobCtx {
-    pub(crate) px: u16,
-    pub(crate) py: u16,
-    pub(crate) pz: i16,
-    /// The player's heading (the wizard entity's +30) — the genie's
-    /// ambush blink (sub_1E770 :24733) lands ahead of the TARGET
-    /// along the target's own yaw.
-    pub(crate) pyaw: u16,
-    /// The player's castable pool (+140) — the genie's mana hunt
-    /// (:24523-46) takes the first wizard holding ANY mana.
-    pub(crate) pmana: u32,
-    /// The human wizard's mana CEILING (+136). Retail's ball-merge
-    /// owner contest (`sub_277D0` :29755-73) reads the owner wizards'
-    /// `+136` off their pool records; ours is out of pool, so its
-    /// ceiling rides the ctx like `pmana` — a Gen field would drag the
-    /// snapshot codec and the state hash along for a per-tick echo.
-    pub(crate) pmana_max: u32,
-    /// The human wizard is dead or death-falling (retail's leader
-    /// death test `life_0x8 < 0` reads the player entity like any
-    /// other; our player lives outside the pool, so followers get
-    /// the state through the ctx). Republished mid-walk at the
-    /// writer's slot — LIVE-read consumers (:24636, :26152) want
-    /// this one.
-    pub(crate) pdead: bool,
-    /// The tick-top pdead, NEVER republished: roster-MEMBERSHIP
-    /// consumers (the genie mana hunt's class-3 chain, :24527 —
-    /// the chain is built at tick top with actLife >= 0, :52254)
-    /// read the value the chain was built with, not the live one.
-    pub(crate) pdead_top: bool,
+    /// The human seat this context's walk serves. The context carries
+    /// no human lanes: walkers read every human off his RECORD
+    /// ([`Gen::seat_at`] and friends), and what the walk publishes
+    /// about him between record reads is his [`Gen::seat_view`]
+    /// ([`crate::engine::features::SeatView`]).
+    pub(crate) phx: crate::engine::world::Hx,
     /// Conformance replay (`World::strict_retail`): deliberate
     /// gameplay deviations switch off (DEVIATIONS.md law). Carried
     /// here so Gen-side ticks can gate without a Gen field (which
@@ -1359,8 +1340,8 @@ impl Gen {
         // that range finds NO reference to `actLife` (`+0xc`) at
         // all. So a wizard who dies DURING a tick stays acquirable
         // by every creature processed later in that same tick, and
-        // membership must be sampled with `pdead_top`, never the
-        // live `pdead` (which `World` republishes mid-walk at the
+        // membership must be sampled with `dead_top`, never the
+        // live `dead` (which `World` republishes mid-walk at the
         // carpet's slot). WITNESS mc1l48-nodeath t=4892: the human
         // (slot 681) takes a fatal `(9,0)` from id 641 at the tick
         // TOP (`act_life 380 → −20`); five guards correctly break
@@ -1371,22 +1352,33 @@ impl Gen {
         // the opposite — "from the fatal hit onward no scan can
         // acquire him" — a passing doc comment encoding a false
         // claim (round 115's law). It is true from the NEXT tick on.
-        // The five other MC1 `ctx.pdead` reads (:1379, :1748, :2119,
+        // The five other MC1 `view.dead` reads (:1379, :1748, :2119,
         // :2388, :3940) are chase TARGET-LOSS tests, which retail
         // does read live off the victim record; they stay as they
         // are.
         // …and his seat must be inside the chain's visible prefix
         // ([`Gen::mc1_human_on_wiz_chain`] — the seizure blank / sever
         // law, the same test the fireball acquire makes).
-        if !ctx.pdead_top
-            && !(self.player_invisible && cloak_gate)
-            && owner != PLAYER_TARGET
-            && self.mc1_human_on_wiz_chain()
-        {
-            let d2 = Self::dist2_sq(ex, ey, ctx.px, ctx.py) as u32;
-            if d2 <= r2 && Self::angdist(ef30, Self::angle_between(ex, ey, ctx.px, ctx.py)) < cone {
-                best = Some(PLAYER_TARGET);
-                best_d2 = d2;
+        // (With the human ON the roster he is met at his own slot in
+        // the walk below — [`crate::engine::features::human_on_wiz_chain`].)
+        // Every seat off the roster is judged ahead of the walk; on it,
+        // at his own record.
+        for hx in self.human_tag.ixs() {
+            if !self.human_rides_chain(hx)
+                && !self.seat_dead_top(hx)
+                && !(self.player_cloaked(hx) && cloak_gate)
+                && self.human_tag[hx].0 != owner
+                && self.mc1_human_on_wiz_chain(hx)
+            {
+                let (hpx, hpy, _) = self.seat_at(ctx, hx);
+                let d2 = Self::dist2_sq(ex, ey, hpx, hpy) as u32;
+                if d2 <= r2
+                    && d2 < best_d2
+                    && Self::angdist(ef30, Self::angle_between(ex, ey, hpx, hpy)) < cone
+                {
+                    best = Some(self.human_tag[hx].0);
+                    best_d2 = d2;
+                }
             }
         }
 
@@ -1412,18 +1404,28 @@ impl Gen {
             // The genie's `+65 <= 1` is the only IN-LOOP model gate
             // (:24487); the m4/m8 scans (`wanted_only`) elect ungated
             // and test the winner below.
-            if c.model65 == 0 || (bodies_only && !wanted_only && c.model65 != 1) {
+            let seat = self.hx_of_rec(j);
+            let human = seat.is_some();
+            if (c.model65 == 0 && !human) || (bodies_only && !wanted_only && c.model65 > 1) {
                 continue;
             }
-            if (cloak_gate && c.flags & 0x20 != 0) || owner == c.id24 {
+            // The human at his slot: his tag, the cloak register, the
+            // published pose — the inputs his old pre-pass read.
+            let (cid, cloaked, cx, cy) = if let Some(hx) = seat {
+                let (hpx, hpy, _) = self.seat_at(ctx, hx);
+                (self.human_tag[hx].0, self.player_cloaked(hx), hpx, hpy)
+            } else {
+                (c.id24, c.flags & 0x20 != 0, c.x, c.y)
+            };
+            if (cloak_gate && cloaked) || owner == cid {
                 continue;
             }
-            let d2 = Self::dist2_sq(ex, ey, c.x, c.y) as u32;
+            let d2 = Self::dist2_sq(ex, ey, cx, cy) as u32;
             if d2 <= r2
                 && d2 < best_d2
-                && Self::angdist(ef30, Self::angle_between(ex, ey, c.x, c.y)) < cone
+                && Self::angdist(ef30, Self::angle_between(ex, ey, cx, cy)) < cone
             {
-                best = Some(j as u16);
+                best = Some(if human { cid } else { j as u16 });
                 best_d2 = d2;
             }
         }
@@ -1431,13 +1433,13 @@ impl Gen {
         // BE a wanted wizard, or the scan comes home empty-handed —
         // there is no falling past the winner to the second-nearest.
         if wanted_only {
-            match best {
-                Some(PLAYER_TARGET) => {
-                    if self.player_aggro <= 0 {
+            match best.map(|j| (j, self.hx_of_tag(j))) {
+                Some((_, Some(hx))) => {
+                    if self.player_aggro[hx] <= 0 {
                         return None;
                     }
                 }
-                Some(j) => {
+                Some((j, None)) => {
                     let c = &self.ent[j as usize];
                     if c.model65 > 1 || self.village_wanted(c.id24) <= 0 {
                         return None;
@@ -1454,8 +1456,8 @@ impl Gen {
     /// index (a rival carpet is its own owner tag). `None` if `id` names
     /// no live wizard.
     fn wizard_slot_of(&self, id: u16) -> Option<usize> {
-        if id == PLAYER_TARGET {
-            return Some(self.human_seat() as usize);
+        if let Some(hx) = self.hx_of_tag(id) {
+            return Some(self.human_seat(hx) as usize);
         }
         self.rival_ents.iter().position(|&e| e != 0 && e == id)
     }
@@ -1464,9 +1466,12 @@ impl Gen {
     /// the human reads `player_aggro`, a rival its `rival_wanted` slot.
     /// 0 for a non-wizard tag.
     pub(crate) fn village_wanted(&self, id: u16) -> i16 {
-        match self.wizard_slot_of(id) {
-            Some(s) if s == self.human_seat() as usize => self.player_aggro,
-            Some(s) => self.rival_wanted[s],
+        match self
+            .wizard_slot_of(id)
+            .map(|s| (s, self.hx_at_wizard(s as u8)))
+        {
+            Some((_, Some(hx))) => self.player_aggro[hx],
+            Some((s, None)) => self.rival_wanted[s],
             None => 0,
         }
     }
@@ -1482,9 +1487,12 @@ impl Gen {
                 std::panic::Location::caller()
             );
         }
-        match self.wizard_slot_of(id) {
-            Some(s) if s == self.human_seat() as usize => self.player_aggro = 200,
-            Some(s) => self.rival_wanted[s] = 200,
+        match self
+            .wizard_slot_of(id)
+            .map(|s| (s, self.hx_at_wizard(s as u8)))
+        {
+            Some((_, Some(hx))) => self.player_aggro[hx] = 200,
+            Some((s, None)) => self.rival_wanted[s] = 200,
             None => {}
         }
     }
@@ -1601,13 +1609,20 @@ impl Gen {
         // for the human (:21658 dereferences +146 whoever it names),
         // so a wizard who has just taken his fatal hit fails
         // `+12 < 0` on the very next chase tick and the creature
-        // drops back to WANDER. Ours is out of the pool, so `pdead`
+        // drops back to WANDER. Ours is out of the pool, so `dead`
         // stands in for his `actLife < 0` — without it every chaser
         // stayed latched onto the corpse through the death fall, the
         // dead hold and the respawn (the reported "monsters keep
         // attacking the body" bug).
-        let (tx, ty, tz, tf66, tf67, lost) = if tgt == PLAYER_TARGET {
-            (ctx.px, ctx.py, ctx.pz, 0xFFu8, 0xFFu8, ctx.pdead)
+        let (tx, ty, tz, tf66, tf67, lost) = if let Some(hx) = self.hx_of_tag(tgt) {
+            (
+                self.seat_at(ctx, hx).0,
+                self.seat_at(ctx, hx).1,
+                self.seat_at(ctx, hx).2,
+                0xFFu8,
+                0xFFu8,
+                self.seat_dead(ctx, hx),
+            )
         } else {
             let t = tgt as usize;
             // ⭐ A `+146` OF 0 IS THE SCRATCH RECORD, AND IT STEERS THE
@@ -1699,10 +1714,13 @@ impl Gen {
             // rival's `knock_mag`/`knock_dir` at whatever its last
             // damage letter armed (mc1l14 t=2262..2276 wiz 1: retail
             // 80 flat / 447→458, port 40 / 609).
-            if self.ent[i].f26 > 0 && tgt == PLAYER_TARGET {
+            if self.ent[i].f26 > 0
+                && let Some(hx) = self.hx_of_tag(tgt)
+            {
                 let (kx, ky) = (self.ent[i].x, self.ent[i].y);
-                let dir = Self::angle_between(kx, ky, ctx.px, ctx.py).wrapping_add(0x400) & 0x7FF;
-                self.player_knock = (dir, 80);
+                let (tpx, tpy, _) = self.seat_at(ctx, hx);
+                let dir = Self::angle_between(kx, ky, tpx, tpy).wrapping_add(0x400) & 0x7FF;
+                self.player_knock[hx] = (dir, 80);
                 // Victim buffet cue (:23223) — the kraken tether's
                 // distinctive "resonance". Sound 42 has its OWN mixer
                 // case (sub_55370 :64625, priority-1, same group as
@@ -1733,7 +1751,7 @@ impl Gen {
             // castle at a distance its own drop-out test then rejected,
             // so a mound flapped chase/hidden on every v_26 tick.
             let mut v28 = row.v_28 as u32;
-            if model == 9 && tgt != PLAYER_TARGET {
+            if model == 9 && !self.is_human_tag(tgt) {
                 let t = tgt as usize;
                 if self.ent[t].class64 == 3 && self.ent[t].model65 == 2 {
                     v28 += self.ent[t].f80 as u32;
@@ -1841,8 +1859,8 @@ impl Gen {
         // the Hit arm's retarget lands after, as in retail (:22349
         // reads +146 before sub_1A120 rewrites it at :21642).
         let tgt = self.ent[i].f146;
-        let tz = if tgt == PLAYER_TARGET {
-            ctx.pz
+        let tz = if let Some(hx) = self.hx_of_tag(tgt) {
+            self.seat_at(ctx, hx).2
         } else {
             self.ent.get(tgt as usize).map_or(0, |e| e.z)
         };
@@ -1996,12 +2014,18 @@ impl Gen {
     fn wyvern_chase(&mut self, i: usize, base: u8, ctx: &MobCtx) {
         self.creature_move(i);
         let tgt = self.ent[i].f146;
-        let (tx, ty, tz, tclass, tdead) = if tgt == PLAYER_TARGET {
+        let (tx, ty, tz, tclass, tdead) = if let Some(hx) = self.hx_of_tag(tgt) {
             // :26152-53 dereferences pool[+146] whoever it names —
             // the human's carpet included; the dead test is the same
             // +12<0 || +17&4 (mc1l49 t=3059: both wyverns exit chase
             // on the death tick where the port kept firing).
-            (ctx.px, ctx.py, ctx.pz, 3u8, ctx.pdead)
+            (
+                self.seat_at(ctx, hx).0,
+                self.seat_at(ctx, hx).1,
+                self.seat_at(ctx, hx).2,
+                3u8,
+                self.seat_dead(ctx, hx),
+            )
         } else {
             let t = tgt as usize;
             // ⭐ A `+146` OF 0 IS THE SCRATCH RECORD HERE TOO — the
@@ -2188,8 +2212,13 @@ impl Gen {
         if tgt == 0 {
             return;
         }
-        let (tx, ty, tz, tyaw) = if tgt == PLAYER_TARGET {
-            (ctx.px, ctx.py, ctx.pz, ctx.pyaw)
+        let (tx, ty, tz, tyaw) = if let Some(hx) = self.hx_of_tag(tgt) {
+            (
+                self.seat_at(ctx, hx).0,
+                self.seat_at(ctx, hx).1,
+                self.seat_at(ctx, hx).2,
+                self.seat_yaw(ctx, hx),
+            )
         } else {
             let t = tgt as usize;
             if t >= self.ent.len() {
@@ -2341,12 +2370,14 @@ impl Gen {
         // (mc1hwl0 t=23503/23504: both wandering genies elect the
         // corpse in the port, retail can't see it). Roster-membership
         // phase: the tick-top pdead, not the mid-walk republish.
-        if !self.player_invisible
-            && self.ent[i].id24 != PLAYER_TARGET
-            && ctx.pmana != 0
-            && !ctx.pdead_top
-        {
-            return Some(PLAYER_TARGET);
+        for hx in self.human_tag.ixs() {
+            if !self.player_cloaked(hx)
+                && self.human_tag[hx].0 != self.ent[i].id24
+                && self.seat_purse(ctx, hx) != 0
+                && !self.seat_dead_top(hx)
+            {
+                return Some(self.human_tag[hx].0);
+            }
         }
         for j in 1..self.ent.len() {
             let c = &self.ent[j];
@@ -2393,12 +2424,17 @@ impl Gen {
         // coordinates; retail tests only `+12 >= 0 && !(+17&4) &&
         // +64` (:24636) and treats a failure as a dead target, not as
         // a reason to leave the handler.
-        let (tx, ty, tz, tdead) = if tgt == PLAYER_TARGET {
+        let (tx, ty, tz, tdead) = if let Some(hx) = self.hx_of_tag(tgt) {
             // The human's carpet IS a pool record at :24636 — the
             // dead test applies to it too (mc1hwl0 t=23461 slot 697:
             // retail eats a ball + blinks home on the death tick,
             // mana 10000→10500, f146/f26 → 0).
-            (ctx.px, ctx.py, ctx.pz, ctx.pdead)
+            (
+                self.seat_at(ctx, hx).0,
+                self.seat_at(ctx, hx).1,
+                self.seat_at(ctx, hx).2,
+                self.seat_dead(ctx, hx),
+            )
         } else {
             let t = tgt as usize;
             if t >= self.ent.len() {
@@ -2622,7 +2658,7 @@ impl Gen {
         // was invented, and it is what mc1hwl1 t=3684 and mc1l37
         // t=2742..2878 score as `sclass: retail 0 port 3`.
         let (tc, tm) = match tgt as usize {
-            _ if tgt == PLAYER_TARGET => (3u8, 0u8),
+            _ if self.is_human_tag(tgt) => (3u8, 0u8),
             t if t < self.ent.len() && !(t == 0 && no_m4m9_arm_scratch_target()) => {
                 (self.ent[t].class64, self.ent[t].model65)
             }
@@ -2678,8 +2714,13 @@ impl Gen {
         // mc1l2 t=8283: the rival wizard slot 300 is mid-death-fall at
         // `act_life -280`, retail's militia posts `+34 = 691` on the
         // way out and ours held its stale 693 for another tick.
-        let (tx, ty, tz, lost) = if tgt == PLAYER_TARGET {
-            (ctx.px, ctx.py, ctx.pz, ctx.pdead)
+        let (tx, ty, tz, lost) = if let Some(hx) = self.hx_of_tag(tgt) {
+            (
+                self.seat_at(ctx, hx).0,
+                self.seat_at(ctx, hx).1,
+                self.seat_at(ctx, hx).2,
+                self.seat_dead(ctx, hx),
+            )
         } else {
             let t = tgt as usize;
             // ⭐ A `+146` OF 0 IS THE SCRATCH RECORD HERE TOO — the
@@ -2785,7 +2826,7 @@ impl Gen {
         // Retail indexes its fixed pool array with the raw `+146`; the
         // bound is memory safety only (the FROZEN path never reaches
         // the body's own index guard).
-        if tgt == PLAYER_TARGET || self.ent.get(tgt as usize).is_some_and(|c| c.model65 <= 1) {
+        if self.is_human_tag(tgt) || self.ent.get(tgt as usize).is_some_and(|c| c.model65 <= 1) {
             self.flag_village_wanted(tgt);
         }
     }
@@ -3371,11 +3412,7 @@ impl Gen {
                 let d2 = Self::dist2_sq(x, y, tx, ty);
                 let dz = tz.wrapping_sub(z) as i32;
                 if Self::isqrt(d2.wrapping_add(dz.wrapping_mul(dz)) as u32) < 1024 {
-                    let t = if tgt == PLAYER_TARGET {
-                        MailTarget::Player
-                    } else {
-                        MailTarget::Pool(tgt as usize)
-                    };
+                    let t = self.target_of_tag(tgt);
                     // sub_12B50 (:21970) — the INVERTED single-target
                     // protocol: melee accumulates onto the victim's
                     // stale amount, so repeated bites snowball.
@@ -3836,11 +3873,11 @@ impl Gen {
         self.stats_note_death(i);
         // Kill credit (:21840-50): the human player, chain heads only,
         // spell-track models excluded. The reward itself is the ball.
-        if self.ent[i].f38 == PLAYER_TARGET
+        if let Some(hx) = self.hx_of_tag(self.ent[i].f38)
             && self.ent[i].id24 == i as u16
             && !matches!(self.ent[i].model65, 9 | 12 | 13 | 14 | 15)
         {
-            self.kills += 1;
+            self.kills[hx] += 1;
         }
         self.ent[i].tick70 = base + 5;
     }
@@ -3911,7 +3948,7 @@ impl Gen {
         // invented, and it short-circuited the id test as well as the
         // stamp.
         let (tc, tm) = match tgt as usize {
-            _ if tgt == PLAYER_TARGET => (3u8, 0u8),
+            _ if self.is_human_tag(tgt) => (3u8, 0u8),
             t if t < self.ent.len() && !(t == 0 && no_m4m9_arm_scratch_target()) => {
                 if self.ent[i].id24 == self.ent[t].id24 {
                     self.ent[i].tick70 = 55; // 0x37, back to hidden
@@ -4454,11 +4491,16 @@ impl Gen {
     /// z + f84, default 100 damage). Any break runs the exit trailer.
     fn guard_chase(&mut self, i: usize, base: u8, ctx: &MobCtx) {
         let tgt = self.ent[i].f146;
-        let (tx, ty, tz, alive) = if tgt == PLAYER_TARGET {
+        let (tx, ty, tz, alive) = if let Some(hx) = self.hx_of_tag(tgt) {
             // Same live-record law as the wyvern/genie chases: the
             // human's carpet is a pool record to retail's target-loss
             // test, so a dead human breaks the guard back to WANDER.
-            (ctx.px, ctx.py, ctx.pz, !ctx.pdead)
+            (
+                self.seat_at(ctx, hx).0,
+                self.seat_at(ctx, hx).1,
+                self.seat_at(ctx, hx).2,
+                !self.seat_dead(ctx, hx),
+            )
         } else {
             let t = tgt as usize;
             // ⭐ …and the FOURTH copy. `sub_201D0` :25830 forms
@@ -4541,7 +4583,15 @@ impl Gen {
     /// — a rolling ball is 42 and retail counts it down all the same
     /// (raw shadow: 275 mc1l42 rows of `retail 249, port 250`, a fresh
     /// ball's allocator -6 that only retail was decrementing).
+    #[cfg(test)]
     pub(crate) fn mob_awake_pass(&mut self, ctx: &MobCtx) {
+        self.mob_awake_pass_refs(ctx, &[(self.view(ctx.phx).x, self.view(ctx.phx).y)]);
+    }
+
+    /// [`Self::mob_awake_pass`] against every human seat's reference
+    /// pose (`refs`, one per seat): a creature wakes off the FIRST seat
+    /// inside its gate — one seat is retail's own `playerIndex` read.
+    pub(crate) fn mob_awake_pass_refs(&mut self, ctx: &MobCtx, refs: &[(u16, u16)]) {
         for i in 1..self.ent.len() {
             let e = &self.ent[i];
             let creature = e.class64 == 5 && e.act_life >= 0 && e.tick70 != 120;
@@ -4561,7 +4611,9 @@ impl Gen {
             } else if e.f59 > 0 {
                 self.ent[i].f59 -= 1;
             } else if (ball && ctx.patches.map_wide_ball_rolling && !ctx.strict)
-                || Self::dist2_sq(e.x, e.y, ctx.px, ctx.py) < self.chassis.awake_gate_sq
+                // The pre-pass REFERENCE poses the walk hands in
+                // (`World::mc2_wake_pose`'s phase), not a slot read.
+                || refs.iter().any(|&(px, py)| Self::dist2_sq(e.x, e.y, px, py) < self.chassis.awake_gate_sq)
             {
                 // Patch option `map_wide_ball_rolling`: the BALL rows
                 // re-arm without the 24-tile radius, so every ball
@@ -4581,7 +4633,16 @@ impl Gen {
                 // hash-silent `raw48`. Citation and the reader
                 // enumeration on [`no_mc1_wake_dy48`].
                 if !no_mc1_wake_dy48() {
-                    let dy = ctx.py.wrapping_sub(e.y) as i16 as i32;
+                    // The waking seat's Y-leg (the first inside the gate;
+                    // a map-wide ball takes seat 0's).
+                    let (ex, ey) = (self.ent[i].x, self.ent[i].y);
+                    let gate = self.chassis.awake_gate_sq;
+                    let py = refs
+                        .iter()
+                        .find(|&&(px, py)| Self::dist2_sq(ex, ey, px, py) < gate)
+                        .or(refs.first())
+                        .map_or(0, |r| r.1);
+                    let dy = py.wrapping_sub(e.y) as i16 as i32;
                     self.ent[i].raw48 = Raw48(Self::isqrt(dy.wrapping_mul(dy) as u32) as u16);
                 }
                 self.ent[i].f58 = 16;
@@ -5387,16 +5448,15 @@ mod tests {
         Gen::new(planes, assets, 1, ChassisParams::MC1, VerbSet::MC1)
     }
 
-    fn ctx() -> MobCtx {
+    fn ctx(g: &mut crate::engine::features::Gen) -> MobCtx {
+        *g.view_mut(crate::engine::world::Hx::FIRST) = crate::engine::features::SeatView {
+            x: 200 << 8,
+            y: 200 << 8,
+            z: 100,
+            ..Default::default()
+        };
         MobCtx {
-            px: 200 << 8,
-            py: 200 << 8,
-            pz: 100,
-            pyaw: 0,
-            pmana: 0,
-            pmana_max: 0,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: WorldPatches::RETAIL,
             mc2_turn: 0,
@@ -5485,7 +5545,8 @@ mod tests {
         g.ent[m].f58 = 16; // awake: the prologue WOULD read the mail
         g.ent[m].act_life = 207;
         g.ent[m].mail[0] = (1200, 629);
-        g.creature_tick(m, &ctx());
+        let rig_ctx = ctx(&mut g);
+        g.creature_tick(m, &rig_ctx);
         assert_eq!(g.ent[m].tick70, 25, "demoted to wander");
         assert_eq!(g.ent[m].act_life, 207, "the hit is not read this tick");
         assert_eq!(g.ent[m].mail[0], (1200, 629), "…and stays pending");
@@ -5500,7 +5561,8 @@ mod tests {
         g.ent[m].f58 = 16;
         g.ent[m].act_life = 207;
         g.ent[m].mail[0] = (1200, 629);
-        g.creature_tick(m, &ctx());
+        let rig_ctx = ctx(&mut g);
+        g.creature_tick(m, &rig_ctx);
         assert_eq!(g.ent[m].act_life, 207 - 1200, "led: the mail lands");
         assert_eq!(g.ent[m].tick70, 28, "…and the member corpses");
     }
@@ -5627,7 +5689,8 @@ mod tests {
             g.ent[mound].id24, g.ent[0].id24,
             "this leg must not trip the sibling id test"
         );
-        g.creature_tick(mound, &ctx());
+        let rig_ctx = ctx(&mut g);
+        g.creature_tick(mound, &rig_ctx);
         assert_eq!(
             g.ent[mound].f146, 0,
             "the pack handoff copied the leader's null target"
@@ -5647,7 +5710,8 @@ mod tests {
         let mut g = flat_gen();
         let victim = g.spawn_creature(4, 102 << 8, 100 << 8, 100).unwrap();
         let mound = packed_mound(&mut g, victim as u16);
-        g.creature_tick(mound, &ctx());
+        let rig_ctx = ctx(&mut g);
+        g.creature_tick(mound, &rig_ctx);
         assert_eq!(
             (g.ent[mound].f66, g.ent[mound].f67),
             (5, 4),
@@ -5655,7 +5719,8 @@ mod tests {
         );
         let mut g = flat_gen();
         let mound = packed_mound(&mut g, PLAYER_TARGET);
-        g.creature_tick(mound, &ctx());
+        let rig_ctx = ctx(&mut g);
+        g.creature_tick(mound, &rig_ctx);
         assert_eq!(
             (g.ent[mound].f66, g.ent[mound].f67),
             (3, 0),
@@ -5681,7 +5746,8 @@ mod tests {
         // "a mound that acquired its own owner's body" — here the
         // scratch record's id, which is what retail actually compares.
         g.ent[mound].id24 = g.ent[0].id24;
-        g.creature_tick(mound, &ctx());
+        let rig_ctx = ctx(&mut g);
+        g.creature_tick(mound, &rig_ctx);
         assert_eq!(
             g.ent[mound].tick70, 55,
             "matching the scratch record's id drops the mound straight back to HIDDEN"

@@ -567,7 +567,8 @@ impl Gen {
     /// ring-swept cell — retail's stale `ix`). Wave += 22/tick,
     /// life += 4; wave > 1024 → phase 3. NO direct HP write — the
     /// terrain is the weapon.
-    pub(crate) fn mc2_cave_in_tick(&mut self, i: usize, human: Option<(u16, u16, i16)>) -> bool {
+    /// `human`: every live human seat's pose as of this walk slot.
+    pub(crate) fn mc2_cave_in_tick(&mut self, i: usize, human: &[(u16, u16, i16)]) -> bool {
         let rings: i32 = match self.ent[i].max_life {
             1 => 5,
             2 => 7,
@@ -699,7 +700,13 @@ impl Gen {
                             };
                             for j in 1..self.ent.len() {
                                 let c = &self.ent[j];
-                                if c.class64 != 3 || c.model65 != 0 || c.flags & 0x400 != 0 {
+                                // (the human's own (3,0) record: his
+                                // pocket is the `human` arm below)
+                                if c.class64 != 3
+                                    || c.model65 != 0
+                                    || c.flags & 0x400 != 0
+                                    || self.hx_of_rec(j).is_some()
+                                {
                                     continue;
                                 }
                                 let (cx, cy, cz) = (c.x, c.y, c.z);
@@ -708,7 +715,7 @@ impl Gen {
                                     dig(self, lo, hi);
                                 }
                             }
-                            if let Some((hx, hy, hz)) = human {
+                            for &(hx, hy, hz) in human {
                                 let (lo, hi, hit) = pocket(hx, hy, hz);
                                 if hit {
                                     dig(self, lo, hi);

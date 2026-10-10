@@ -80,7 +80,8 @@ pub(crate) const FLY_OVER_AIRBORNE: i32 = 256;
 pub(crate) const FLY_OVER_CLEARANCE: i32 = 128;
 use super::sprite_params::SPRITE_PARAMS;
 use crate::engine::features::Gen;
-use crate::mc1::mobs::{MobCtx, PLAYER_TARGET};
+use crate::engine::world::Hx;
+use crate::mc1::mobs::MobCtx;
 
 /// MC2-only flag bits on [`Ent::flags`] (high bits; MC1 owns the low
 /// ones — see the module doc mapping).
@@ -330,7 +331,7 @@ pub(crate) fn no_mc2_chase_ally_resolve() -> bool {
 /// attack state 130.
 ///
 /// APPROX, cited: the port's human life reaches the Gen only as
-/// `ctx.pdead` (`life < 0`), so a human standing at exactly `life` 0
+/// `view.dead` (`life < 0`), so a human standing at exactly `life` 0
 /// still reads alive here where retail's `jle` releases.
 ///
 /// `MGC_NO_MC2_ALLY_HUMAN_PARENT_DEATH=1` restores the immortal
@@ -1349,8 +1350,8 @@ impl Gen {
     /// later be recycled into a wizard, which retail's one shared
     /// scratch word structurally cannot do.
     pub(crate) fn mc2_arm_wanted(&mut self, src: u16) {
-        if src == PLAYER_TARGET {
-            self.player_aggro = 200;
+        if let Some(hx) = self.hx_of_tag(src) {
+            self.player_aggro[hx] = 200;
         } else {
             let j = src as usize;
             if j > 0 && j < self.ent.len() && self.ent[j].class64 == 3 && self.ent[j].model65 <= 1 {
@@ -1362,8 +1363,8 @@ impl Gen {
     /// Is `slot`'s wanted timer live? (the archer Scan-A post-reject
     /// gate, :11799-802.)
     pub(crate) fn mc2_wanted_live(&self, slot: u16) -> bool {
-        if slot == PLAYER_TARGET {
-            self.player_aggro > 0
+        if let Some(hx) = self.hx_of_tag(slot) {
+            self.player_aggro[hx] > 0
         } else {
             self.mc2_wanted.0.get(&slot).is_some_and(|&t| t > 0)
         }
@@ -1438,7 +1439,7 @@ impl Gen {
     /// carries for the class-5 chains.
     ///
     /// 🏦 OWED — the out-of-pool human still enters on the LIVE
-    /// `ctx.pdead` where the roster's own sample is `ctx.pdead_top`.
+    /// `view.dead` where the roster's own sample is `view.dead_top`.
     /// Unwitnessed here and shared verbatim with
     /// [`Self::mc2_wizard_scan`], so it keeps the sibling's behaviour
     /// and wants its own A/B.
@@ -1464,16 +1465,30 @@ impl Gen {
                 best = Some((slot, d2));
             }
         };
-        // ⚠ `pdead` is the roster's ENTRY test, not a walk test — see
+        // ⚠ `dead` is the roster's ENTRY test, not a walk test — see
         // [`Gen::mc2_wizard_scan`]. `dword_38519` only ever holds
         // `life_0x8 >= 0` records (EF:39975); the pool arm below
         // applies that itself, the out-of-pool human cannot.
-        if !self.player_invisible && !ctx.pdead {
-            consider(ctx.px, ctx.py, PLAYER_TARGET);
+        // (On the roster the human is met at his own slot below.)
+        let in_walk = |hx: Hx| self.human_rides_chain(hx) && !no_mc2_class3_scan_roster();
+        for hx in self
+            .human_tag
+            .ixs()
+            .filter(|&hx| !in_walk(hx) && !self.player_cloaked(hx) && !self.seat_dead(ctx, hx))
+        {
+            consider(
+                self.seat_at(ctx, hx).0,
+                self.seat_at(ctx, hx).1,
+                self.human_tag[hx].0,
+            );
         }
         if no_mc2_class3_scan_roster() {
             for (j, c) in self.ent.iter().enumerate().skip(1) {
-                if c.class64 == 3 && c.act_life >= 0 && c.flags & 0x400 == 0 && c.flags & 0x20 == 0
+                if c.class64 == 3
+                    && c.act_life >= 0
+                    && c.flags & 0x400 == 0
+                    && c.flags & 0x20 == 0
+                    && self.hx_of_rec(j).is_none()
                 {
                     consider(c.x, c.y, j as u16);
                 }
@@ -1482,6 +1497,16 @@ impl Gen {
             for c in 0..self.wiz_chain.visible_len() {
                 let j = self.wiz_chain.list[c] as usize;
                 let w = &self.ent[j];
+                if let Some(hx) = self.hx_of_rec(j) {
+                    if !self.player_cloaked(hx) && !self.seat_dead(ctx, hx) {
+                        consider(
+                            self.seat_at(ctx, hx).0,
+                            self.seat_at(ctx, hx).1,
+                            self.human_tag[hx].0,
+                        );
+                    }
+                    continue;
+                }
                 if w.flags & 0x20 == 0 {
                     consider(w.x, w.y, j as u16);
                 }
@@ -1535,9 +1560,18 @@ impl Gen {
         // `flags` 269 at 11757, so bit 5 is CLEAR. 39's "the death
         // touchdown raises the invisibility bit" is a different tick
         // in the death sequence and does not cover this one.
-        let human_skip =
-            self.player_invisible || ctx.pdead || (wanted_only && self.player_aggro <= 0);
-        consider(ctx.px, ctx.py, PLAYER_TARGET, human_skip, &mut best);
+        let human_skip = |hx: Hx| {
+            self.player_cloaked(hx)
+                || self.seat_dead(ctx, hx)
+                || (wanted_only && self.player_aggro[hx] <= 0)
+        };
+        // Every seat; on the roster a human is met at his own slot below.
+        for hx in self.human_tag.ixs() {
+            if !self.human_rides_chain(hx) {
+                let (px, py, _) = self.seat_at(ctx, hx);
+                consider(px, py, self.human_tag[hx].0, human_skip(hx), &mut best);
+            }
+        }
         // ⭐⭐⭐ THE TICK-TOP CLASS-3 ROSTER `dword_38519` (EF:9147), AND
         // THE WALK RE-ASKS NOTHING BUT THE INVISIBILITY BIT. Retail's
         // sweep is `while (v12x > Entities_EA3E4[0])` over `next_0`
@@ -1565,6 +1599,11 @@ impl Gen {
         for c in 0..self.wiz_chain.visible_len() {
             let j = self.wiz_chain.list[c] as usize;
             let w = &self.ent[j];
+            if let Some(hx) = self.hx_of_rec(j) {
+                let (px, py, _) = self.seat_at(ctx, hx);
+                consider(px, py, self.human_tag[hx].0, human_skip(hx), &mut best);
+                continue;
+            }
             // Pool wizards carry no wanted timer yet (see
             // mc2_arm_wanted) — under wanted_only they never
             // qualify, faithful to an unarmed timer.
@@ -1734,7 +1773,7 @@ impl Gen {
     /// core for StageVar2 == 0 spawns (:11060: non-14 stage vars
     /// return the candidate; the caller then rejects dead/reaped).
     pub(crate) fn mc2_target(&self, slot: u16, ctx: &MobCtx) -> Option<(u16, u16, i16)> {
-        if slot == PLAYER_TARGET {
+        if let Some(hx) = self.hx_of_tag(slot) {
             // ⭐ THE CARPET IS A POOL RECORD IN RETAIL AND TAKES THE
             // SAME LIFE TEST AS EVERY OTHER TARGET. Each caller guards
             // the resolved pointer with `v7x->life_0x8 < 0 ||
@@ -1746,15 +1785,15 @@ impl Gen {
             // slot take retail's LABEL_92 — `actionIndex` 154 → 153
             // (attack → idle) and `actSpeed` → `minSpeed` 76 — where
             // the port held them all in the attack run.
-            // `pdead` is the ctx channel that already existed for
+            // `dead` is the ctx channel that already existed for
             // exactly this ("our player lives outside the pool, so
             // followers get the state through the ctx"); the MC2
             // carpet dispatch refreshes it mid-walk so a creature
             // ABOVE the carpet reads the death on its own tick.
-            if ctx.pdead {
+            if self.seat_dead(ctx, hx) {
                 return None;
             }
-            return Some((ctx.px, ctx.py, ctx.pz));
+            return Some(self.seat_at(ctx, hx));
         }
         let j = slot as usize;
         if j == 0 || j >= self.ent.len() {
@@ -1792,11 +1831,11 @@ impl Gen {
     /// `Entities_EA3E4[0]`, the sentinel); the port keeps only the
     /// slice bound, which cannot change a shipped-data outcome.
     pub(crate) fn mc2_target_raw(&self, slot: u16, ctx: &MobCtx) -> Option<(u16, u16, i16)> {
-        if slot == PLAYER_TARGET {
+        if let Some(hx) = self.hx_of_tag(slot) {
             // The carpet is an ordinary pool record in retail, so an
             // UNGUARDED caller reads a dead player's position too —
-            // no `ctx.pdead` arm here on purpose.
-            return Some((ctx.px, ctx.py, ctx.pz));
+            // no `view.dead` arm here on purpose.
+            return Some(self.seat_at(ctx, hx));
         }
         let j = slot as usize;
         if j >= self.ent.len() {
@@ -2141,11 +2180,11 @@ impl Gen {
         // class-3 MODEL-0 (the human avatar only — rivals are (3,1)
         // and never score creature kills) AND the SELF-ID check:
         // killing your own creature earns nothing.
-        if killer == PLAYER_TARGET
-            && self.ent[i].id24 != PLAYER_TARGET
+        if let Some(hx) = self.hx_of_tag(killer)
+            && self.ent[i].id24 != self.human_tag[hx].0
             && !matches!(model, 9 | 12 | 13 | 14 | 15)
         {
-            self.kills += 1;
+            self.kills[hx] += 1;
         }
         self.ent[i].tick70 = base + 5;
     }
@@ -2536,8 +2575,8 @@ impl Gen {
                     // Re-arm the target wizard's wanted timer per
                     // volley (:11900).
                     let t = self.ent[i].f146;
-                    if t == PLAYER_TARGET {
-                        self.mc2_arm_wanted(PLAYER_TARGET);
+                    if let Some(hx) = self.hx_of_tag(t) {
+                        self.mc2_arm_wanted(self.human_tag[hx].0);
                     } else if (t as usize) < self.ent.len()
                         && self.ent[t as usize].class64 == 3
                         && self.ent[t as usize].model65 <= 1
@@ -2638,7 +2677,7 @@ impl Gen {
                     // a nearer castle/balloon/non-wanted wizard voids
                     // the whole scan (falls to Scan B).
                     let mut target = self.mc2_class3_scan(i, ctx).filter(|&s| {
-                        let wizard = s == PLAYER_TARGET || self.ent[s as usize].model65 <= 1;
+                        let wizard = self.is_human_tag(s) || self.ent[s as usize].model65 <= 1;
                         wizard && self.mc2_wanted_live(s)
                     });
                     if target.is_none() {
@@ -2760,7 +2799,7 @@ impl Gen {
         self.mc2_set_sprite(i, sprite);
         self.mc2_shift_rot(i, 128, 256);
         let t = self.ent[i].f146;
-        let (c, m) = if t == PLAYER_TARGET {
+        let (c, m) = if self.is_human_tag(t) {
             (3, 0)
         } else if (t as usize) < self.ent.len() {
             (self.ent[t as usize].class64, self.ent[t as usize].model65)
@@ -2805,7 +2844,7 @@ impl Gen {
         self.move_relink(a, ax, ay, az);
         self.ent[a].f146 = self.ent[i].f146;
         self.ent[a].f44 = 250;
-        let (tc, tm) = if target == PLAYER_TARGET {
+        let (tc, tm) = if self.is_human_tag(target) {
             (3, 0)
         } else {
             (
@@ -2815,8 +2854,8 @@ impl Gen {
         };
         self.ent[a].f66 = tc;
         self.ent[a].f67 = tm;
-        if target == PLAYER_TARGET {
-            self.player_danger = 100; // sub_5EF70 (:60598)
+        if let Some(hx) = self.hx_of_tag(target) {
+            self.player_danger[hx] = 100; // sub_5EF70 (:60598)
         }
         // No shots++: a creature volley never bumps the player's
         // accuracy stat in retail.
@@ -2907,8 +2946,8 @@ impl Gen {
                 let vz = self.ent[v].aim_z();
                 self.move_relink(i, vx, vy, vz);
             }
-            Some(crate::mc1::combat::MailTarget::Player) => {
-                let (px, py, pz) = (ctx.px, ctx.py, ctx.pz);
+            Some(crate::mc1::combat::MailTarget::Player(hx)) => {
+                let (px, py, pz) = self.seat_at(ctx, hx);
                 self.move_relink(
                     i,
                     px,
@@ -2955,7 +2994,7 @@ impl Gen {
                 if if crate::mc2::roster::wanted_any_wizard() {
                     self.mc2_is_wizard(killer)
                 } else {
-                    killer == PLAYER_TARGET
+                    self.is_human_tag(killer)
                 } {
                     self.mc2_arm_wanted(killer);
                 }
@@ -2991,7 +3030,7 @@ impl Gen {
                 if if crate::mc2::roster::wanted_any_wizard() {
                     self.mc2_is_wizard(src)
                 } else {
-                    src == PLAYER_TARGET
+                    self.is_human_tag(src)
                 } {
                     self.mc2_arm_wanted(src);
                 }
@@ -3831,8 +3870,8 @@ impl Gen {
         // IS a class-3 wizard record in retail, so he qualifies and his
         // raw pose is the measuring point (`sub_583F0` reads
         // `position_0x4C_76` with no `sub_65580` raise).
-        let (ox, oy, oz) = if own == PLAYER_TARGET {
-            (ctx.px, ctx.py, ctx.pz)
+        let (ox, oy, oz) = if let Some(hx) = self.hx_of_tag(own) {
+            self.seat_at(ctx, hx)
         } else {
             match self.ent.get(own as usize) {
                 Some(o) if o.class64 == 3 => (o.x, o.y, o.z),
@@ -3923,7 +3962,9 @@ impl Gen {
         human: Option<((u16, u16, i16), u16, bool, i16)>,
         castle_only: bool,
     ) -> bool {
-        self.mc2_building_tick_with(i, human, castle_only, false)
+        let seats: Option<Vec<(Hx, ((u16, u16, i16), u16, bool, i16))>> =
+            human.map(|h| vec![(Hx::FIRST, h)]);
+        self.mc2_building_tick_with(i, seats.as_deref(), castle_only, false)
     }
 
     /// [`Self::mc2_building_tick`] with the `mc2_building_pad_saturate`
@@ -3934,7 +3975,7 @@ impl Gen {
     pub(crate) fn mc2_building_tick_with(
         &mut self,
         i: usize,
-        human: Option<((u16, u16, i16), u16, bool, i16)>,
+        human: Option<&[(Hx, ((u16, u16, i16), u16, bool, i16))]>,
         castle_only: bool,
         pad_saturate: bool,
     ) -> bool {
@@ -4054,18 +4095,25 @@ impl Gen {
             // re-mint the (10,42) painters or re-stamp the @0x2E latch
             // (mc2l30 t=402: a phantom painter off the free stack every
             // pair, castle f2e 0→4; mc2l0-sg t=7283: seven at once).
-            if let Some((pose, slot, alive, human_row)) = human {
+            if let Some(humans) = human {
                 let pw = (self.mc2_params_ext(44).0 / 2) as i32;
-                let slot = slot as usize;
-                // A native world has no pooled carpet (slot 0):
-                // retail's human sits SOMEWHERE in the walk, and
-                // with no slot to place it the human tests after
-                // the pool — the pre-fix order, kept for native
-                // play (the painter is a row-0 no-op there anyway).
-                let human_in_walk = slot != 0;
-                let human_hit =
-                    !castle_only && alive && wd(pose.0, bx) < bw + pw && wd(pose.1, by) < bh + pw;
-                let n = self.ent.len().max(slot + 1);
+                // Every human seat: (seat, his record's walk slot, hit,
+                // painter row). A native world has no pooled carpet
+                // (slot 0): retail's human sits SOMEWHERE in the walk,
+                // and with no slot to place it the human tests after
+                // the pool — the pre-fix order, kept for native play
+                // (the painter is a row-0 no-op there anyway).
+                let seats: Vec<(Hx, usize, bool, i16)> = humans
+                    .iter()
+                    .map(|&(hx, (pose, slot, alive, row))| {
+                        let hit = !castle_only
+                            && alive
+                            && wd(pose.0, bx) < bw + pw
+                            && wd(pose.1, by) < bh + pw;
+                        (hx, slot as usize, hit, row)
+                    })
+                    .collect();
+                let n = seats.iter().fold(self.ent.len(), |n, s| n.max(s.1 + 1));
                 // ⭐ THE WALK IS THE TICK-TOP ROSTER `dword_38519`, NOT
                 // THE POOL — see `features::no_mc2_build_repaint_roster`.
                 // The walk order below is the pool order with every
@@ -4075,8 +4123,12 @@ impl Gen {
                         .then(|| self.wiz_chain.list[..self.wiz_chain.visible_len()].to_vec());
                 let intact = self.wiz_chain.visible_len() == self.wiz_chain.list.len();
                 for w in 1..n {
+                    // The human seated at this walk slot, if any.
+                    let seat_here = seats.iter().copied().find(|s| s.1 != 0 && s.1 == w);
                     if let Some(r) = &roster {
-                        let is_human_seat = human_in_walk && w == slot;
+                        // (On the roster his record is a member like any
+                        // other; off it, his seat is exempted.)
+                        let is_human_seat = seat_here.is_some_and(|s| !self.human_rides_chain(s.0));
                         if !is_human_seat && r.binary_search(&(w as u16)).is_err() {
                             continue;
                         }
@@ -4086,7 +4138,7 @@ impl Gen {
                             continue;
                         }
                     }
-                    if human_in_walk && w == slot {
+                    if let Some((hx, slot, human_hit, human_row)) = seat_here {
                         // The out-of-pool carpet, tested where its
                         // pool slot sits in retail's walk. Its spare
                         // axis @0x9A is unwritten on the wizard body
@@ -4118,7 +4170,7 @@ impl Gen {
                             self.mc2_spawn_wizard_painter(
                                 (0, 0, 0),
                                 human_row,
-                                crate::mc1::mobs::PLAYER_TARGET,
+                                self.human_tag[hx].0,
                                 slot as u16,
                             );
                         }
@@ -4256,13 +4308,15 @@ impl Gen {
                         }
                     }
                 }
-                if !human_in_walk && human_hit {
-                    self.mc2_spawn_wizard_painter(
-                        (0, 0, 0),
-                        human_row,
-                        crate::mc1::mobs::PLAYER_TARGET,
-                        0,
-                    );
+                for &(hx, slot, human_hit, human_row) in &seats {
+                    if slot == 0 && human_hit {
+                        self.mc2_spawn_wizard_painter(
+                            (0, 0, 0),
+                            human_row,
+                            self.human_tag[hx].0,
+                            0,
+                        );
+                    }
                 }
             }
             return true;
@@ -4562,8 +4616,8 @@ impl Gen {
                 if force != 0 {
                     self.ent[i].flags |= F_CLAIM_LOCK;
                 }
-                if src == crate::mc1::mobs::PLAYER_TARGET {
-                    self.snd_player(4);
+                if let Some(hx) = self.hx_of_tag(src) {
+                    self.snd_player(hx, 4);
                 }
                 self.mc2_set_sprite(i, 177);
                 // Owner recolor (EF:28035-40; castle-builder trace
@@ -5061,7 +5115,7 @@ impl Gen {
         // EF:10655) — a RIVAL's morph body follows the rival, not
         // the human (mc2l22 slot 673, owner 557); only the human's
         // body reads `ctx` (its carpet is out of pool).
-        let (px, py, pz, pyaw, proll) = if self.ent[i].id24 == PLAYER_TARGET {
+        let (px, py, pz, pyaw, proll) = if let Some(hx) = self.hx_of_tag(self.ent[i].id24) {
             // ⭐⭐⭐ THE HUMAN'S @0x20 IS NOT A FLIGHT QUANTITY — AND IT
             // IS VISIBLE. `sub_1E4D0` reloads `dx` from `[ebx+0x20]`
             // whoever the parent is, and retail's human wizard IS a
@@ -5089,11 +5143,17 @@ impl Gen {
             // level like retail's ctor.
             // `MGC_NO_MC2_HUMAN_PUPPET_ROLL=1` restores `roll = yaw`.
             let hr = if crate::engine::features::no_mc2_human_puppet_roll() {
-                ctx.pyaw
+                self.seat_yaw(ctx, hx)
             } else {
-                self.human_roll_0x20.0
+                self.human_roll(hx)
             };
-            (ctx.px, ctx.py, ctx.pz, ctx.pyaw, hr)
+            (
+                self.seat_at(ctx, hx).0,
+                self.seat_at(ctx, hx).1,
+                self.seat_at(ctx, hx).2,
+                self.seat_yaw(ctx, hx),
+                hr,
+            )
         } else {
             let p = self.ent[i].id24 as usize;
             if p == 0 || p >= self.ent.len() || self.ent[p].class64 == 0 {
@@ -5211,8 +5271,8 @@ impl Gen {
         if t == 0 {
             return None;
         }
-        if t == PLAYER_TARGET {
-            return Some((ctx.px, ctx.py, ctx.pz));
+        if let Some(hx) = self.hx_of_tag(t) {
+            return Some(self.seat_at(ctx, hx));
         }
         let j = t as usize;
         if j >= self.ent.len() {
@@ -5226,8 +5286,8 @@ impl Gen {
     /// 0x42DEB): `life <= 0 || byte[1] & 4` clears the lock — note the
     /// `<= 0`, and note that there is NO class or model re-check.
     fn mc2_summon_lock_ok(&self, t: u16, ctx: &MobCtx) -> bool {
-        if t == PLAYER_TARGET {
-            return !ctx.pdead;
+        if let Some(hx) = self.hx_of_tag(t) {
+            return !self.seat_dead(ctx, hx);
         }
         let j = t as usize;
         if j == 0 || j >= self.ent.len() {
@@ -5260,6 +5320,7 @@ impl Gen {
             if e.class64 != 3
                 || e.model65 > 1
                 || e.id24 == own
+                || self.hx_of_rec(j).is_some()
                 || e.flags & 0x400 != 0
                 || e.act_life < 0
             {
@@ -5271,10 +5332,16 @@ impl Gen {
                 out = j as u16;
             }
         }
-        if own != PLAYER_TARGET && !ctx.pdead {
-            let d = Self::dist2_sq(mx, my, ctx.px, ctx.py);
+        for hx in self
+            .human_tag
+            .ixs()
+            .filter(|&hx| self.human_tag[hx].0 != own && !self.seat_dead(ctx, hx))
+        {
+            let (hpx, hpy, _) = self.seat_at(ctx, hx);
+            let d = Self::dist2_sq(mx, my, hpx, hpy);
             if d < best {
-                out = PLAYER_TARGET;
+                best = d;
+                out = self.human_tag[hx].0;
             }
         }
         out
@@ -5346,7 +5413,7 @@ impl Gen {
                     let e = &self.ent[i];
                     (e.f40, e.id24, e.class64, e.model65)
                 };
-                let same_species = atk != PLAYER_TARGET
+                let same_species = !self.is_human_tag(atk)
                     && (atk as usize) < self.ent.len()
                     && self.ent[atk as usize].class64 == cls
                     && self.ent[atk as usize].model65 == mdl;
@@ -5475,6 +5542,7 @@ impl Gen {
     /// The pre-2026-09-03 StageVar2-13 paraphrase, kept behind
     /// `MGC_NO_SUMMON_CORE` as the A/B arm for the dig above.
     fn mc2_summon_creature_tick_legacy(&mut self, i: usize, ctx: &MobCtx) {
+        // The pre-dig arm's fallback heading: the local player.
         // Life countdown (word_0x2E_46): expire with a puff.
         self.ent[i].add_lease(-1);
         if self.ent[i].lease() <= 0 {
@@ -5490,7 +5558,7 @@ impl Gen {
         let (mx, my) = (self.ent[i].x, self.ent[i].y);
         let mut target = self.ent[i].f146;
         let valid = target != 0
-            && target != crate::mc1::mobs::PLAYER_TARGET
+            && !self.is_human_tag(target)
             && (target as usize) < self.ent.len()
             && self.ent[target as usize].class64 == 3
             && self.ent[target as usize].model65 <= 1
@@ -5504,6 +5572,7 @@ impl Gen {
                 if e.class64 != 3
                     || e.model65 > 1
                     || e.id24 == own
+                    || self.hx_of_rec(j).is_some()
                     || e.flags & 0x400 != 0
                     || e.act_life < 0
                 {
@@ -5520,7 +5589,10 @@ impl Gen {
         let (tx, ty) = if target != 0 && (target as usize) < self.ent.len() {
             (self.ent[target as usize].x, self.ent[target as usize].y)
         } else {
-            (ctx.px, ctx.py)
+            {
+                let (px, py, _) = self.seat_at(ctx, self.local_seat());
+                (px, py)
+            }
         };
         let yaw = Self::angle_between(mx, my, tx, ty);
         self.ent[i].f34 = yaw;
@@ -5602,11 +5674,11 @@ impl Gen {
         if !Self::summon_null_attacker_law() && atk == 0 {
             return 0;
         }
-        let same_species = atk != PLAYER_TARGET
+        let same_species = !self.is_human_tag(atk)
             && (atk as usize) < self.ent.len()
             && self.ent[atk as usize].class64 == self.ent[i].class64
             && self.ent[atk as usize].model65 == self.ent[i].model65;
-        let is_parent = atk != PLAYER_TARGET && parent.is_some_and(|p| p == atk as usize);
+        let is_parent = !self.is_human_tag(atk) && parent.is_some_and(|p| p == atk as usize);
         if same_species || is_parent {
             return 0;
         }
@@ -5633,7 +5705,7 @@ impl Gen {
     /// corpse, ran `sub_1E700`'s core instead, and its engage check
     /// promoted five (5,0)s and three (5,21)s out of `8m+7` into
     /// `8m+2` on the very next tick. Our human lives outside the pool,
-    /// so the life reaches Gen through `ctx.pdead`
+    /// so the life reaches Gen through `view.dead`
     /// (`World::player.life < 0`, world.rs:6192) — an APPROX only for
     /// a human sitting at EXACTLY 0 life, which retail's home probe
     /// (below) would already count as dead.
@@ -5664,11 +5736,11 @@ impl Gen {
 
     fn mc2_doom_target_probe(&self, t: u16, ctx: &MobCtx, home: bool) -> Option<(u16, u16, i16)> {
         let law = Self::doom_dead_target_law();
-        if t == PLAYER_TARGET {
-            if law && ctx.pdead {
+        if let Some(hx) = self.hx_of_tag(t) {
+            if law && self.seat_dead(ctx, hx) {
                 return None;
             }
-            return Some((ctx.px, ctx.py, ctx.pz));
+            return Some(self.seat_at(ctx, hx));
         }
         let j = t as usize;
         if j == 0 || j >= self.ent.len() {
@@ -5796,11 +5868,12 @@ impl Gen {
         // the nearest wizard of a different `id_0x1A_26`. It runs NO
         // life test of its own — a dead wizard is excluded by CHAIN
         // MEMBERSHIP, and that chain is the TICK-TOP sample. So the
-        // human's death must be read here through `pdead_top`, not the
-        // live `pdead`.
+        // human's death must be read here through `dead_top`, not the
+        // live `dead`.
         if target == 0 && self.ent[i].f63 & 7 == 0 {
-            if !(Self::doom_dead_target_law() && ctx.pdead_top) {
-                target = PLAYER_TARGET;
+            if !(Self::doom_dead_target_law() && self.seat_dead_top(self.local_seat())) {
+                // The pyramid's own target: `Entities[playerIndex]`.
+                target = self.human_tag[self.local_seat()].0;
                 self.ent[i].f146 = target;
             }
         }
@@ -6041,7 +6114,10 @@ impl Gen {
         duration: i32,
     ) {
         let v = victim as usize;
-        if victim == 0 || victim == PLAYER_TARGET || v >= self.ent.len() || self.ent[v].class64 != 5
+        if victim == 0
+            || self.is_human_tag(victim)
+            || v >= self.ent.len()
+            || self.ent[v].class64 != 5
         {
             return;
         }
@@ -6159,7 +6235,7 @@ impl Gen {
         if slot == parent {
             return None;
         }
-        let (p96, p26) = if parent == PLAYER_TARGET {
+        let (p96, p26) = if self.is_human_tag(parent) {
             (0, self.mc2_alliance_parent_attacker(i, parent))
         } else {
             match self.ent.get(parent as usize) {
@@ -6240,14 +6316,15 @@ impl Gen {
         // The HUMAN parent is NOT immortal here — see
         // [`no_mc2_ally_human_parent_death`]. Scoped to the state-7
         // slot, the only state `sub_1E9C0` itself runs in.
-        if parent == PLAYER_TARGET
-            && ctx.pdead
+        if self
+            .hx_of_tag(parent)
+            .is_some_and(|hx| self.seat_dead(ctx, hx))
             && self.ent[i].tick70 & 7 == 7
             && !no_mc2_ally_human_parent_death()
         {
             parent_dead = true;
         }
-        if parent != 0 && parent != PLAYER_TARGET && self.ent[i].f63 & 7 == 0 {
+        if parent != 0 && !self.is_human_tag(parent) && self.ent[i].f63 & 7 == 0 {
             parent_dead = !(1..self.ent.len()).any(|j| {
                 let e = &self.ent[j];
                 e.class64 == 3
@@ -6331,7 +6408,7 @@ impl Gen {
         self.mc2_summon_core(i, ctx);
         // EF:10974-77 — `v9` = the parent's lock, else its attacker.
         let v9 = match self.ent.get(parent as usize) {
-            Some(p) if parent != PLAYER_TARGET && parent != 0 => {
+            Some(p) if !self.is_human_tag(parent) && parent != 0 => {
                 if p.f146 != 0 {
                     p.f146
                 } else {
@@ -6352,7 +6429,7 @@ impl Gen {
         // reaped record. `PLAYER_TARGET` is the out-of-pool human and
         // has no record to test: retail's `Entities[v8]` would be the
         // carpet, which is neither charmed nor dead here.
-        if v8 != PLAYER_TARGET {
+        if !self.is_human_tag(v8) {
             let Some(t) = self.ent.get(v8 as usize) else {
                 self.ent[i].f146 = 0;
                 return;
@@ -6414,7 +6491,7 @@ impl Gen {
         let (mx, my) = (self.ent[i].x, self.ent[i].y);
         let mut target = self.ent[i].f146;
         let stale = target == 0
-            || target == PLAYER_TARGET
+            || self.is_human_tag(target)
             || (target as usize) >= self.ent.len()
             || self.ent[target as usize].flags & 0x400 != 0
             || self.ent[target as usize].act_life < 0;
@@ -6432,10 +6509,12 @@ impl Gen {
                 if self.mc2_allied.0.get(&(j as u16)) == Some(&parent) {
                     continue;
                 }
-                let attacks_parent = parent == PLAYER_TARGET
-                    && matches!(e.class64, 3 | 5)
-                    && e.f146 == PLAYER_TARGET;
-                let enemy_wizard = e.class64 == 3 && e.model65 <= 1 && e.id24 != parent;
+                let attacks_parent =
+                    self.is_human_tag(parent) && matches!(e.class64, 3 | 5) && e.f146 == parent;
+                let enemy_wizard = e.class64 == 3
+                    && e.model65 <= 1
+                    && e.id24 != parent
+                    && self.hx_of_rec(j).is_none();
                 if !(attacks_parent || enemy_wizard) {
                     continue;
                 }
@@ -6522,7 +6601,14 @@ impl Gen {
     /// decrements; a zero counter waits out the wake delay (f59),
     /// then the 2D proximity probe (same 0x2400000 as MC1) arms 16
     /// (followers 18). Dead entities reset to the 0xFA sentinel.
+    #[cfg(test)]
     pub(crate) fn mc2_awake_pass(&mut self, ctx: &MobCtx) {
+        self.mc2_awake_pass_refs(ctx, &[(self.view(ctx.phx).x, self.view(ctx.phx).y)]);
+    }
+
+    /// [`Self::mc2_awake_pass`] against every human seat's reference
+    /// pose (`refs`, one per seat; one seat = retail's `playerIndex`).
+    pub(crate) fn mc2_awake_pass_refs(&mut self, ctx: &MobCtx, refs: &[(u16, u16)]) {
         // ⭐⭐⭐ THE FIRST LOOP IS THE 29 PER-MODEL ROSTER CHAINS IN
         // MODEL ORDER, NOT THE POOL IN SLOT ORDER. `sub_68BF0`
         // (EF:55822-24) is `for (i = 0; i < 29; i++) for (jx =
@@ -6587,7 +6673,7 @@ impl Gen {
             if e.act_life < 0 {
                 continue;
             }
-            self.mc2_awake_one(i, ctx);
+            self.mc2_awake_one(i, ctx, refs);
         }
         // sub_68BF0's SECOND loop (EF:55489-90): dword_38523 = the
         // mana-sphere family awake-ticks too — spheres near the
@@ -6612,14 +6698,14 @@ impl Gen {
         for i in 1..self.ent.len() {
             let e = &self.ent[i];
             if e.class64 == 10 && matches!(e.model65, 39 | 40 | 57) && e.flags & 0x400 == 0 {
-                self.mc2_awake_one(i, ctx);
+                self.mc2_awake_one(i, ctx, refs);
             }
         }
     }
 
     /// One entity's `sub_68C70` body (EF:55494): f58 propagate +
     /// decrement, the HIDDEN-skip, the f59 hold, proximity-wake.
-    fn mc2_awake_one(&mut self, i: usize, ctx: &MobCtx) {
+    fn mc2_awake_one(&mut self, i: usize, ctx: &MobCtx, refs: &[(u16, u16)]) {
         if self.ent[i].f58 != 0 {
             let v = self.ent[i].f58;
             let mut j = self.ent[i].f54 as usize;
@@ -6653,7 +6739,9 @@ impl Gen {
         // retail and keeps doing so here); the creature gate stays.
         let ball = e.class64 == 10;
         if (ball && ctx.patches.map_wide_ball_rolling && !ctx.strict)
-            || Self::dist2_sq(e.x, e.y, ctx.px, ctx.py) < 0x240_0000
+            // The pre-pass REFERENCE pose ([`World::mc2_wake_pose`]),
+            // handed in — not a slot read of the record.
+            || refs.iter().any(|&(px, py)| Self::dist2_sq(e.x, e.y, px, py) < 0x240_0000)
         {
             self.ent[i].f58 = 16;
             let mut j = self.ent[i].f54 as usize;
@@ -6738,14 +6826,7 @@ mod tests {
         }
         g.rebuild_mob_chains_mc2();
         let ctx = MobCtx {
-            px: 0,
-            py: 0,
-            pz: 0,
-            pyaw: 0,
-            pmana: 0,
-            pmana_max: 0,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: crate::patches::WorldPatches::RETAIL,
             mc2_turn: 0,
@@ -6820,14 +6901,7 @@ mod tests {
             "the other record is the chain head going in"
         );
         let ctx = MobCtx {
-            px: 0,
-            py: 0,
-            pz: 0,
-            pyaw: 0,
-            pmana: 0,
-            pmana_max: 0,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: crate::patches::WorldPatches::RETAIL,
             mc2_turn: 0,
@@ -6877,7 +6951,7 @@ mod tests {
         // bolts; 0 is the fireball, whose worker keeps the else-arm.
         let run = |action: u8, model: u8, row: u8| -> (u16, u16) {
             let mut g = w3v_flat_gen();
-            let ctx = w3v_ctx();
+            let ctx = w3v_ctx(&mut g);
             let i = g.new_event().expect("a pool slot");
             {
                 let e = &mut g.ent[i];
@@ -6918,16 +6992,13 @@ mod tests {
         );
     }
 
-    fn w3v_ctx() -> crate::mc1::mobs::MobCtx {
+    fn w3v_ctx(g: &mut crate::engine::features::Gen) -> crate::mc1::mobs::MobCtx {
+        *g.view_mut(crate::engine::world::Hx::FIRST) = crate::engine::features::SeatView {
+            z: 100,
+            ..Default::default()
+        };
         crate::mc1::mobs::MobCtx {
-            px: 0,
-            py: 0,
-            pz: 100,
-            pyaw: 0,
-            pmana: 0,
-            pmana_max: 0,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: crate::patches::WorldPatches::RETAIL,
             mc2_turn: 0,
@@ -7005,7 +7076,7 @@ mod tests {
 
         // THE LAW, villager path (`sub_23340`).
         let mut g = w3v_flat_gen();
-        let ctx = w3v_ctx();
+        let ctx = w3v_ctx(&mut g);
         let d = dwelling(&mut g, true);
         let v = townie(&mut g, 12, VILLAGER_BASE, d as u16);
         g.villager_brain(v, &ctx);
@@ -7057,7 +7128,7 @@ mod tests {
     #[test]
     fn a_damaged_tank_latches_its_attacker_as_its_target() {
         let mut g = w3v_flat_gen();
-        let ctx = w3v_ctx();
+        let ctx = w3v_ctx(&mut g);
         let i = g.new_event().expect("tank slot");
         {
             let e = &mut g.ent[i];
@@ -7297,16 +7368,15 @@ mod tests {
         }
     }
 
-    fn q22_ctx() -> crate::mc1::mobs::MobCtx {
+    fn q22_ctx(g: &mut crate::engine::features::Gen) -> crate::mc1::mobs::MobCtx {
+        *g.view_mut(crate::engine::world::Hx::FIRST) = crate::engine::features::SeatView {
+            x: 40 * 256,
+            y: 40 * 256,
+            z: 400,
+            ..Default::default()
+        };
         crate::mc1::mobs::MobCtx {
-            px: 40 * 256,
-            py: 40 * 256,
-            pz: 400,
-            pyaw: 0,
-            pmana: 0,
-            pmana_max: 0,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: crate::patches::WorldPatches::RETAIL,
             mc2_turn: 0,
@@ -7425,8 +7495,9 @@ mod tests {
         g.ent[i].f63 = 0; // the 8-tick aim throttle is OPEN
         g.ent[i].f34 = 0; // a stale bearing the port would have kept
         let stale = g.ent[i].f34;
+        let rig_ctx = q22_ctx(&mut g);
 
-        g.m16_tick(i, &q22_ctx());
+        g.m16_tick(i, &rig_ctx);
 
         let (mx, my) = (g.ent[i].x, g.ent[i].y);
         let want = Gen::angle_between(mx, my, g.ent[v].x, g.ent[v].y);
@@ -7475,7 +7546,8 @@ mod tests {
             g.ent[i].tick70 = 16 * 8 + 1; // idle
             g.ent[i].f58 = 0; // asleep: no wizard scan in the shared idle
             g.ent[i].f63 = 0; // the sweep cadence is open
-            g.m16_tick(i, &q22_ctx());
+            let rig_ctx = q22_ctx(&mut g);
+            g.m16_tick(i, &rig_ctx);
             (g.ent[i].tick70, g.ent[i].f146, near as u16, far as u16)
         };
         let (act, lock, near, _) = build(false);
@@ -7712,7 +7784,7 @@ mod tests {
         g.ent[i].site_z = 14;
         g.ent[i].set_lease(600);
         g.mc2_allied.0.insert(i as u16, PLAYER_TARGET);
-        let ctx = q22_ctx();
+        let ctx = q22_ctx(&mut g);
         g.mc2_creature_tick(i, &ctx);
         assert_eq!(g.ent[i].tick70, 16 * 8 + 7, "following, charmed");
         // A meteor's worth of mail: more than its whole 60,000 life.
@@ -7760,7 +7832,7 @@ mod tests {
         g.ent[i].site_z = 14;
         g.ent[i].set_lease(3);
         g.mc2_allied.0.insert(i as u16, PLAYER_TARGET);
-        let ctx = q22_ctx();
+        let ctx = q22_ctx(&mut g);
         for want in [2i16, 1, 0, -1, -2] {
             g.mc2_creature_tick(i, &ctx);
             assert_eq!(
@@ -7779,7 +7851,7 @@ mod tests {
             );
         }
         // The patched arm: the missing null arm, `actionIndex = 8m+1`.
-        let mut patched = q22_ctx();
+        let mut patched = q22_ctx(&mut g);
         patched.patches.mc2_wyvern_alliance_brain = true;
         g.mc2_creature_tick(i, &patched);
         assert_eq!(
@@ -7848,15 +7920,16 @@ mod tests {
             g.mc2_allied.0.insert(i as u16, PLAYER_TARGET);
             i
         };
-        let ctx = q22_ctx();
         // POSITIVE CONTROL 1: the state-7 body counts once, both arms.
         let mut g = q22_gen();
+        let ctx = q22_ctx(&mut g);
         let i = charmed(&mut g, 20 * 8 + 7, 0);
         g.mc2_creature_tick(i, &ctx);
         assert_eq!(g.ent[i].lease(), 609, "sub_1E9C0 decrements once");
         // POSITIVE CONTROL 2: a lock on the human reaches the quiet arm
         // — ONE count (the resolver's), never the head's as well.
         let mut g = q22_gen();
+        let ctx = q22_ctx(&mut g);
         let i = charmed(&mut g, 20 * 8 + 2, PLAYER_TARGET);
         g.mc2_creature_tick(i, &ctx);
         assert_eq!(
@@ -7867,6 +7940,7 @@ mod tests {
         // THE WITNESS — last, so the switched arm proves both controls:
         // 162 with no lock → 161, the clock untouched.
         let mut g = q22_gen();
+        let ctx = q22_ctx(&mut g);
         let i = charmed(&mut g, 20 * 8 + 2, 0);
         g.mc2_creature_tick(i, &ctx);
         assert_eq!(

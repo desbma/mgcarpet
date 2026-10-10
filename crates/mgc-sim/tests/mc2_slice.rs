@@ -10,6 +10,7 @@
 //! untouched — the columns share the chassis, not the fixtures).
 //! Self-skips without baked mc2 data.
 
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
 use mgc_sim::ids::GameId;
@@ -126,7 +127,7 @@ fn run(root: &std::path::Path) -> Option<(Vec<u64>, Vec<u64>)> {
     // fireball is the cast path). RIGHT unbinds so possession pulses
     // don't spray claims over the script; tier-0 fireball is CLICK
     // cadence, so the volley pulses the edge.
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     if let Some((vx, vz)) = find_creature(&w, 5, 1) {
         let unbind_r = PlayerCommand {
             mc2_select: Some((255, 0, 1)),
@@ -215,7 +216,7 @@ fn mc2_slice_behaviors_and_goldens() {
         "proximity switches are known things now"
     );
     assert!(
-        !w.live_poses().iter().any(|p| p.class == 11),
+        !w.live_poses(Hx::FIRST).iter().any(|p| p.class == 11),
         "switches draw nothing (invisible in retail)"
     );
     assert!(
@@ -239,7 +240,7 @@ fn mc2_slice_behaviors_and_goldens() {
     // wander), so survival is not asserted; kill CREDIT staying zero
     // is (townsfolk/construction deaths never credit).
     let yaw0: Vec<f32> = w
-        .live_poses()
+        .live_poses(Hx::FIRST)
         .iter()
         .filter(|p| p.class == 5 && p.model == 13)
         .map(|p| p.yaw)
@@ -247,7 +248,7 @@ fn mc2_slice_behaviors_and_goldens() {
     assert!(!yaw0.is_empty(), "villagers spawned at init");
     hover(&mut w, 16.0, 16.0, 200, idle);
     let yaw1: Vec<f32> = w
-        .live_poses()
+        .live_poses(Hx::FIRST)
         .iter()
         .filter(|p| p.class == 5 && p.model == 13)
         .map(|p| p.yaw)
@@ -258,7 +259,7 @@ fn mc2_slice_behaviors_and_goldens() {
         "the wander cadence turned somebody"
     );
     assert_eq!(
-        w.combat_stats().0,
+        w.combat_stats(Hx::FIRST).0,
         0,
         "nothing credited while idling afield"
     );
@@ -345,7 +346,7 @@ fn mc2_slice_behaviors_and_goldens() {
     // 2, par1 1 → dis 3 = the four (5,4) archers in the drowned
     // village). Order-insensitive like retail: a gate spawning after
     // its stage completed fires on its first probe.
-    w.set_dev_spells(true);
+    w.set_dev_spells(Hx::FIRST, true);
     assert!(find_creature(&w, 5, 4).is_none(), "archers gated at start");
     hover(&mut w, 150.0, 212.5, 12, idle);
     hover(&mut w, 115.5, 212.5, 12, idle);
@@ -402,18 +403,18 @@ fn mc2_slice_behaviors_and_goldens() {
         }
         for _ in 0..30 {
             w.tick(overhead, idle);
-            if w.combat_stats().0 > 0 {
+            if w.combat_stats(Hx::FIRST).0 > 0 {
                 break 'kill;
             }
         }
     }
-    let kills = w.combat_stats().0;
+    let kills = w.combat_stats(Hx::FIRST).0;
     assert!(kills >= 1, "the fireball killed an archer (kills {kills})");
     // The kill state waits for phase & 7 == 0 before transforming
     // (KillEntity_1C930) — give the corpse its settle ticks.
     hover(&mut w, 16.0, 16.0, 16, idle);
     assert!(
-        w.live_poses()
+        w.live_poses(Hx::FIRST)
             .iter()
             .any(|p| p.class == 10 && p.model == 39),
         "the corpse dropped a mana sphere"
@@ -424,12 +425,12 @@ fn mc2_slice_behaviors_and_goldens() {
     // (townsfolk kills are EXCLUDED from kill credit), then stand in
     // range: they fire — an arrow entity exists and the danger music
     // arms.
-    let kills_before = w.combat_stats().0;
+    let kills_before = w.combat_stats(Hx::FIRST).0;
     if let Some((tx, tz)) = find_creature(&w, 5, 13) {
         hover(&mut w, tx + 1.0, tz, 64, firing);
     }
     assert_eq!(
-        w.combat_stats().0,
+        w.combat_stats(Hx::FIRST).0,
         kills_before,
         "villager kills never count (model-13 exclusion)"
     );
@@ -445,7 +446,11 @@ fn mc2_slice_behaviors_and_goldens() {
     let (mut ax, mut az) = find_creature(&w, 5, 4).expect("archers materialized");
     let mut ayaw = 0.0f32;
     for _ in 0..400 {
-        if let Some(p) = w.live_poses().iter().find(|p| p.class == 5 && p.model == 4) {
+        if let Some(p) = w
+            .live_poses(Hx::FIRST)
+            .iter()
+            .find(|p| p.class == 5 && p.model == 4)
+        {
             (ax, az, ayaw) = (p.x, p.z, p.yaw);
         }
         let vtarget = find_creature(&w, 5, 13);
@@ -474,7 +479,10 @@ fn mc2_slice_behaviors_and_goldens() {
     }
     assert!(arrow_seen, "an archer fired an arrow at the wanted wizard");
     let alt = w.ground_height_tiles(ax + 3.0, az) + 2.0;
-    let frame = w.take_audio(PlayerPose::from_tiles(ax + 3.0, alt, az, 0.0, 0.0, 0.0));
+    let frame = w.take_audio(
+        Hx::FIRST,
+        PlayerPose::from_tiles(ax + 3.0, alt, az, 0.0, 0.0, 0.0),
+    );
     assert!(frame.danger, "the arrow armed the danger music");
 
     // The objective board: the archer-unlock flight above already
@@ -485,7 +493,10 @@ fn mc2_slice_behaviors_and_goldens() {
     assert_eq!(stages[0], (5, 2), "checkpoint 1 latched at (115, 212)");
     assert_eq!(stages[1], (5, 2), "checkpoint 2 latched at (194, 213)");
     assert!(cur > 1, "the cursor advanced past the completed fly-tos");
-    assert!(!w.completed(), "three stages remain — no premature win");
+    assert!(
+        !w.completed(Hx::FIRST),
+        "three stages remain — no premature win"
+    );
 
     // Pinned goldens: regenerate with --nocapture on a DELIBERATE
     // behavior change and say so in the commit.
@@ -657,7 +668,11 @@ fn mc2_slice_behaviors_and_goldens() {
     // is hashed; the decay moved from the tick tail to the carpet's
     // own walk slot).
     const GOLDEN: [u64; 6] = [
-        0x9a40b581eec40b84, // post-init (GenerateEvents + dis 0)
+        // ⭐ RE-PINNED 2026-10-10 for THE HUMAN'S SLOT TAG (multiplayer stage 1):
+        // the human's owner tag is his carpet record's pool slot (retail's
+        // convention), no longer the out-of-pool 0xFFFF, and the record's own
+        // `+24` carries it. `MGC_NO_HUMAN_SLOT_TAG=1` restores every old pin.
+        0x7504be6d183827f6, // post-init (GenerateEvents + dis 0)
         // ⚠ RE-PINNED 2026-09-17 (round 148, dig w148m), A..E + OBSERVABLE
         // 1..5 (post-init / OBSERVABLE 0 HOLD): THE MC2 NATIVE REAP IS
         // RETAIL'S TICK-TOP SWEEP (`MGC_NO_MC2_NATIVE_TICKTOP_REAP`, since 2026-09-18 the retail arm of the `mc2_immediate_reap` patch,
@@ -665,14 +680,28 @@ fn mc2_slice_behaviors_and_goldens() {
         // that dies at walk slot n is no longer poppable by a spawner at
         // slot > n in the same tick, so every later mint's slot (and its
         // private LCG) shifts. That switch alone restores every old pin.
-        0x4dd51bcaaf6fcccb, // A: 64 idle ticks afield (was 0x45a9d7b71191da3c)
-        0x683fc306c36c655e, // (was 0x2e4c5a51cfb9c680) B: the type-5 fly-to latched
+        // ⭐ RE-PINNED 2026-10-10 for THE HUMAN'S CARPET RECORD (multiplayer
+        // stage 2): the record at his slot is a live (3,0) wizard record mirroring
+        // him, a member of the tick-top class-3 roster and linked into his tile
+        // chain — the record's own bytes and its neighbours' `+20/+22` are hashed.
+        // Behaviour-neutral by measurement: under `MGC_HASH_EXCLUDE_CARPET=1` (the
+        // record spliced out and blanked before hashing) every checkpoint is
+        // identical with the stage on and off. `MGC_NO_HUMAN_RECORD_MIRROR=1`
+        // restores every old pin.
+        // Re-pinned 2026-10-13 (the first checkpoint holds) for MP STAGE 3 CH. 2:
+        // the human's (3,0) carpet record carries retail's probe-victim bit
+        // (`+16 & 8`, the recorded 0x20D) — `MGC_NO_HUMAN_POOL_VICTIM=1`
+        // reproduces the previous pins exactly, and under
+        // `MGC_HASH_EXCLUDE_CARPET=1` the values are identical switch on/off
+        // (the record's own word is the whole move).
+        0xa1c56c8be8c61f07, // A: 64 idle ticks afield (was 0x45a9d7b71191da3c)
+        0x75b0f8d329d6ba31, // (was 0x2e4c5a51cfb9c680) B: the type-5 fly-to latched
         // C-E re-pinned for the mc2l0 on-ramp batch (2026-08-21f;
         // attribution in mc2_cave.rs): the fireball's terrain-contact
         // move REVERT (sub_65C20 v16x) + the universal token-mana
         // copy + the impact pitch stamp move the combat checkpoints;
         // the D fireball window is the first consumer.
-        0x3cc9804b1b0c0a00, // (was 0x3ec630e077c6cc8a) C: goat awake/flee window
+        0xbb500f2603827368, // (was 0x3ec630e077c6cc8a) C: goat awake/flee window
         // D re-pinned for the MC2 CAST-CHARGE BANK (`mc2_launch`;
         // EF:55869-70 — every MC2 cast site copies the wizext
         // `byte_0x154` meter into the projectile's @0x10 and zeroes
@@ -726,7 +755,7 @@ fn mc2_slice_behaviors_and_goldens() {
         // (`player.left/right`, hashed); the overlay leaves it alone.
         // A/B-ATTRIBUTED: restoring the wipe alone reproduces the
         // previous D and E exactly; OBSERVABLE holds.
-        0x83dc70d04fcd499d, // (was 0x3642251fa7d3b930, 2026-09-17 tick-top reap) D — was 0x2410773a72d4f3d0, re-pinned 2026-09-04 (ROUND 98) for THE
+        0xb6f7e0a8a9ef5c4e, // (was 0x3642251fa7d3b930, 2026-09-17 tick-top reap) D — was 0x2410773a72d4f3d0, re-pinned 2026-09-04 (ROUND 98) for THE
         // LAUNCH AIM POINT `axis_0x9A_154x` EXTENDED TO THE WHOLE
         // class-15 fire table (`MGC_NO_MC2_LAUNCH_AXIS_BAND=1`
         // reverts). Retail stamps the flyer's @0x9A with the caster's
@@ -838,7 +867,7 @@ fn mc2_slice_behaviors_and_goldens() {
         // array unmoved: `MGC_NO_MC2_CLASS14_MARKER_HIDE_BIT` (the ending
         // markers hide on byte[0] bit 0, not the invisibility bit 0x20);
         // that switch alone reproduces 0x75c66d0a65b520a7.
-        0xdef64d50348352d1, // E: census + villager/archer provocation (was 0x46c9c6f10efc23f8 before the tick-top reap, 0x75c66d0a65b520a7 before the marker hide bit, both 2026-09-17; 0xa463e62ac91d6c3b, 2026-09-15 — see D)
+        0x1d623c449ca00d8c, // E: census + villager/archer provocation (was 0x46c9c6f10efc23f8 before the tick-top reap, 0x75c66d0a65b520a7 before the marker hide bit, both 2026-09-17; 0xa463e62ac91d6c3b, 2026-09-15 — see D)
     ];
     // Checkpoints 4-6 re-pinned for the DISPOSITION-FIRE stack
     // rebuild (see mc2_cave.rs — sub_49F90 at sub_4A1E0's top,
@@ -1062,7 +1091,10 @@ fn mc2_level000_mission_chain() {
         1,
         "the m17 kill switch dropped the spell jar"
     );
-    assert!(!w.completed(), "row 4 held — no premature completion");
+    assert!(
+        !w.completed(Hx::FIRST),
+        "row 4 held — no premature completion"
+    );
 
     // Row 3 = castle + banked share (type 0). Force it (the banked
     // economy is pending) and expect the m32 watcher's dis 6.
@@ -1072,14 +1104,17 @@ fn mc2_level000_mission_chain() {
     let (cur, stages) = w.mc2_objective_view();
     assert_eq!(stages[4], (7, 1), "row 4 (kill fireflies) armed and held");
     assert_eq!(cur, 4, "the cursor advanced to the firefly hunt");
-    assert!(!w.completed(), "the wave must die first");
+    assert!(!w.completed(Hx::FIRST), "the wave must die first");
 
     // Extinguish the wave → all rows complete → the level ends
     // (the smite instrument again — the chain is the subject).
     assert!(w.debug_smite(5, 19) >= 1, "fireflies live to smite");
     hover(&mut w, 170.0, 200.0, 64, idle);
     assert_eq!(count(&w, 5, 19), 0, "the firefly wave died");
-    assert!(w.completed(), "all stages done — the level completed");
+    assert!(
+        w.completed(Hx::FIRST),
+        "all stages done — the level completed"
+    );
     assert!(
         w.misfits().is_empty(),
         "no misfits on the full run (start markers + castle guards known): {:?}",
@@ -1383,7 +1418,7 @@ fn mc2_doomsday_is_tiny_until_the_proximity_wake_then_grows_to_full_size() {
     // it is hidden (the ctor's byte[0] bit 0 holds the whole opening
     // ritual out of the billboard pass).
     let boss = |w: &World| {
-        w.live_poses()
+        w.live_poses(Hx::FIRST)
             .into_iter()
             .find(|p| p.class == 5 && p.model == 10)
             .map(|p| (p.blend, p.sprite_h_units))
@@ -1493,7 +1528,7 @@ fn mc2_doomsday_growth_ramp_exports_lerpable_size_steps() {
     let mut w = World::new_for_game(planes, &things, 1, assets, GameId::Mc2);
     w.set_mc2_doom_level(true);
     let boss_h = |w: &World| {
-        w.live_poses()
+        w.live_poses(Hx::FIRST)
             .into_iter()
             .find(|p| p.class == 5 && p.model == 10)
             .and_then(|p| p.sprite_h_units)

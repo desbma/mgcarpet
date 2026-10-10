@@ -2313,16 +2313,15 @@ mod tests {
         Gen::new(planes, assets, 1, ChassisParams::MC2, VerbSet::MC2)
     }
 
-    fn ctx_at(px: u16, py: u16) -> MobCtx {
+    fn ctx_at(g: &mut crate::engine::features::Gen, px: u16, py: u16) -> MobCtx {
+        *g.view_mut(crate::engine::world::Hx::FIRST) = crate::engine::features::SeatView {
+            x: px,
+            y: py,
+            z: 100,
+            ..Default::default()
+        };
         MobCtx {
-            px,
-            py,
-            pz: 100,
-            pyaw: 0,
-            pmana: 0,
-            pmana_max: 0,
-            pdead: false,
-            pdead_top: false,
+            phx: crate::engine::world::Hx::FIRST,
             strict: false,
             patches: WorldPatches::RETAIL,
             mc2_turn: 0,
@@ -2453,9 +2452,9 @@ mod tests {
     #[test]
     fn a_blocked_summon_keeps_the_retry_yaw_instead_of_re_aiming() {
         // (0x2000, 0x2000) -> (0x4000, 0x2000) is due +x, angle 512.
-        let ctx = ctx_at(0x4000, 0x2000);
 
         let mut g = flat_gen();
+        let ctx = ctx_at(&mut g, 0x4000, 0x2000);
         let free = summoned_firebug(&mut g, 0);
         g.mc2_creature_tick(free, &ctx);
         assert_eq!(
@@ -2470,6 +2469,7 @@ mod tests {
         );
 
         let mut g = flat_gen();
+        let ctx = ctx_at(&mut g, 0x4000, 0x2000);
         let stuck = summoned_firebug(&mut g, F_BLOCKED);
         g.mc2_creature_tick(stuck, &ctx);
         assert_eq!(g.ent[stuck].lease(), 495, "the same leg ran on both arms");
@@ -2627,7 +2627,8 @@ mod tests {
 
         let pre = (w.g.ent[i].x, w.g.ent[i].y);
         let pre_nearest = nearest(&w, pre.0, pre.1);
-        w.mc2_held_move(i, 3, &ctx_at(0, 0));
+        let rig_ctx = ctx_at(&mut w.g, 0, 0);
+        w.mc2_held_move(i, 3, &rig_ctx);
         let post = (w.g.ent[i].x, w.g.ent[i].y);
         let post_nearest = nearest(&w, post.0, post.1);
 
@@ -2708,8 +2709,9 @@ mod tests {
         w.g.ent[held].tick70 = 4 * 8 + 7; // 39 — the phase-7 wrapper
         w.g.ent[held].site_z = 1;
         w.g.rebuild_mob_chains();
+        let rig_ctx = ctx_at(&mut w.g, 0, 0);
         assert!(
-            w.mc2_held_tick(held, &ctx_at(0, 0)),
+            w.mc2_held_tick(held, &rig_ctx),
             "a kind-1 held archer consumes its own tick"
         );
         assert_eq!(
@@ -2721,8 +2723,9 @@ mod tests {
         // `mc2_held_tick` deliberately does not take.
         w.g.ent[ctrl].tick70 = 4 * 8 + 7;
         w.g.ent[ctrl].site_z = 13;
+        let rig_ctx = ctx_at(&mut w.g, 0, 0);
         assert!(
-            !w.mc2_held_tick(ctrl, &ctx_at(0, 0)),
+            !w.mc2_held_tick(ctrl, &rig_ctx),
             "kind 13 falls through to the controlled arm"
         );
         assert_eq!(
@@ -2730,7 +2733,8 @@ mod tests {
             (ctrl % 100) as i16,
             "…so nothing has cleared it yet"
         );
-        w.g.mc2_creature_tick(ctrl, &ctx_at(0, 0));
+        let rig_ctx = ctx_at(&mut w.g, 0, 0);
+        w.g.mc2_creature_tick(ctrl, &rig_ctx);
         assert_eq!(
             w.g.ent[ctrl].f26, 0,
             "and the same first statement clears it on the controlled seam"

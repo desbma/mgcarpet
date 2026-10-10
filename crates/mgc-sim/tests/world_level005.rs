@@ -6,6 +6,7 @@
 //!
 //! Self-skips when the baked tree is absent (game data is optional).
 
+use mgc_sim::Hx;
 use mgc_sim::engine::features::{FeatureAssets, Planes};
 use mgc_sim::engine::world::{PlayerCommand, PlayerPose, World};
 use std::path::PathBuf;
@@ -78,17 +79,17 @@ fn level_005_trigger_cascade() {
     let (mut w, drawable_records) = build_world(&root);
 
     // Disposition gating: only dis_id == 0 things exist at level init.
-    let init = w.live_things().len();
+    let init = w.live_things(Hx::FIRST).len();
     assert!(
         init < drawable_records,
         "expected latent things: {init} live of {drawable_records} drawable records"
     );
-    assert!(w.live_things().iter().all(|t| t.dis_id == 0));
+    assert!(w.live_things(Hx::FIRST).iter().all(|t| t.dis_id == 0));
 
     // Idle far away: nothing fires, terrain static.
     let before = region_height(&w, 90, 103, 101, 114);
     fly(&mut w, 20.0, 20.0, 32);
-    assert_eq!(w.live_things().len(), init);
+    assert_eq!(w.live_things(Hx::FIRST).len(), init);
     assert_eq!(region_height(&w, 90, 103, 101, 114), before);
 
     // Fly into the trigger at (99,115) (extent 4 tiles) → disposition
@@ -142,7 +143,7 @@ fn level_005_trigger_cascade() {
 /// way — only the trigger-spawned models prove anything about a
 /// trigger.
 fn non_village_count(w: &World) -> usize {
-    w.live_things()
+    w.live_things(Hx::FIRST)
         .iter()
         .filter(|t| t.class == 5 && !matches!(t.model, 4 | 12 | 13 | 14))
         .count()
@@ -160,14 +161,14 @@ fn level_005_deterministic() {
         fly(&mut w, 20.0, 20.0, 100);
         fly(&mut w, 95.5, 109.5, 16);
         let poses: Vec<_> = w
-            .live_poses()
+            .live_poses(Hx::FIRST)
             .iter()
             .map(|p| (p.type_index, (p.x * 256.0) as i32, (p.z * 256.0) as i32))
             .collect();
         (
             w.planes().height.clone(),
             w.planes().tile_type.clone(),
-            w.live_things().len(),
+            w.live_things(Hx::FIRST).len(),
             poses,
         )
     };
