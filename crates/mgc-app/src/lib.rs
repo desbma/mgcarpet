@@ -90,7 +90,7 @@ struct WorldInit {
     player_count: u16,
     /// The wizard seat the human flies (`--seat`, 0-based; retail's
     /// local index) — 0 everywhere but a `--seat` launch, which makes
-    /// seat 0 a rival (`World::new_full_env_seated`). MC1 column only.
+    /// seat 0 a rival (`World::new_full_env_seated`).
     human_seat: u8,
     /// MC2 stage checkpoints (`(index, stage, x, y)` rows) — the
     /// single-stage objective engine's board. Empty for MC1/HW.
@@ -145,7 +145,7 @@ impl WorldInit {
             if !self.stage_vars.is_empty() {
                 w.set_mc2_stagevars(&self.stage_vars);
             }
-            w.set_mc2_wizards(&self.mc2_wizards, self.player_count);
+            w.seat_mc2_wizards(&self.mc2_wizards, self.player_count);
         } else {
             if self.win_pct > 0 {
                 w.set_win_pct(self.win_pct);
@@ -678,7 +678,9 @@ fn mc2_rival_configs(
         return (out, 1);
     };
     let count = h.number_of_players.clamp(1, 8) as u16;
-    for (slot, cfg) in w.wizards.iter().enumerate().take(8).skip(1) {
+    // Colour 0 too: it is a rival whenever the human flies another
+    // (`--seat`); `set_mc2_wizards` skips the human's own.
+    for (slot, cfg) in w.wizards.iter().enumerate().take(8) {
         let (Some(reflexes), Some(perception)) = (cfg.reflexes, cfg.perception) else {
             continue; // MC1-shaped config: no MC2 rival data
         };
@@ -1210,17 +1212,23 @@ fn load_level(
         Vec::new()
     };
 
-    // `--seat`: MC1/HW only for now, and the level must seat it.
+    // `--seat`: the level must seat it — MC1's wizard-table count,
+    // MC2's header NumberOfPlayers (the single-player bound; a network
+    // game seats the joined count instead).
     if human_seat != 0 {
-        if !mc1_family {
-            return Err("--seat: MC1/HW levels only for now".into());
-        }
-        let count = package
-            .wizards
-            .as_ref()
-            .and_then(|w| w.player_count)
-            .unwrap_or(1)
-            .min(8);
+        let count = if mc1_family {
+            package
+                .wizards
+                .as_ref()
+                .and_then(|w| w.player_count)
+                .unwrap_or(1)
+                .min(8)
+        } else {
+            package
+                .header
+                .as_ref()
+                .map_or(1, |h| h.number_of_players.clamp(1, 8) as u16)
+        };
         if u16::from(human_seat) >= count {
             return Err(format!(
                 "--seat {}: this level seats {count} wizard(s)",
@@ -9788,8 +9796,8 @@ struct Args {
     awake_range: Option<u32>,
     /// `--seat N` (1-based): fly wizard seat N of a `--level` launch
     /// instead of seat 1 — retail's local index; every other seat,
-    /// seat 1 included, is a rival. Stored 0-based. MC1/HW only for
-    /// now; not with `--campaign`, `--record` or `--replay`.
+    /// seat 1 included, is a rival. Stored 0-based. Not with
+    /// `--campaign`, `--record` or `--replay`.
     seat: u8,
     /// `--replay <take.mgcr>`: play a recording as the session's only
     /// input source — SOURCE-AGNOSTIC (retail takes via inline input
@@ -10264,7 +10272,7 @@ fn parse_args() -> Result<Args, String> {
                 return Err(format!(
                     "usage: mgcarpet [--level <game:index> | <baked/.../level-NNN.mgcl>] \
                      [--campaign mc1|mc1hw|mc2 [--slot N] [--new-game]] \
-                     [--seat 1-8 (fly that wizard seat; MC1/HW --level only)] \
+                     [--seat 1-8 (fly that wizard seat; --level only)] \
                      (slot 0 = default: a fresh run, saved only from the in-game menu) \
                      [--tileset 0|1] [--config <path>] \
                      [--smooth-shading|--no-smooth-shading] \

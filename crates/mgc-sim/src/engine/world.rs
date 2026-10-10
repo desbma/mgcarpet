@@ -4370,13 +4370,14 @@ impl World {
     /// `human_seat` ([`Gen::human_seat`]) — retail's local index set
     /// to a seat other than 0, which its own level init answers by
     /// making every other seat (seat 0 included) an AI. Seat 0 is
-    /// exactly `new_full_env`. MC1 only for now: an MC2 world always
-    /// seats the human at 0.
+    /// exactly `new_full_env`.
     ///
     /// A nonzero seat does NOT pop the human's carpet record here:
-    /// retail pops the wizards in SEAT order (the consume loop runs
-    /// `sub_44D30` for wizard 0..7, :48633), so the caller seats the
-    /// whole roster through [`World::seat_mc1_wizards`].
+    /// retail pops the wizards in SEAT order (MC1's consume loop runs
+    /// `sub_44D30` for wizard 0..7, :48633; MC2's `sub_53160` runs
+    /// `sub_5C950` per colour, EF:38410), so the caller seats the
+    /// whole roster through [`World::seat_mc1_wizards`] /
+    /// [`World::seat_mc2_wizards`].
     #[allow(clippy::too_many_arguments)]
     pub fn new_full_env_seated(
         planes: Planes,
@@ -4569,8 +4570,13 @@ impl World {
             // `sub_5C950` for player 0: the (3,0) record FIRST
             // (`AddPlayer_4A920`), then the book's tokens — round 112,
             // see `mc2::rivals::no_mc2_native_human_record`.
-            w.mc2_spawn_human_record();
-            w.mc2_seed_default_spells();
+            // A nonzero seat pops in its seat's turn instead
+            // (`seat_mc2_wizards`).
+            w.g.human_seat = features::HumanSeat(human_seat.min(7));
+            if human_seat == 0 {
+                w.mc2_spawn_human_record();
+                w.mc2_seed_default_spells();
+            }
             // Arm the level-start checkpoint autosave. `DEFAULT_FRAME`
             // is the corpus median, not a constant of the engine —
             // see [`World::mc2_arm_checkpoint_autosave`].
@@ -13177,7 +13183,7 @@ impl World {
         // like a rival's does (EF:44185-93, NETHERW.EXE 0x5CE22).
         // `MGC_NO_MC2_HUMAN_RESPAWN_TRUCE=1` restores the pre-dig
         // behaviour. See [`World::mc2_respawn_truce`].
-        self.mc2_respawn_truce(0);
+        self.mc2_respawn_truce(self.g.human_seat() as usize);
         // The recycle stack is emptied outright (EF:43857).
         self.g.mc2_recycle.stack.clear();
         self.entities_dirty = true;

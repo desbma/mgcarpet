@@ -2230,7 +2230,7 @@ impl std::hash::Hash for DuelLock {
 /// needs. Position/yaw/life live on the pool entity (class 3 model 1).
 #[derive(Hash, Clone)]
 pub(crate) struct Mc2Rival {
-    /// Player color (1..=7); color 0 = the human, never a rival.
+    /// Player color (0..=7) — never the human's own (`Gen::human_seat`).
     pub slot: u8,
     /// Wizard entity pool index — also the OWNER TAG on its
     /// projectiles (id24) and claims.
@@ -2545,7 +2545,8 @@ impl World {
         if no_mc2_native_human_record() || self.mc2_carpet_slot != 0 {
             return;
         }
-        if self.start_markers[0].is_none() {
+        let seat = self.g.human_seat() as usize;
+        if self.start_markers[seat].is_none() {
             return;
         }
         let Some(i) = self.g.new_event() else { return };
@@ -2561,7 +2562,7 @@ impl World {
         // still the constructor's (0,0,0) when the book is granted.
         // [`crate::engine::features::no_mc2_native_human_start_pose`].
         if !crate::engine::features::no_mc2_native_human_start_pose() {
-            if let Some((mx, my)) = self.start_markers[0] {
+            if let Some((mx, my)) = self.start_markers[seat] {
                 let x = (mx << 8).wrapping_add(128);
                 let y = (my << 8).wrapping_add(128);
                 let z = (self.g.ground_z(x, y) as i16).wrapping_add(0x100);
@@ -2585,14 +2586,44 @@ impl World {
     /// as AI rivals at their (3,4+color) start markers (the
     /// `sub_53160` activation walk under the NumberOfPlayers pump
     /// bound — lifecycle trace §1 + the header-unk09 identification).
-    /// Color 0 (the human) stays out-of-pool; it gets NO authored
+    /// The human's colour ([`crate::engine::features::Gen::human_seat`],
+    /// 0 unless `--seat`) stays out-of-pool; it gets NO authored
     /// starting castle (open-closure §7).
     pub fn set_mc2_wizards(&mut self, configs: &[Option<Mc2RivalConfig>; 8], player_count: u16) {
-        for slot in 1..player_count.min(8) as u8 {
+        let hs = self.g.human_seat();
+        for slot in 0..player_count.min(8) as u8 {
+            if slot == hs {
+                continue;
+            }
             let Some(cfg) = &configs[slot as usize] else {
                 continue;
             };
             self.mc2_spawn_rival(slot, cfg.clone());
+        }
+    }
+
+    /// Seat the whole MC2 roster in retail's colour order (`sub_53160`
+    /// runs `sub_5C950` for colour 0..NumberOfPlayers, EF:38410): at
+    /// the human's colour his (3,0) record
+    /// ([`World::mc2_spawn_human_record`]) and then his default book
+    /// ([`World::mc2_seed_default_spells`]); a rival at every other.
+    /// At colour 0 this is exactly the classic sequence — the
+    /// constructor's record and book, then `set_mc2_wizards`. A world
+    /// built by [`World::new_full_env_seated`] with a nonzero seat
+    /// must be seated through here.
+    pub fn seat_mc2_wizards(&mut self, configs: &[Option<Mc2RivalConfig>; 8], player_count: u16) {
+        let hs = self.g.human_seat();
+        if hs == 0 {
+            self.set_mc2_wizards(configs, player_count);
+            return;
+        }
+        for slot in 0..player_count.min(8) as u8 {
+            if slot == hs {
+                self.mc2_spawn_human_record();
+                self.mc2_seed_default_spells();
+            } else if let Some(cfg) = &configs[slot as usize] {
+                self.mc2_spawn_rival(slot, cfg.clone());
+            }
         }
     }
 
@@ -2630,10 +2661,11 @@ impl World {
         self.g.link(i, x, y, z);
         // Carpet sprite by color: retail switches on
         // TransformPlayerColorIndex (EF:43732) -> models 273..279
-        // (the human keeps 44) — the art families are authored in
-        // Transform order (crate::mc2::COLOR_ART). Rivals only ever
-        // take slots 1.., so this never reads the row-44 arm; the
-        // shared helper is what the replay ghost needs.
+        // (colour 0 keeps 44) — the art families are authored in
+        // Transform order (crate::mc2::COLOR_ART). A rival reads the
+        // row-44 arm only at colour 0, i.e. when the human flies
+        // another (`--seat`); the shared helper is what the replay
+        // ghost needs.
         self.g
             .mc2_set_sprite(i, crate::mc2::carpet_sprite_row(slot));
         let mut r = Mc2Rival::new(slot, i as u16, &cfg);
@@ -6553,8 +6585,8 @@ impl World {
                 w.human_pose.1,
                 w.player_castle().is_none(),
                 w.player.mana,
-                w.mc2_rivals[ri].war[0],
-                w.mc2_hate_over(ri, 0, w.player.mana_max),
+                w.mc2_rivals[ri].war[w.g.human_seat() as usize],
+                w.mc2_hate_over(ri, w.g.human_seat(), w.player.mana_max),
                 w.mc2_book.ent[2] != 0,
             )
         };
@@ -7514,7 +7546,7 @@ impl World {
                     };
                     if fired {
                         let slot = match self.mc2_rivals[ri].target {
-                            PLAYER_TARGET => Some(0u8),
+                            PLAYER_TARGET => Some(self.g.human_seat()),
                             t => self.mc2_rivals.iter().find(|r| r.ent == t).map(|r| r.slot),
                         };
                         if let Some(s) = slot {
@@ -10856,5 +10888,219 @@ mod grave_tests {
         assert_eq!(g.ent[s].f26, (s % 11) as i16, "dword_0x10_16 = slot % 11");
         assert_eq!(g.ent[s].tick70, 42, "actionIndex_0x45_69 = 0x2A");
         assert_eq!((g.ent[s].class64, g.ent[s].model65), (10, 40));
+    }
+}
+
+/// The human at a colour other than 0 (`Gen::human_seat`) — MC2's
+/// twin of `mc1::rivals::human_seat_tests`, on baked arena level 53
+/// (eight authored seats, NumberOfPlayers 8). Self-skips without
+/// baked data.
+#[cfg(test)]
+mod human_seat_tests {
+    use super::Mc2RivalConfig;
+    use crate::engine::features::{FeatureAssets, Planes};
+    use crate::engine::world::World;
+    use crate::ids::GameId;
+    use crate::mc1::mobs::PLAYER_TARGET;
+    use crate::{FlightInput, Simulation, ThrustModel};
+
+    struct Arena {
+        planes: Planes,
+        things: Vec<mgc_formats::Thing>,
+        seed: u32,
+        assets: FeatureAssets,
+        stages: Vec<(i8, i16, i16, i16)>,
+        vars: Vec<(i8, i8, u8, u8, u32)>,
+        configs: [Option<Mc2RivalConfig>; 8],
+        count: u16,
+    }
+
+    fn arena() -> Option<Arena> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../baked");
+        let lp = root.join("mc2/level-053.mgcl");
+        if !lp.exists() {
+            eprintln!("skip: baked mc2 level 53 not present");
+            return None;
+        }
+        let pkg: mgc_formats::LevelPackage =
+            mgc_formats::mgcl::read(std::fs::File::open(lp).ok()?).ok()?;
+        let bundle = mgc_formats::bundle::Bundle::load(&root.join("assets/mc2-day")).ok()?;
+        let assets = FeatureAssets::parse(
+            bundle.search.as_ref()?,
+            bundle.build_tab.as_ref()?,
+            bundle.build_dat.as_ref()?,
+        )
+        .ok()?
+        .with_bldgprm(bundle.bldgprm.as_deref().unwrap_or_default());
+        let assets = match bundle.spells.as_deref() {
+            Some(sp) => assets.with_spells(sp).ok()?,
+            None => assets,
+        };
+        let terrain = pkg.terrain.as_ref()?;
+        let planes = Planes {
+            height: terrain.height.clone(),
+            tile_type: terrain.tile_type.clone(),
+            shading: terrain.shading.clone()?,
+            angle: terrain.angle.clone()?,
+            ceiling: terrain.ceiling.clone().unwrap_or_default(),
+        };
+        let (stages, vars) = pkg.stages.as_ref().map_or((Vec::new(), Vec::new()), |st| {
+            (
+                st.checkpoints.iter().map(|c| (c.index, c.stage, c.x, c.y)).collect(),
+                st.variables.iter().map(|v| (v.index, v.stage, v.x, v.y, v.data)).collect(),
+            )
+        });
+        // The app's `mc2_rival_configs`, every colour.
+        let (wiz, h) = (pkg.wizards.as_ref()?, pkg.header.as_ref()?);
+        let mut configs: [Option<Mc2RivalConfig>; 8] = Default::default();
+        for (slot, c) in wiz.wizards.iter().enumerate().take(8) {
+            let (Some(reflexes), Some(perception)) = (c.reflexes, c.perception) else {
+                continue;
+            };
+            let mut start = [false; 26];
+            let mut start_level = [0u8; 26];
+            let mut blocked = [false; 26];
+            for s in 0..26 {
+                start[s] = c.starting_spells.get(s).copied().unwrap_or(0) != 0;
+                start_level[s] = c.starting_spell_levels.get(s).copied().unwrap_or(0).min(2);
+                blocked[s] = c.blocked_spells.get(s).copied().unwrap_or(0) != 0;
+            }
+            configs[slot] = Some(Mc2RivalConfig {
+                aggression: c.aggression.clamp(0, 255) as u8,
+                perception: perception.clamp(0, 255) as u8,
+                reflexes: reflexes.clamp(0, 255) as u8,
+                life: c.life.unwrap_or(0).max(0) as u16,
+                castle_level: h.players[slot].max(0) as u8,
+                start,
+                start_level,
+                blocked,
+            });
+        }
+        Some(Arena {
+            planes,
+            things: pkg.things.things.clone(),
+            seed: pkg.gen_params.as_ref().map_or(0, |g| g.seed),
+            assets,
+            stages,
+            vars,
+            configs,
+            count: h.number_of_players.clamp(1, 8) as u16,
+        })
+    }
+
+    /// The app's build order: constructor, stage board, roster.
+    fn build(a: &Arena, seat: u8, classic: bool) -> World {
+        let mut w = if classic {
+            World::new_full_env(
+                a.planes.clone(),
+                &a.things,
+                a.seed,
+                a.assets.clone(),
+                GameId::Mc2.chassis(),
+                GameId::Mc2,
+                false,
+            )
+        } else {
+            World::new_full_env_seated(
+                a.planes.clone(),
+                &a.things,
+                a.seed,
+                a.assets.clone(),
+                GameId::Mc2.chassis(),
+                GameId::Mc2,
+                false,
+                seat,
+            )
+        };
+        if !a.stages.is_empty() {
+            w.set_mc2_stages(&a.stages);
+        }
+        if !a.vars.is_empty() {
+            w.set_mc2_stagevars(&a.vars);
+        }
+        if classic {
+            w.set_mc2_wizards(&a.configs, a.count);
+        } else {
+            w.seat_mc2_wizards(&a.configs, a.count);
+        }
+        w
+    }
+
+    fn sim(w: World) -> Simulation {
+        let mut s = Simulation::with_world(w);
+        s.thrust_model = ThrustModel::Mc1;
+        s.sync_carpet_from_flyer();
+        s
+    }
+
+    #[test]
+    fn colour_zero_is_the_classic_build() {
+        let Some(a) = arena() else { return };
+        let (mut c, mut s) = (sim(build(&a, 0, true)), sim(build(&a, 0, false)));
+        assert_eq!(c.state_hash(), s.state_hash(), "fresh build");
+        let fly = FlightInput {
+            thrust: 1.0,
+            stick_x: 40,
+            ..Default::default()
+        };
+        for t in 1..=300 {
+            c.step(&fly);
+            s.step(&fly);
+            assert_eq!(c.state_hash(), s.state_hash(), "tick {t}");
+        }
+    }
+
+    #[test]
+    fn human_flies_colour_four_and_colour_zero_is_a_rival() {
+        let Some(a) = arena() else { return };
+        assert_eq!(a.count, 8, "level 53 seats eight wizards");
+        let w = build(&a, 4, false);
+        assert_eq!(w.g.human_seat(), 4);
+        let (mx, my) = w.start_markers[4].expect("level 53 authors colour 4");
+        assert_eq!(
+            (w.human_pose.0, w.human_pose.1),
+            ((mx << 8) | 128, (my << 8) | 128)
+        );
+        let mut seats: Vec<u8> = w.mc2_rivals.iter().map(|r| r.slot).collect();
+        seats.sort_unstable();
+        assert_eq!(seats, vec![0, 1, 2, 3, 5, 6, 7]);
+        // `sub_5C950` per colour in order: the human's record between
+        // colours 3 and 5.
+        let ent_of = |s: u8| w.mc2_rivals.iter().find(|r| r.slot == s).unwrap().ent;
+        let hs = w.mc2_carpet_slot;
+        assert!(ent_of(3) < hs && hs < ent_of(5), "{} < {hs} < {}", ent_of(3), ent_of(5));
+        assert_eq!(w.g.owner_team(PLAYER_TARGET), Some(4));
+        assert_eq!(w.g.owner_team(ent_of(0)), Some(0));
+        assert_eq!(w.g.rival_ents[0], ent_of(0));
+    }
+
+    #[test]
+    fn colour_four_plays_and_round_trips() {
+        let Some(a) = arena() else { return };
+        let mut live = sim(build(&a, 4, false));
+        let fly = FlightInput {
+            thrust: 1.0,
+            stick_x: -30,
+            fire_left: true,
+            ..Default::default()
+        };
+        for _ in 0..600 {
+            live.step(&fly);
+        }
+        let w = live.world.as_ref().unwrap();
+        assert!(!w.mc2_rivals.iter().find(|r| r.slot == 0).unwrap().eliminated);
+        let bytes = live.snapshot();
+        let mut restored = sim(build(&a, 4, false));
+        restored.restore(&bytes).expect("restore");
+        assert_eq!(live.state_hash(), restored.state_hash());
+        for t in 1..=300 {
+            live.step(&fly);
+            restored.step(&fly);
+            assert_eq!(live.state_hash(), restored.state_hash(), "tick {t}");
+        }
+        assert_ne!(
+            sim(build(&a, 4, false)).state_hash(),
+            sim(build(&a, 0, false)).state_hash()
+        );
     }
 }

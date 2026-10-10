@@ -5722,8 +5722,8 @@ impl World {
         // loop — and the possession arms overwrite the bank with
         // their own @0x10 law after this helper returns while
         // keeping the zero (EF:56058/55975).
-        self.g.ent[i].f26 = self.wiz_charge[0] as i16;
-        self.wiz_charge[0] = 0;
+        self.g.ent[i].f26 = self.wiz_charge[self.g.human_seat.0 as usize] as i16;
+        self.wiz_charge[self.g.human_seat.0 as usize] = 0;
         // ⭐⭐⭐ `word_0x26_38` IS THE (15,x) TOKEN'S **POOL SLOT**,
         // NOT THE SPELL INDEX, AND TWO RETAIL READERS DEREFERENCE IT:
         // the impact XP award (`sub_6D8B0(id,
