@@ -1345,7 +1345,15 @@ pub fn book_quads(
         let (mx, my) = (cell[0] + 4.0 * sx, cell[1] + 36.0 * sy);
         let partial = (56.0 * (mana % cost) as f32 / cost as f32).floor();
         quads.push(solid([mx, my, partial * sx, 4.0 * sy], METER_GREY));
-        meter_dots(&mut quads, mx, my, sx, sy, (mana / cost).min(54) as usize);
+        meter_dots(
+            &mut quads,
+            mx,
+            my,
+            sx,
+            sy,
+            (mana / cost).min(54) as usize,
+            MANA_WHITE,
+        );
         // Retail's sub_23D40 re-stamps the quickselect digit inside
         // the redraw (:27749-67) — without it the badge vanishes
         // exactly while hovering the cell you're assigning.
@@ -1587,7 +1595,8 @@ const SPR_SPELL_ICON: usize = 6; // spell icon base: [spell + 6]
 /// Life-bar color (remc1 uses palette index 0x7B, a team red).
 const LIFE_RED: [f32; 4] = [0.85, 0.15, 0.12, 1.0];
 /// Collected/banked mana bar (sub_22E50 :27377, color v29 =
-/// byte_99B58[2*owner]) — WHITE, not blue.
+/// byte_99B58[2*owner]) — WHITE, not blue, for seat 0 (other seats
+/// draw their own team pair, see `hud_quads`).
 const MANA_WHITE: [f32; 4] = [0.95, 0.95, 0.95, 1.0];
 /// Spell availability progress bar (sub_23D40 :27705, color v26 =
 /// byte_99B58[1+2*owner]) — GREY, not blue; the partial mana toward
@@ -1716,11 +1725,19 @@ fn thin_bar(quads: &mut Vec<UiQuad>, pf: &PanelFrame, x: f32, y: f32, frac: f32,
 /// upscaler smearing that pixel across the 2-px spacing grid. `mx/my`
 /// in screen px; `sx/sy` = native→screen scale (snap() keeps every dot
 /// rasterizing alike).
-fn meter_dots(quads: &mut Vec<UiQuad>, mx: f32, my: f32, sx: f32, sy: f32, casts: usize) {
+fn meter_dots(
+    quads: &mut Vec<UiQuad>,
+    mx: f32,
+    my: f32,
+    sx: f32,
+    sy: f32,
+    casts: usize,
+    color: [f32; 4],
+) {
     for d in 0..casts {
         let (col, row) = ((d / 2) as f32, (d % 2) as f32);
         let (x, y) = (mx + col * 2.0 * sx, my + row * 2.0 * sy);
-        quads.push(solid([x, y, sx.max(1.0), sy.max(1.0)], MANA_WHITE));
+        quads.push(solid([x, y, sx.max(1.0), sy.max(1.0)], color));
     }
 }
 
@@ -1746,10 +1763,17 @@ pub fn hud_quads(
     mc2: bool,
     mc2_book: Option<&Mc2BookView>,
     dev_spells: bool,
+    team: Option<([f32; 4], [f32; 4])>,
     w: f32,
     h: f32,
 ) -> Vec<UiQuad> {
     let mut quads = Vec::new();
+    // The bars' colour pair: retail's `byte_99B58[2·owner]` (mana,
+    // banked, cargo, ticks, dots) and `[1 + 2·owner]` (capacity, the
+    // spell meter) — the HUMAN's team pair (`team`, resolved through
+    // the level palette by the caller). Seat 0 keeps the tuned
+    // white/grey (`None`).
+    let (mana_c, meter_c) = team.unwrap_or((MANA_WHITE, METER_GREY));
     // The strip splits into two anchored groups (see `HudFrame`): the
     // radar + three wizard sub-panels are LEFT-anchored — they already
     // read as `native * s` from x=0, so nothing below changes — and the
@@ -1800,7 +1824,7 @@ pub fn hud_quads(
         if loadout.win_pct > 0 && goal_blink {
             let tx = BAR_X + BAR_W * (loadout.win_pct as f32 / 100.0).min(1.0);
             for y in [26.0, 38.0] {
-                quads.push(solid(pf.rect(tx, y, 2.0, 2.0), MANA_WHITE));
+                quads.push(solid(pf.rect(tx, y, 2.0, 2.0), mana_c));
             }
         }
     };
@@ -1851,7 +1875,7 @@ pub fn hud_quads(
         // double-counts and pins the bar full). banked == capacity
         // blinks the single full bar between the pair (:27242-53).
         if loadout.banked >= capacity && capacity > 0 {
-            let c = if alert_blink { METER_GREY } else { MANA_WHITE };
+            let c = if alert_blink { meter_c } else { mana_c };
             bar(
                 &mut quads,
                 &pf,
@@ -1869,7 +1893,7 @@ pub fn hud_quads(
                 28.0,
                 10.0,
                 capacity as f32 / world,
-                METER_GREY,
+                meter_c,
             );
             bar(
                 &mut quads,
@@ -1878,7 +1902,7 @@ pub fn hud_quads(
                 28.0,
                 10.0,
                 loadout.banked as f32 / world,
-                MANA_WHITE,
+                mana_c,
             );
         }
         win_tick(&mut quads, &pf);
@@ -1920,7 +1944,7 @@ pub fn hud_quads(
             let Some((hp, cargo)) = *slot else { continue };
             let y = 2.0 * i as f32;
             thin_bar(&mut quads, &pf, BAR_X, 12.0 + y, hp, LIFE_RED);
-            thin_bar(&mut quads, &pf, BAR_X, 30.0 + y, cargo, MANA_WHITE);
+            thin_bar(&mut quads, &pf, BAR_X, 30.0 + y, cargo, mana_c);
         }
     }
 
@@ -1971,7 +1995,7 @@ pub fn hud_quads(
             28.0,
             10.0,
             loadout.mana_max as f32 / world,
-            METER_GREY,
+            meter_c,
         );
         bar(
             &mut quads,
@@ -1980,7 +2004,7 @@ pub fn hud_quads(
             28.0,
             10.0,
             loadout.mana as f32 / world,
-            MANA_WHITE,
+            mana_c,
         );
         win_tick(&mut quads, &pf);
     }
@@ -2070,8 +2094,16 @@ pub fn hud_quads(
             let mx = px + 4.0 * s;
             let my = (2.0 + 36.0) * s;
             let partial = (56.0 * (mana % cost) as f32 / cost as f32).floor();
-            quads.push(solid([mx, my, partial * s, 4.0 * s], METER_GREY));
-            meter_dots(&mut quads, mx, my, s, s, (mana / cost).min(54) as usize);
+            quads.push(solid([mx, my, partial * s, 4.0 * s], meter_c));
+            meter_dots(
+                &mut quads,
+                mx,
+                my,
+                s,
+                s,
+                (mana / cost).min(54) as usize,
+                mana_c,
+            );
             // Locked equipped spell (retail `DrawSpellIcon_2E260`
             // UI:398-405): the manifestation's +136 — the SELECTED
             // tier's `maxManaLimit` castle prerequisite — is nonzero
@@ -2108,8 +2140,16 @@ pub fn hud_quads(
             let mx = px + 4.0 * s; // sub_23D40 a1+4
             let my = (2.0 + 36.0) * s; // a2+36
             let partial = (56.0 * (mana % cost) as f32 / cost as f32).floor();
-            quads.push(solid([mx, my, partial * s, 4.0 * s], METER_GREY));
-            meter_dots(&mut quads, mx, my, s, s, (mana / cost).min(54) as usize);
+            quads.push(solid([mx, my, partial * s, 4.0 * s], meter_c));
+            meter_dots(
+                &mut quads,
+                mx,
+                my,
+                s,
+                s,
+                (mana / cost).min(54) as usize,
+                mana_c,
+            );
             // Locked equipped spell (sub_23D40 :27767): the same fog
             // wash as the book cell covers the whole panel while the
             // castle_req isn't met — the equipped hand tells you it

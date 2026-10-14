@@ -20620,6 +20620,12 @@ impl World {
     /// caller is a debt of the identity slice, which resolves the seat
     /// from the record, tag or walk slot in hand instead.
     /// Retail's local player — see [`Gen::local_seat`].
+    /// The wizard seat (colour slot, 0-based) human `hx` flies —
+    /// retail's local index; 0 except under `--seat`.
+    pub fn human_wizard_seat(&self, hx: Hx) -> u8 {
+        self.g.human_seat(hx)
+    }
+
     /// Seat `hx`'s walk view ([`crate::engine::features::SeatView`]).
     pub(crate) fn view(&self, hx: Hx) -> &crate::engine::features::SeatView {
         self.g.view(hx)

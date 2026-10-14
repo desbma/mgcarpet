@@ -973,7 +973,9 @@ pub fn map_stamps_from_poses(
         };
         let icon = match (p.class, p.model) {
             (3, 2) => icons.castle[team].as_ref(),
-            (3, 3) if p.team == Some(0) || beyond_sight => icons.balloon[team].as_ref(),
+            // "Own" is the local human's, at whatever seat he flies
+            // (`--seat`) — not seat 0.
+            (3, 3) if p.player_owned || beyond_sight => icons.balloon[team].as_ref(),
             // expose-jar-spells: pickable jars (MC1 class 12, MC2
             // class-15 tokens; owned manifestations never reach the
             // pose list) tag with their spell's icon. The debug

@@ -630,6 +630,18 @@ fn scan_mc2_slots() -> Vec<(String, bool)> {
         .collect()
 }
 
+/// The HUD bars' team colour pair for the human flying wizard `seat`
+/// (`ui::hud_quads`): MC1/HW's `byte_99B58` pair through the level
+/// palette. Seat 0 — every launch but `--seat` — and MC2 keep the
+/// HUD's tuned white/grey (`None`).
+fn hud_team_colors(seat: u8, level: &LoadedLevel) -> Option<([f32; 4], [f32; 4])> {
+    if seat == 0 || level.game == mgc_sim::ids::GameId::Mc2 {
+        return None;
+    }
+    let colors = entities::roster_team_colors(level.game, level.mc2_env, &level.palette_rgba);
+    Some(colors[(seat as usize).min(7)])
+}
+
 /// Resolve the package's wizards.json into per-slot rival configs
 /// (MC1: the 8 x 216-byte level-record tail — aggression/accuracy/
 /// tempo + the two 24-spell masks; the AI's book = pregrant &&
@@ -7514,6 +7526,7 @@ impl App {
                         is_mc2,
                         mc2_book.as_ref(),
                         self.cfg.gameplay.cheat.dev_spells,
+                        hud_team_colors(w.human_wizard_seat(LOCAL_HX), &sess.level),
                         size.0,
                         size.1,
                     ),
@@ -7682,7 +7695,10 @@ impl App {
                         &sess.level.palette_rgba,
                     );
                     let mut rows: [Option<ui::RosterEntry>; 8] = Default::default();
-                    // Slot 0 = the human. Retail's in-play flag
+                    // The human's row is HIS seat (0 except under
+                    // `--seat`); every other slot is a rival's.
+                    let seat = w.human_wizard_seat(LOCAL_HX).min(7) as usize;
+                    // The human's row. Retail's in-play flag
                     // (+6) clears only when the wizard is OUT of
                     // the level (castle-less death / banishment,
                     // MC1 :48585/:55622, MC2 EF:37663/:37777) —
@@ -7704,22 +7720,22 @@ impl App {
                             })
                             .unwrap_or_else(|| {
                                 if is_mc2 {
-                                    mgc_sim::mc2::rivals::MC2_RIVAL_NAMES[0].into()
+                                    mgc_sim::mc2::rivals::MC2_RIVAL_NAMES[seat].into()
                                 } else {
-                                    mgc_sim::mc1::rivals::RIVAL_NAMES[0].into()
+                                    mgc_sim::mc1::rivals::RIVAL_NAMES[seat].into()
                                 }
                             });
-                        rows[0] = Some(ui::RosterEntry {
+                        rows[seat] = Some(ui::RosterEntry {
                             name,
                             mana: loadout.mana_max,
                             kills: w.player_kill_row(LOCAL_HX),
-                            box_c: colors[0].0,
-                            text_c: colors[0].1,
+                            box_c: colors[seat].0,
+                            text_c: colors[seat].1,
                         });
                     }
                     for r in w.rival_views() {
                         let slot = r.slot as usize;
-                        if !r.eliminated && (1..8).contains(&slot) {
+                        if !r.eliminated && slot < 8 && slot != seat {
                             rows[slot] = Some(ui::RosterEntry {
                                 name: r.name.to_string(),
                                 mana: r.mana_max,
@@ -11493,6 +11509,10 @@ fn run_screenshot(
         renderer.set_sight_mist(1.0, anim_turn / 24.0);
     }
     // Spell UI (book grid or HUD), from the level-start loadout.
+    let hud_team = level
+        .world
+        .as_ref()
+        .and_then(|w| hud_team_colors(w.human_wizard_seat(LOCAL_HX), &level));
     if let (Some(assets), Some(w)) = (&level.ui, &mut level.world) {
         // invincible/ghost/inert=false: a single headless frame
         // takes no damage and trips nothing.
@@ -11538,6 +11558,7 @@ fn run_screenshot(
                 shot_is_mc2,
                 mc2_book.as_ref(),
                 dev_spells,
+                hud_team,
                 1280.0,
                 960.0,
             )
