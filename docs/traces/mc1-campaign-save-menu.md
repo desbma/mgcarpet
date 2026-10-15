@@ -392,7 +392,9 @@ Menu→level: :59992-94 stops sfx (`sub_5D010_5D520`) + music
 (`sub_20E60_20E60`) before the launch; level entry (:41550-56)
 reloads snds0 + music0 and the in-level loop starts a random song 1-3
 (:41578-82 `pseudoRand%3 + 1` = the cgame cycle we already ship).
-Multiplayer screen (:60004-06) plays song 1 (cgame1); returning to it
+⚠ CORRECTED 2026-10-15 (`mc1-multiplayer-lobby.md` §10): :60004-06 is the
+post-level SCORE screen, the multiplayer screen plays no music, and the
+song-4 return branch never runs. Original note: Multiplayer screen (:60004-06) plays song 1 (cgame1); returning to it
 replays 4 (:59803).
 
 Ported 2026-07-18 (frontend/gameplay separation): `frontend_music()`

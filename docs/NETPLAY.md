@@ -94,7 +94,8 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
    each change before Start. ⏭ 1b: the **available spell set** as a rule
    (a limited arsenal for every seat — sim-side withholding, MC2's
    `BlockedSpells` is the precedent; MC1 has none).
-2. **AI opponents on/off** (a port option; retail always fills). Needs the
+2. **AI opponents on/off** (a port option: retail NEVER fills network
+   seats with AI in either game — MC1 recon §, MC2 EF:38449). Needs the
    win condition re-read with no rivals (last castle standing).
 3. **In-game connect + lobby UI — its own development (player, 10-15).**
    Use the RETAIL lobby: both games' main menus have a Multiplayer button,
@@ -104,19 +105,52 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
    hotkeys, selector quick-select), never the collected spells: everyone
    gets the same arsenal, and the available spell set is itself a fairness
    option (a deliberately limited arsenal). Leads: MC1 button 3 → menu
-   sel 4, multiplayer screen at remc1 :60004 (song 1), validity gate
+   sel 4, the PMULTI screen `sub_4D680` (:59382; no music), validity gate
    :58861, `frontend_mc1.rs` `hot_id` (id 3); MC2 `Button::Multiplayer`
    (362,72) in `frontend.rs`, remc2 `MenusAndIntros.cpp` / `Network.cpp`.
-   Also needed: Host / Join (address entry, recent
+   Retail recon: `docs/traces/mc1-multiplayer-lobby.md`, `mc2-multiplayer-lobby.md`
+   (10-15). Also needed: Host / Join (address entry, recent
    hosts), the seat chooser, the ruleset page, Start. ⚖ No LAN
    autodiscovery (player, 10-15): it would not carry past the LAN anyway —
    connect by typed address + recent hosts; finding games later is a
    service (rendezvous / lobby server), its own track.
+   **⚖ Lobby rulings (player, 10-15) — the first lobby is MC2's:**
+   1. Only the host (server) changes parameters.
+   2. Every client must AGREE to the rules — a consensus.
+   3. Any host change to an option voids EVERY agreement (no last-second
+      switcheroo).
+   4. The host can KICK any client (misbehaving, refusing to agree).
+   5. No chat / in-game messaging (the retail "I" key) — players talk
+      over voice (Discord) these days.
+   6. A session needs a PASSPHRASE to enter: the host hands out hostname +
+      passphrase, and can change it (a kicked player can't come back).
+      Maybe optional later; required for now.
+   7. Only the host sets the level and presses Play. The level is part of
+      the rules everyone agrees to; Play is possible only once everyone
+      has agreed.
+   8. Wizards (the totems) are first come, first served: a wizard someone
+      holds can't be chosen by anyone else.
+   9. The rules get shown in the lobby somehow — design open (the player
+      wants the lobby art in front of him first). The first working
+      version doesn't show them.
+   10. After a game: back to the lobby, same players and settings; everyone
+      approves Play again (or the host changes things).
+   Lobby art renders: `sprite-export/mc2-lobby/` (bg, 8 wizard portraits,
+   sprite sheet).
+
 4. **Desync recovery.** Detection exists (24-tick hash). Next: a
    divergence report (which part of the state differs), then the host's
    snapshot wins (save-format world snapshot over the wire, client
    reloads and re-simulates the turns it already holds).
-5. Later: host handover; per-seat flight models; `Gen::local_seat()`
+5. Later: 🏦 **spectator ghosts** (player idea, 10-15, banked — "a cherry
+   on top"): a BANISHED player rises from his last corpse as a visible
+   in-game ghost (mostly translucent, greyscale or another filter), flies
+   freely and watches the rest of the battle, but can neither touch nor be
+   touched. Starting points: the `ghost`/`inert` cheats (unseen,
+   no triggers) and the greyscale death look. Open: other players see the
+   ghost, so its flight must stay in the lockstep as a seat that cannot
+   interact, not a local-only camera.
+   Also later: host handover; per-seat flight models; `Gen::local_seat()`
    per peer; level end / campaign; more than two seats.
 
 ## Playtest log
