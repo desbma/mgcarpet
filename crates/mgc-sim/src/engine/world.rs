@@ -20482,6 +20482,47 @@ impl World {
         mc1.chain(mc2).collect()
     }
 
+    /// The other human seats as the [`Self::rival_views`] shape — what
+    /// one peer sees of the rest (name tag, Beyond Sight reveal, map
+    /// roster). Every human but `local`; the name is the seat's
+    /// retail table name (no entered names travel yet). Read from the
+    /// seat's carpet record, so a world without one shows none.
+    pub fn human_views(&self, local: Hx) -> Vec<RivalView> {
+        self.players
+            .ixs()
+            .filter(|&hx| hx != local)
+            .filter_map(|hx| {
+                let e = &self.g.ent[self.human_pose_home(hx)?];
+                let slot = self.g.human_seat(hx);
+                let name = if self.game == GameId::Mc2 {
+                    crate::mc2::rivals::MC2_RIVAL_NAMES[slot as usize]
+                } else {
+                    crate::mc1::rivals::RIVAL_NAMES[slot as usize]
+                };
+                let mm = self.players[hx].owned[4] as usize;
+                Some(RivalView {
+                    slot,
+                    name,
+                    alive: self.human_state(hx) == LifeState::Alive && !self.lost,
+                    eliminated: self.lost,
+                    x: e.x as f32 / 256.0,
+                    z: e.y as f32 / 256.0,
+                    alt: e.z as f32 / 256.0,
+                    mana: self.human_mana(hx),
+                    mana_max: self.human_mana_max(hx),
+                    life_frac: self.human_life(hx).clamp(0, PLAYER_LIFE_MAX) as f32
+                        / PLAYER_LIFE_MAX as f32,
+                    kills: self.player_kill_row(hx),
+                    invisible: self.human_invisible(hx),
+                    metamorphed: self.game == GameId::Mc2
+                        && mm != 0
+                        && mm < self.g.ent.len()
+                        && self.g.ent[mm].f26 > 0,
+                })
+            })
+            .collect()
+    }
+
     /// The human's owner tag ([`Gen::human_tag`]): his carpet's pool
     /// slot, or the out-of-pool sentinel `0xFFFF` in a world with no
     /// carpet record.

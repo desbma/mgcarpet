@@ -5353,7 +5353,9 @@ impl App {
             };
             // The Beyond-Sight rival reveal: the name labels (+ MC2's
             // position pixel), gated by the live tier.
-            let rival_views = w.rival_views();
+            // Netplay: the other humans tag, reveal and roster like rivals.
+            let mut rival_views = w.rival_views();
+            rival_views.extend(w.human_views(local_hx()));
             let (reveal_dots, reveal_stamps) = entities::rival_reveals(
                 level.game,
                 &rival_views,
@@ -7895,7 +7897,7 @@ impl App {
                             text_c: colors[seat].1,
                         });
                     }
-                    for r in w.rival_views() {
+                    for r in w.rival_views().into_iter().chain(w.human_views(local_hx())) {
                         let slot = r.slot as usize;
                         if !r.eliminated && slot < 8 && slot != seat {
                             rows[slot] = Some(ui::RosterEntry {
@@ -12988,6 +12990,37 @@ mod net_lockstep_tests {
                     _ => [44, 273][usize::from(seen)],
                 };
                 assert_eq!(rows, vec![expect], "{game}: seat {} drawn wrong", seen + 1);
+            }
+        }
+    }
+
+    /// Each peer sees the other human the way it sees a rival: tagged
+    /// and on the map roster under the seat's retail name.
+    #[test]
+    fn each_human_sees_the_other_on_tag_and_roster() {
+        for game in ["mc1", "mc2"] {
+            let Some(mut sim) = (0..25).find_map(|i| peer_sim(&level(game, i), &[0, 1])) else {
+                eprintln!("skipping: no baked {game} level seats two humans");
+                continue;
+            };
+            for _ in 0..4 {
+                sim.step_seats(&[FlightInput::default(); 2]);
+            }
+            let w = sim.world.as_ref().unwrap();
+            for (viewer, seen) in [(Hx(1), 0u8), (Hx::FIRST, 1)] {
+                let views = w.human_views(viewer);
+                assert_eq!(views.len(), 1, "{game}: one other human");
+                let v = &views[0];
+                let name = match game {
+                    "mc2" => mgc_sim::mc2::rivals::MC2_RIVAL_NAMES[usize::from(seen)],
+                    _ => mgc_sim::mc1::rivals::RIVAL_NAMES[usize::from(seen)],
+                };
+                assert_eq!((v.slot, v.name), (seen, name), "{game}");
+                assert!(v.alive && !v.eliminated && !v.invisible, "{game}");
+                assert!(
+                    w.rival_views().iter().all(|r| r.slot != seen),
+                    "{game}: a human seat is no rival"
+                );
             }
         }
     }
