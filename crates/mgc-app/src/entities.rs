@@ -2292,7 +2292,7 @@ pub fn roster_team_colors(
 /// framebuffer. Decode here so the display round-trips back to the
 /// palette color. (Atlas SPRITES are unaffected: their textures are
 /// sRGB-typed and decode on sample.)
-fn srgb_lin(b: u8) -> f32 {
+pub(crate) fn srgb_lin(b: u8) -> f32 {
     let c = b as f32 / 255.0;
     if c <= 0.04045 {
         c / 12.92
@@ -3301,7 +3301,7 @@ mod tests {
         use mgc_sim::engine::world::RivalView;
         RivalView {
             slot,
-            name,
+            name: name.to_string(),
             alive: true,
             eliminated: false,
             x: 10.0,

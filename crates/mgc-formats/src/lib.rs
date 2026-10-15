@@ -153,7 +153,11 @@ pub const FORMAT_VERSION: u32 = 2;
 ///    bank's asset corrections applied (MC2: the troglodyte's
 ///    uncropped canvas, formerly the runtime patch option
 ///    `mc2_troglodyte_sprite_crop`). The app requires it.
-pub const BAKE_EPOCH: u32 = 27;
+/// 28: `assets/mc2-ui` gains the multiplayer lobby (HSCREEN0 case 7):
+///    `lobby-bg.bin` / `lobby-pal.bin`, `lobby-sprites.{bin,json}` and
+///    the eight wizard portraits (`lobby-portraits.{bin,json}`,
+///    `lobby-portrait-pals.bin`).
+pub const BAKE_EPOCH: u32 = 28;
 
 /// Which original game an asset belongs to. Serialized as the short
 /// tags used in `meta.json`.

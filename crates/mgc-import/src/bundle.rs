@@ -1646,6 +1646,37 @@ pub fn bake_mc2_worldmap(
         &serde_json::to_vec_pretty(&mpacked.index).expect("menu sprite index serializes"),
     )?;
 
+    // The multiplayer lobby — HSCREEN0 case 7 (epoch 28): its own
+    // 640×480 background + palette + 33-sprite bank, and the eight
+    // wizard portraits (pixels back to back, each with its own
+    // palette; the rects in `lobby-portraits.json`).
+    let lobby = crate::hscreen::lobby(&file)
+        .map_err(|e| BakeError::Level(Path::new(rel).to_path_buf(), 0, e))?;
+    emit("lobby-bg.bin", &lobby.bg)?;
+    emit("lobby-pal.bin", &lobby.palette)?;
+    let lpacked = sprites::pack(&lobby.sprites, UI_ATLAS_WIDTH);
+    emit("lobby-sprites.bin", &lpacked.atlas)?;
+    emit(
+        "lobby-sprites.json",
+        &serde_json::to_vec_pretty(&lpacked.index).expect("lobby sprite index serializes"),
+    )?;
+    let mut px = Vec::new();
+    let mut pals = Vec::new();
+    let mut rects = Vec::new();
+    for p in &lobby.portraits {
+        rects.push(serde_json::json!({
+            "x": p.x, "y": p.y, "w": p.w, "h": p.h, "offset": px.len(),
+        }));
+        px.extend_from_slice(&p.px);
+        pals.extend_from_slice(&p.palette);
+    }
+    emit("lobby-portraits.bin", &px)?;
+    emit("lobby-portrait-pals.bin", &pals)?;
+    emit(
+        "lobby-portraits.json",
+        &serde_json::to_vec_pretty(&rects).expect("portrait rects serialize"),
+    )?;
+
     // FONT1 glyph masks (GetFont(1) — the frontend text font: level
     // descriptions, dialog titles, slot labels). Same shape as the
     // per-variant font.bin: 1-bit coverage masks, glyph id = char+1,

@@ -40,6 +40,16 @@ pub enum MenuAction {
     },
     LoadFrom(usize),
     SetName(String),
+    /// Multiplayer → Host: open a lobby on `port`.
+    Host {
+        port: String,
+        passphrase: String,
+    },
+    /// Multiplayer → Join: connect to `addr`.
+    Join {
+        addr: String,
+        passphrase: String,
+    },
     Quit,
 }
 
@@ -55,6 +65,19 @@ fn ok_rect(x1: f32, y1: f32, h: f32) -> (f32, f32, f32, f32) {
 fn cancel_rect(x1: f32, y1: f32, h: f32) -> (f32, f32, f32, f32) {
     (x1 + DIALOG_W - 12.0 - 39.0, y1 + h - 30.0, 39.0, 30.0)
 }
+/// The network scroll's clickable rows: Host, Join, the address/port
+/// field, the passphrase field, two recent hosts.
+fn net_rows(x1: f32, y1: f32) -> [(f32, f32, f32, f32); 6] {
+    [
+        (x1 + 40.0, y1 + 30.0, 50.0, 14.0),
+        (x1 + 120.0, y1 + 30.0, 50.0, 14.0),
+        (x1 + 15.0, y1 + 48.0, 190.0, 14.0),
+        (x1 + 15.0, y1 + 64.0, 190.0, 14.0),
+        (x1 + 15.0, y1 + 84.0, 190.0, 14.0),
+        (x1 + 15.0, y1 + 98.0, 190.0, 14.0),
+    ]
+}
+
 fn in_rect(mx: f32, my: f32, r: (f32, f32, f32, f32)) -> bool {
     mx >= r.0 && mx < r.0 + r.2 && my >= r.1 && my < r.1 + r.3
 }
@@ -114,7 +137,33 @@ enum Modal {
     },
     /// Exit confirm ((352,26) h 80, title 407 "Exit").
     ExitConfirm,
+    /// Multiplayer: retail's "Enter Network Session" scroll (title 412)
+    /// widened for the port's entry — Host / Join, the address (the
+    /// port when hosting), the passphrase, recent hosts.
+    Network {
+        host: bool,
+        addr: String,
+        port: String,
+        pass: String,
+        /// The field taking keystrokes: 0 address/port, 1 passphrase.
+        focus: u8,
+        recent: Vec<String>,
+    },
+    /// "Attempting Connection" (title 413): no buttons, the busy
+    /// cursor (case-4 sprites 40-49) — retail `WaitToConnect_7C230`.
+    Connecting,
+    /// A one-line notice with OK (a refused join, a kick).
+    Message { text: String },
 }
+
+/// The network scroll's box (x1, y1, w, h) — retail anchors the session
+/// scroll at (430,78); the port's is wider and centred.
+const NET_BOX: (f32, f32, f32, f32) = (210.0, 110.0, 220.0, 150.0);
+/// The message scroll's box (x1, y1, w); its height follows the
+/// wrapped text ([`MainMenu::message_layout`]).
+const MSG_BOX: (f32, f32, f32) = (190.0, 150.0, 260.0);
+/// The message scroll's line pitch.
+const MSG_LH: f32 = 12.0;
 
 pub struct MainMenu {
     atlas: Vec<u8>,
@@ -251,7 +300,9 @@ impl MainMenu {
     pub fn editing(&self) -> bool {
         matches!(
             &self.modal,
-            Some(Modal::Name { .. }) | Some(Modal::Slots { edit: Some(_), .. })
+            Some(Modal::Name { .. })
+                | Some(Modal::Slots { edit: Some(_), .. })
+                | Some(Modal::Network { .. })
         )
     }
 
@@ -261,6 +312,9 @@ impl MainMenu {
     /// sets `selected_8` on button id 11; retail plays no click
     /// sample in that arm, only in the mouse one).
     pub fn escape(&mut self) {
+        if matches!(self.modal, Some(Modal::Connecting)) {
+            return;
+        }
         if self.modal.is_some() {
             self.press_cancel();
         } else {
@@ -272,6 +326,25 @@ impl MainMenu {
     /// 0-9, letters), uppercased, max 12 (MI:4848-73); slot labels
     /// max 15.
     pub fn key_char(&mut self, c: char) {
+        if let Some(Modal::Network {
+            host,
+            addr,
+            port,
+            pass,
+            focus,
+            ..
+        }) = &mut self.modal
+        {
+            let (field, ok, max) = match (*focus, *host) {
+                (0, true) => (port, c.is_ascii_digit(), 5),
+                (0, false) => (addr, c.is_ascii_alphanumeric() || ".:-[]".contains(c), 40),
+                _ => (pass, c.is_ascii_alphanumeric() || "-_.!?".contains(c), 24),
+            };
+            if ok && field.len() < max {
+                field.push(c);
+            }
+            return;
+        }
         if !(c == ' ' || c.is_ascii_alphanumeric()) {
             return;
         }
@@ -290,6 +363,20 @@ impl MainMenu {
 
     pub fn key_backspace(&mut self) {
         match &mut self.modal {
+            Some(Modal::Network {
+                host,
+                addr,
+                port,
+                pass,
+                focus,
+                ..
+            }) => {
+                match (*focus, *host) {
+                    (0, true) => port.pop(),
+                    (0, false) => addr.pop(),
+                    _ => pass.pop(),
+                };
+            }
             Some(Modal::Name { buf }) => {
                 buf.pop();
             }
@@ -318,8 +405,18 @@ impl MainMenu {
                     s.0 = e;
                 }
             }
+            Some(Modal::Network {
+                focus: focus @ 0, ..
+            }) => *focus = 1,
             Some(_) => self.press_ok(),
             None => {}
+        }
+    }
+
+    /// Tab: the network scroll's other field.
+    pub fn key_tab(&mut self) {
+        if let Some(Modal::Network { focus, .. }) = &mut self.modal {
+            *focus ^= 1;
         }
     }
 
@@ -338,6 +435,38 @@ impl MainMenu {
             Modal::ExitConfirm => {
                 self.sounds.push(SND_CLICK);
                 self.pending = Some(MenuAction::Quit);
+                self.modal = None;
+            }
+            Modal::Network {
+                host,
+                addr,
+                port,
+                pass,
+                ..
+            } => {
+                // Both fields are required (ruling 6: a session has a
+                // passphrase); an empty one clicks and stays.
+                self.sounds.push(SND_CLICK);
+                let target = if *host { &*port } else { &*addr };
+                if target.is_empty() || pass.is_empty() {
+                    return;
+                }
+                self.pending = Some(if *host {
+                    MenuAction::Host {
+                        port: port.clone(),
+                        passphrase: pass.clone(),
+                    }
+                } else {
+                    MenuAction::Join {
+                        addr: addr.clone(),
+                        passphrase: pass.clone(),
+                    }
+                });
+                self.modal = None;
+            }
+            Modal::Connecting => {}
+            Modal::Message { .. } => {
+                self.sounds.push(SND_CLICK);
                 self.modal = None;
             }
             Modal::Slots {
@@ -367,6 +496,9 @@ impl MainMenu {
     /// The Cancel button: close the dialog, keep the state (with the
     /// click sample — retail plays it on the keyboard arm too).
     fn press_cancel(&mut self) {
+        if matches!(self.modal, Some(Modal::Connecting)) {
+            return;
+        }
         if self.modal.take().is_some() {
             self.sounds.push(SND_CLICK);
         }
@@ -381,6 +513,36 @@ impl MainMenu {
             selected: None,
             edit: None,
         });
+    }
+
+    /// Open the network scroll (Multiplayer), seeded with the last
+    /// entries and the recent hosts.
+    pub fn open_network(&mut self, recent: Vec<String>, port: String, pass: String) {
+        self.modal = Some(Modal::Network {
+            host: recent.is_empty(),
+            addr: recent.first().cloned().unwrap_or_default(),
+            port,
+            pass,
+            focus: 0,
+            recent,
+        });
+    }
+
+    /// "Attempting Connection" while a join is under way.
+    pub fn open_connecting(&mut self) {
+        self.modal = Some(Modal::Connecting);
+    }
+
+    /// A notice with OK (replaces whatever dialog is up).
+    pub fn open_message(&mut self, text: String) {
+        self.modal = Some(Modal::Message { text });
+    }
+
+    /// The app closes the connecting scroll once the join resolved.
+    pub fn close_connecting(&mut self) {
+        if matches!(self.modal, Some(Modal::Connecting)) {
+            self.modal = None;
+        }
     }
 
     /// Open the name-entry dialog seeded with the current name.
@@ -415,7 +577,8 @@ impl MainMenu {
             Button::Save => return Some("save"),
             Button::Load => return Some("load"),
             Button::Exit => self.modal = Some(Modal::ExitConfirm),
-            Button::Multiplayer | Button::SetKeys | Button::Language | Button::Joystick => {
+            Button::Multiplayer => return Some("network"),
+            Button::SetKeys | Button::Language | Button::Joystick => {
                 println!("main menu: that button is not part of this remake (yet)");
             }
         }
@@ -423,9 +586,59 @@ impl MainMenu {
     }
 
     fn modal_click(&mut self, mx: f32, my: f32) {
+        // The message scroll's height follows its wrapped text.
+        let msg_h = match &self.modal {
+            Some(Modal::Message { text }) => self.message_layout(text).1,
+            _ => 0.0,
+        };
         let Some(modal) = &mut self.modal else { return };
         // Each modal's dialog box, for the shared OK/Cancel rects.
+        if let Modal::Network {
+            host,
+            addr,
+            focus,
+            recent,
+            ..
+        } = modal
+        {
+            let (x1, y1, w, h) = NET_BOX;
+            for (k, r) in net_rows(x1, y1).into_iter().enumerate() {
+                if !in_rect(mx, my, r) {
+                    continue;
+                }
+                match k {
+                    0 => *host = true,
+                    1 => *host = false,
+                    2 => *focus = 0,
+                    3 => *focus = 1,
+                    _ => match recent.get(k - 4) {
+                        Some(a) if !*host => {
+                            *addr = a.clone();
+                            *focus = 1;
+                        }
+                        _ => return,
+                    },
+                }
+                self.sounds.push(SND_CLICK);
+                return;
+            }
+            if in_rect(mx, my, ok_rect(x1, y1, h)) {
+                self.press_ok();
+            } else if in_rect(mx, my, cancel_rect(x1 + w - DIALOG_W, y1, h)) {
+                self.press_cancel();
+            }
+            return;
+        }
         let (x1, y1, h) = match modal {
+            Modal::Connecting => return,
+            Modal::Message { .. } => {
+                let (x1, y1, _) = MSG_BOX;
+                if in_rect(mx, my, ok_rect(x1, y1, msg_h)) {
+                    self.press_ok();
+                }
+                return;
+            }
+            Modal::Network { .. } => unreachable!("handled above"),
             Modal::Name { .. } => (356.0 - DIALOG_W / 2.0, 112.0, 80.0),
             Modal::ExitConfirm => (352.0 - DIALOG_W / 2.0, 26.0, 80.0),
             // Retail anchors: Save (78,160), Load (448,160).
@@ -511,17 +724,49 @@ impl MainMenu {
             .sum()
     }
 
+    /// A message wrapped at word bounds to the scroll's width, and the
+    /// scroll's height: the lines plus room for the OK button below.
+    fn message_layout(&self, text: &str) -> (Vec<String>, f32) {
+        let max = MSG_BOX.2 - 30.0;
+        let mut lines: Vec<String> = Vec::new();
+        for word in text.split_whitespace() {
+            match lines.last_mut() {
+                Some(l) if self.text_width(&format!("{l} {word}")) <= max => {
+                    l.push(' ');
+                    l.push_str(word);
+                }
+                _ => lines.push(word.to_string()),
+            }
+        }
+        let h = 22.0 + MSG_LH * lines.len() as f32 + 34.0;
+        (lines, h.max(80.0))
+    }
+
     /// The retail unrolled-scroll dialog panel at (x1,y1), open to
     /// `openh` (DrawScrollDialog2 law — the roller bar at the top
     /// AND the animated bottom edge, a solid parchment fill with
     /// vertical edge lines between them; ONE scroll, not a stack).
     fn parchment(&self, x1: f32, y1: f32, openh: f32, scale: f32, out: &mut Vec<UiQuad>) {
-        let (bar_w, bar_h) = self
+        self.parchment_w(x1, y1, DIALOG_W, openh, scale, out);
+    }
+
+    /// [`Self::parchment`] `bar_w` wide — the roller bar stretched (the
+    /// port's wider dialogs; at `DIALOG_W` it is the retail scroll).
+    fn parchment_w(
+        &self,
+        x1: f32,
+        y1: f32,
+        bar_w: f32,
+        openh: f32,
+        scale: f32,
+        out: &mut Vec<UiQuad>,
+    ) {
+        let bar_h = self
             .rects
             .get(72)
             .copied()
             .flatten()
-            .map_or((DIALOG_W, 12.0), |(_, _, w, h)| (w, h));
+            .map_or(12.0, |(_, _, _, h)| h);
         let solid = |r: [f32; 4], tint: [f32; 4]| UiQuad {
             rect: [r[0] * scale, r[1] * scale, r[2] * scale, r[3] * scale],
             uv: [0.0; 4],
@@ -535,11 +780,11 @@ impl MainMenu {
             out.push(solid([x1 + 10.0, top, 1.0, openh], edge));
             out.push(solid([x1 + bar_w - 12.0, top, 1.0, openh], edge));
         }
-        if let Some(q) = self.sprite(72, (x1, y1), scale) {
-            out.push(q);
-        }
-        if let Some(q) = self.sprite(72, (x1, y1 + openh), scale) {
-            out.push(q);
+        for y in [y1, y1 + openh] {
+            if let Some(mut q) = self.sprite(72, (x1, y), scale) {
+                q.rect[2] = bar_w * scale;
+                out.push(q);
+            }
         }
     }
 
@@ -549,6 +794,23 @@ impl MainMenu {
         let ink = [88.0 / 255.0, 64.0 / 255.0, 36.0 / 255.0, 1.0];
         if let Some(t) = self.strings.get(idx) {
             let tx = x1 + 10.0 + (DIALOG_W - 22.0 - self.text_width(t)) / 2.0;
+            out.extend(self.text(t, tx, y1 + 14.0, ink, scale));
+        }
+    }
+
+    /// [`Self::dialog_title`] centred over a `w`-wide dialog.
+    fn centred_title(
+        &self,
+        idx: usize,
+        x1: f32,
+        y1: f32,
+        w: f32,
+        scale: f32,
+        out: &mut Vec<UiQuad>,
+    ) {
+        let ink = [88.0 / 255.0, 64.0 / 255.0, 36.0 / 255.0, 1.0];
+        if let Some(t) = self.strings.get(idx) {
+            let tx = x1 + (w - self.text_width(t)) / 2.0;
             out.extend(self.text(t, tx, y1 + 14.0, ink, scale));
         }
     }
@@ -640,6 +902,99 @@ impl MainMenu {
                 self.dialog_title(407, x1, y1, scale, &mut quads);
                 self.ok_cancel(x1, y1, h, (mx, my), scale, &mut quads);
             }
+            Some(Modal::Network {
+                host,
+                addr,
+                port,
+                pass,
+                focus,
+                recent,
+            }) => {
+                let (x1, y1, w, h) = NET_BOX;
+                let ink = [88.0 / 255.0, 64.0 / 255.0, 36.0 / 255.0, 1.0];
+                let white = [1.0, 1.0, 1.0, 1.0];
+                self.parchment_w(x1, y1, w, h, scale, &mut quads);
+                self.centred_title(412, x1, y1, w, scale, &mut quads);
+                let rows = net_rows(x1, y1);
+                for (k, word) in [(0, "Host"), (1, "Join")] {
+                    let on = (k == 0) == *host;
+                    let r = rows[k];
+                    quads.extend(self.text(word, r.0, r.1, if on { white } else { ink }, scale));
+                }
+                let field = |label: &str, value: &str, focused: bool| {
+                    let mut v = value.to_string();
+                    if focused && caret_on {
+                        v.push('_');
+                    }
+                    (format!("{label}:"), v)
+                };
+                let lines = [
+                    field(
+                        if *host { "Port" } else { "Address" },
+                        if *host { port } else { addr },
+                        *focus == 0,
+                    ),
+                    field("Passphrase", pass, *focus == 1),
+                ];
+                for (k, (label, value)) in lines.iter().enumerate() {
+                    let r = rows[2 + k];
+                    quads.extend(self.text(label, r.0, r.1, ink, scale));
+                    let on = *focus as usize == k;
+                    quads.extend(self.text(
+                        value,
+                        r.0 + 75.0,
+                        r.1,
+                        if on { white } else { ink },
+                        scale,
+                    ));
+                }
+                if !*host {
+                    for (k, a) in recent.iter().take(2).enumerate() {
+                        let r = rows[4 + k];
+                        let hov = in_rect(mx, my, r);
+                        quads.extend(self.text(
+                            &format!("> {a}"),
+                            r.0,
+                            r.1,
+                            if hov { white } else { ink },
+                            scale,
+                        ));
+                    }
+                }
+                let (ok, ca) = (ok_rect(x1, y1, h), cancel_rect(x1 + w - DIALOG_W, y1, h));
+                quads.extend(self.sprite(
+                    if in_rect(mx, my, ok) { 71 } else { 70 },
+                    (ok.0, ok.1),
+                    scale,
+                ));
+                quads.extend(self.sprite(
+                    if in_rect(mx, my, ca) { 69 } else { 68 },
+                    (ca.0, ca.1),
+                    scale,
+                ));
+            }
+            Some(Modal::Connecting) => {
+                let (x1, y1, h) = (430.0, 78.0, 80.0);
+                self.parchment(x1, y1, h, scale, &mut quads);
+                self.dialog_title(413, x1, y1, scale, &mut quads);
+            }
+            Some(Modal::Message { text }) => {
+                let (x1, y1, w) = MSG_BOX;
+                let (lines, h) = self.message_layout(text);
+                let ink = [88.0 / 255.0, 64.0 / 255.0, 36.0 / 255.0, 1.0];
+                self.parchment_w(x1, y1, w, h, scale, &mut quads);
+                for (k, t) in lines.iter().enumerate() {
+                    let tx = x1 + (w - self.text_width(t)) / 2.0;
+                    let ty = y1 + 22.0 + MSG_LH * k as f32;
+                    quads.extend(self.text(t, tx, ty, ink, scale));
+                }
+                let ok = ok_rect(x1, y1, h);
+                quads.extend(self.sprite(
+                    if in_rect(mx, my, ok) { 71 } else { 70 },
+                    (ok.0, ok.1),
+                    scale,
+                ));
+            }
             Some(Modal::Slots {
                 save,
                 open,
@@ -677,7 +1032,14 @@ impl MainMenu {
         // Cursor (case-4 sprite 39). In authored space like every
         // other quad here — the letterbox translation below puts it
         // back under the real pointer.
-        if let Some((sx, sy, w, h)) = self.rects.get(39).copied().flatten() {
+        // While connecting: the busy cursor, sprites 40-49 stepping
+        // every 4 ticks of the 100 Hz clock (retail WaitToConnect).
+        let cursor_spr = if matches!(self.modal, Some(Modal::Connecting)) {
+            40 + (self.anim * 25.0) as usize % 10
+        } else {
+            39
+        };
+        if let Some((sx, sy, w, h)) = self.rects.get(cursor_spr).copied().flatten() {
             quads.push(UiQuad {
                 rect: [cursor.0 * scale, cursor.1 * scale, w * scale, h * scale],
                 uv: [sx, sy, w, h],
@@ -720,6 +1082,27 @@ mod tests {
         m.key_enter();
         assert_eq!(m.take_action(), Some(MenuAction::Quit));
         assert!(m.modal.is_none());
+    }
+
+    /// A long notice (a refused join) wraps at word bounds to the
+    /// scroll's width, the scroll grows to hold it, and its OK still
+    /// answers below the text.
+    #[test]
+    fn a_long_message_wraps_and_its_ok_still_works() {
+        let mut m = bare();
+        let text = "net: the host refused: a player named Zanzamar is already in this \
+                    game - pick another name (Set Name)";
+        let (lines, h) = m.message_layout(text);
+        assert!(lines.len() > 1, "wrapped");
+        assert!(lines.iter().all(|l| m.text_width(l) <= MSG_BOX.2 - 30.0));
+        assert_eq!(
+            lines.join(" "),
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+        m.open_message(text.into());
+        let ok = ok_rect(MSG_BOX.0, MSG_BOX.1, h);
+        m.modal_click(ok.0 + 2.0, ok.1 + 2.0);
+        assert!(m.modal.is_none(), "OK closed it");
     }
 
     #[test]

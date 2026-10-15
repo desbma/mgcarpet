@@ -50,6 +50,103 @@ const MENU_SPRITE_INDEX: (usize, usize) = (271_062, 411);
 const FMV_FONT_POOL: (usize, usize) = (0x164FCD, 860);
 const FMV_FONT_INDEX: (usize, usize) = (0x165329, 548);
 
+// The `case 7` (multiplayer lobby, `sub_77680`) chunk table — contiguous
+// in the file (docs/traces/mc2-multiplayer-lobby.md §2.2): palette
+// (768 raw), background (RNC → 640×480), sprite pool, sprite TAB.
+const LOBBY_PALETTE: (usize, usize) = (0x42471, 768);
+const LOBBY_BG: (usize, usize) = (0x42771, 82_233);
+const LOBBY_SPRITE_POOL: (usize, usize) = (0x568AA, 21_216);
+const LOBBY_SPRITE_INDEX: (usize, usize) = (0x5BB8A, 148);
+/// The eight wizard portraits (`str_E1BAC_0x2ec`, MenusAndIntros.cpp
+/// :229-238): image chunk (RNC → raw w×h, 0/0xFF transparent), its own
+/// palette (768 raw), and the doorway rect it lands in.
+const LOBBY_PORTRAITS: [(usize, usize, usize, u16, u16, u16, u16); 8] = [
+    (0x5BC1E, 0x32D0, 0x76BBD, 0xF4, 0x85, 0x88, 0x15C),
+    (0x5EEEE, 0x3282, 0x76EBD, 0xD0, 0x81, 0xB4, 0x160),
+    (0x62170, 0x3BE3, 0x771BD, 0xE2, 0x90, 0x96, 0x151),
+    (0x65D53, 0x42B6, 0x774BD, 0xE0, 0x6F, 0xA4, 0x172),
+    (0x6A009, 0x3029, 0x777BD, 0xEC, 0x70, 0x9C, 0x171),
+    (0x6D032, 0x2E89, 0x77ABD, 0xE0, 0x87, 0xB4, 0x160),
+    (0x6FEBB, 0x3BDC, 0x77DBD, 0xDD, 0x84, 0xA5, 0x15D),
+    (0x73A97, 0x3126, 0x780BD, 0xF0, 0x8B, 0x8C, 0x156),
+];
+
+/// One lobby wizard portrait.
+pub struct Portrait {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+    /// w×h 8bpp, row-major; 0 and 0xFF are transparent.
+    pub px: Vec<u8>,
+    /// The portrait's own 6-bit palette (it supplies entries 159-254
+    /// and the wizard's colour pair 148/149).
+    pub palette: [u8; 768],
+}
+
+/// The decoded multiplayer lobby screen (`case 7`).
+pub struct Lobby {
+    /// 640×480 8bpp row-major palette indices.
+    pub bg: Vec<u8>,
+    /// 256×RGB 6-bit components.
+    pub palette: [u8; 768],
+    /// The 33-record lobby bank (lit buttons 1-7, cursor 15, …).
+    pub sprites: Vec<DecodedSprite>,
+    pub portraits: Vec<Portrait>,
+}
+
+fn palette_chunk(file: &[u8], at: (usize, usize), what: &str) -> Result<[u8; 768], String> {
+    chunk(file, at, what)?
+        .try_into()
+        .map_err(|_| format!("HSCREEN0: {what} chunk is not 768 bytes"))
+}
+
+/// Decode the multiplayer lobby screen (`case 7`) out of the raw
+/// HSCREEN0 file bytes.
+pub fn lobby(file: &[u8]) -> Result<Lobby, String> {
+    let bg = chunk(file, LOBBY_BG, "lobby background")?;
+    if bg.len() != SCREEN_W * SCREEN_H {
+        return Err(format!(
+            "HSCREEN0: lobby background decoded to {} bytes (want {})",
+            bg.len(),
+            SCREEN_W * SCREEN_H
+        ));
+    }
+    let palette = palette_chunk(file, LOBBY_PALETTE, "lobby palette")?;
+    let pool = chunk(file, LOBBY_SPRITE_POOL, "lobby sprite pool")?;
+    let index = chunk(file, LOBBY_SPRITE_INDEX, "lobby sprite index")?;
+    let sprites = crate::hspr::decode(&pool, &index)
+        .map_err(|e| format!("HSCREEN0: lobby sprite bank: {e}"))?;
+    let portraits = LOBBY_PORTRAITS
+        .iter()
+        .enumerate()
+        .map(|(k, &(img, len, pal, x, y, w, h))| {
+            let px = chunk(file, (img, len), "lobby portrait")?;
+            if px.len() != usize::from(w) * usize::from(h) {
+                return Err(format!(
+                    "HSCREEN0: portrait {k} decoded to {} bytes (want {w}×{h})",
+                    px.len()
+                ));
+            }
+            let palette = palette_chunk(file, (pal, 768), "portrait palette")?;
+            Ok(Portrait {
+                x,
+                y,
+                w,
+                h,
+                px,
+                palette,
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    Ok(Lobby {
+        bg,
+        palette,
+        sprites,
+        portraits,
+    })
+}
+
 /// The decoded world-map screen assets.
 pub struct WorldMap {
     /// 1280×960 8bpp row-major palette indices.
@@ -343,6 +440,30 @@ mod tests {
             .filter(|&i| b[i] != 0)
             .count();
         assert_eq!(center, 0, "frame center is transparent");
+    }
+
+    /// The lobby (case 7) chunk table against the pristine install.
+    #[test]
+    fn lobby_decodes() {
+        let found = crate::gamedata::Gamedata::locate(std::path::Path::new("../../gamedata"));
+        let Some(src) = found.mc2 else { return };
+        let file = src
+            .read("DATA/SCREENS/HSCREEN0.DAT")
+            .expect("HSCREEN0.DAT readable");
+        let l = lobby(&file).expect("lobby chunks decode");
+        assert_eq!(l.bg.len(), 640 * 480);
+        assert!(l.palette.iter().all(|&c| c < 64), "palette is 6-bit");
+        assert_eq!(l.sprites.len(), 33, "lobby bank entry count");
+        for idx in [1, 2, 4, 5, 6, 7, 15] {
+            let s = &l.sprites[idx];
+            assert!(s.width > 0 && s.height > 0, "lobby sprite {idx} present");
+        }
+        assert_eq!(l.portraits.len(), 8);
+        assert_eq!((l.portraits[0].w, l.portraits[0].h), (136, 348));
+        // Each portrait palette carries its wizard's colour pair at
+        // 148/149 — wizard 1 is green (the recon §2.2.3 writes it in hex).
+        let p = &l.portraits[1].palette;
+        assert_eq!(&p[148 * 3..149 * 3], &[0, 0x26, 0]);
     }
 
     /// The FMV subtitle font against the pristine install: the bank

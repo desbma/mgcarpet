@@ -86,8 +86,8 @@ impl MenuState {
         self.pinned = specs
             .iter()
             .map(|s| match settings::preset_group(s.cfg_path) {
-                Some(g) => g.members.iter().any(|m| crate::rules::pin_of(m).is_some()),
-                None => crate::rules::pin_of(s.cfg_path).is_some(),
+                Some(g) => g.members.iter().any(|m| crate::rules::locked_in_game(m)),
+                None => crate::rules::locked_in_game(s.cfg_path),
             })
             .collect();
     }
@@ -729,7 +729,7 @@ mod tests {
             .collect();
         assert!(!presets.is_empty());
         for (i, g) in presets {
-            let pinned = g.members.iter().any(|m| crate::rules::pin_of(m).is_some());
+            let pinned = g.members.iter().any(|m| crate::rules::locked_in_game(m));
             assert_eq!(!row_live(&st, &specs, i), pinned, "{}", g.cfg_path);
         }
     }

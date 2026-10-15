@@ -1556,6 +1556,30 @@ impl World {
         }
     }
 
+    /// Seat a NETWORK game's roster (the port's netplay): every human
+    /// at his seat across all eight (a network game seats the joined
+    /// count, not the level's wizard count), each with the level book,
+    /// and AI wizards in the first `ai` free seats the level authors a
+    /// rival for (retail's network game seats none; the count is the
+    /// session's rule). Same per-seat arms as
+    /// [`World::seat_mc1_wizards`].
+    pub fn seat_mc1_net(&mut self, human_book: &[u8], configs: &[Option<RivalConfig>; 8], ai: u8) {
+        let mut left = ai;
+        for slot in 0..8u8 {
+            if let Some(hx) = self.hx_at_wizard(slot) {
+                self.mc1_spawn_human_record(hx);
+                if !human_book.is_empty() {
+                    self.grant_level_book(hx, human_book);
+                }
+            } else if left > 0
+                && let Some(cfg) = &configs[slot as usize]
+            {
+                self.spawn_rival(slot, cfg.clone());
+                left -= 1;
+            }
+        }
+    }
+
     /// ⭐ THE HUMAN'S OWN POOL RECORD, seated where retail seats it —
     /// the MC1 twin of [`World::mc2_spawn_human_record`] (round 112),
     /// added in round 153 for `init-check`'s native build and wired

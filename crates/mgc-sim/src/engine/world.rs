@@ -364,6 +364,13 @@ pub struct Player {
     /// mc2l15 t=24152 slot 719 and t=24184 slot 314, `b46` retail 176 /
     /// port 0, the human having died earlier in the take.
     pub(crate) mc2_respawn_timer_reg: u32,
+    /// A NETWORK game banished this seat: it died with no castle, and
+    /// in a multi-human world that is retail's banishment ("has been
+    /// banished from the realm", MC2 string 283), not the single-player
+    /// level restart — the seat stays a corpse, never respawns, and the
+    /// game goes on without it (the port keeps the player's machine in
+    /// the lockstep, watching, until the game ends).
+    pub(crate) banished: bool,
 }
 
 impl Default for Player {
@@ -402,6 +409,7 @@ impl Default for Player {
             hit_flash: 0,
             lost: false,
             mc2_respawn_timer_reg: 0,
+            banished: false,
         }
     }
 }
@@ -447,6 +455,7 @@ impl std::hash::Hash for Player {
             hit_flash,
             lost,
             mc2_respawn_timer_reg: mc2_respawn_timer,
+            banished,
         } = self;
         (mana, mana_max, mana_delta, banked, world_mana, left, right).hash(h);
         (owned, shield, invisible, rebound, beyond_sight, heal_active).hash(h);
@@ -456,6 +465,10 @@ impl std::hash::Hash for Player {
         // Transparent at pristine — the `life_rate` / `death_owned_blue`
         // shape. 0 until the human's first death, so every fixture and
         // golden whose human never dies keeps its hash byte-identical.
+        // Transparent at pristine: only a network game ever banishes.
+        if *banished {
+            banished.hash(h);
+        }
         if *mc2_respawn_timer != 0 {
             mc2_respawn_timer.hash(h);
         }
@@ -1559,6 +1572,10 @@ pub struct Notification {
     /// the same tag takes its place instead of stacking. `None` =
     /// an event line (deaths, eliminations, level-ups), which stack.
     pub tag: Option<NotifyTag>,
+    /// The one human seat the line is FOR (retail kept a message per
+    /// player: a spell pick or a level-up is its own player's news);
+    /// `None` = everyone (deaths, eliminations).
+    pub seat: Option<Hx>,
 }
 
 /// A posed entity's place in a multipart body: segments link toward
@@ -1772,7 +1789,9 @@ pub struct BlastView {
 #[derive(Debug, Clone)]
 pub struct RivalView {
     pub slot: u8,
-    pub name: &'static str,
+    /// The table name; the app overrides a networked human's with his
+    /// own (presentation only).
+    pub name: String,
     pub alive: bool,
     pub eliminated: bool,
     /// Live position, tile units.
@@ -13750,6 +13769,9 @@ impl World {
     /// respawn at the castle; castle-less in single player = the
     /// lost + level-over flags — the level restarts.
     fn player_respawn(&mut self, hx: Hx) {
+        if self.banish_instead(hx, self.player_castle_bound(hx).is_some()) {
+            return;
+        }
         // :54842 — the respawn's FIRST statement is the same rebuild
         // the landing runs, and it is what puts retail's re-minted
         // spell tokens on the slots the scatter just freed (mc1l42
@@ -14444,6 +14466,56 @@ impl World {
         self.set_human_pose(hx, (player.x, player.y, z));
     }
 
+    /// A respawn request in a NETWORK game (several human seats): a
+    /// castle-less seat is BANISHED instead of restarting the level for
+    /// everyone (retail's network arm: string 283, the wizard removed —
+    /// SMold:51387-95), and a banished seat never respawns. True = the
+    /// respawn must not run. Single player (one seat) never banishes.
+    fn banish_instead(&mut self, hx: Hx, has_castle: bool) -> bool {
+        if self.players[hx].banished {
+            return true;
+        }
+        if self.players.len() < 2 || has_castle {
+            return false;
+        }
+        self.players[hx].banished = true;
+        let seat = usize::from(self.g.human_seat(hx).min(7));
+        let name = if self.game == GameId::Mc2 {
+            crate::mc2::rivals::MC2_RIVAL_NAMES[seat]
+        } else {
+            crate::mc1::rivals::RIVAL_NAMES[seat]
+        };
+        self.set_notification(
+            format!("{name} has been banished from the realm."),
+            100,
+            [0xFF, 0, 0],
+        );
+        true
+    }
+
+    /// Has a network game banished seat `hx`? (see `banish_instead`)
+    pub fn banished(&self, hx: Hx) -> bool {
+        self.players[hx].banished
+    }
+
+    /// The wizards still in a network game: the humans not banished and
+    /// the rivals not eliminated — the app ends the game when one side
+    /// alone stands (or no human does).
+    pub fn contenders(&self) -> (Vec<Hx>, Vec<u8>) {
+        let humans = self
+            .players
+            .ixs()
+            .filter(|&hx| !self.banished(hx))
+            .collect();
+        let rivals = self
+            .rival_views()
+            .into_iter()
+            .filter(|r| !r.eliminated)
+            .map(|r| r.slot)
+            .collect();
+        (humans, rivals)
+    }
+
     /// `sub_5C950` (EF:43630) driven by PlayerAction 0xF — the HUMAN
     /// arm (`IsAiPlayer != 1`, so `actionIndex = 0` and the fresh-join
     /// block at EF:43744-43822 is skipped).
@@ -14464,6 +14536,9 @@ impl World {
     /// pass, which is why mc2l3 shows `mana_max` unchanged at 82,157
     /// straight across the reset while `mana` lands on 750.
     fn mc2_player_respawn(&mut self, hx: Hx) {
+        if self.banish_instead(hx, self.seat_castle(hx).is_some()) {
+            return;
+        }
         self.g.mc2_rebuild_free(&self.mc2_carpet_slots());
         let dest = match self.seat_castle(hx) {
             Some(c) => {
@@ -20438,7 +20513,7 @@ impl World {
             let e = &self.g.ent[r.ent as usize];
             RivalView {
                 slot: r.slot,
-                name: crate::mc1::rivals::RIVAL_NAMES[r.slot as usize],
+                name: crate::mc1::rivals::RIVAL_NAMES[r.slot as usize].to_string(),
                 alive: e.tick70 == 1 && !r.eliminated,
                 eliminated: r.eliminated,
                 x: e.x as f32 / 256.0,
@@ -20461,7 +20536,7 @@ impl World {
             let mm = r.book.ent[4] as usize;
             RivalView {
                 slot: r.slot,
-                name: crate::mc2::rivals::MC2_RIVAL_NAMES[r.slot as usize],
+                name: crate::mc2::rivals::MC2_RIVAL_NAMES[r.slot as usize].to_string(),
                 alive: e.tick70 == 1 && !r.eliminated,
                 eliminated: r.eliminated,
                 x: e.x as f32 / 256.0,
@@ -20502,7 +20577,7 @@ impl World {
                 let mm = self.players[hx].owned[4] as usize;
                 Some(RivalView {
                     slot,
-                    name,
+                    name: name.to_string(),
                     alive: self.human_state(hx) == LifeState::Alive && !self.lost,
                     eliminated: self.lost,
                     x: e.x as f32 / 256.0,
@@ -25315,7 +25390,18 @@ impl World {
     /// (retail's level-up path uses 200, the select toast 20), inked
     /// `color` (RGB). Event lines stack (see [`World::notifications`]).
     pub(crate) fn set_notification(&mut self, text: impl Into<String>, ticks: u16, color: [u8; 3]) {
-        self.push_notification(text.into(), ticks, color, None);
+        self.push_notification(text.into(), ticks, color, None, None);
+    }
+
+    /// [`Self::set_notification`] for one seat's player only.
+    pub(crate) fn set_seat_notification(
+        &mut self,
+        hx: Hx,
+        text: impl Into<String>,
+        ticks: u16,
+        color: [u8; 3],
+    ) {
+        self.push_notification(text.into(), ticks, color, None, Some(hx));
     }
 
     /// A REPLACING line: takes the place of any live line with the same
@@ -25328,7 +25414,19 @@ impl World {
         ticks: u16,
         color: [u8; 3],
     ) {
-        self.push_notification(text.into(), ticks, color, Some(tag));
+        self.push_notification(text.into(), ticks, color, Some(tag), None);
+    }
+
+    /// [`Self::set_notification_tagged`] for one seat's player only.
+    pub(crate) fn set_seat_notification_tagged(
+        &mut self,
+        hx: Hx,
+        tag: NotifyTag,
+        text: impl Into<String>,
+        ticks: u16,
+        color: [u8; 3],
+    ) {
+        self.push_notification(text.into(), ticks, color, Some(tag), Some(hx));
     }
 
     /// The stack law: a live line with the same tag, or the same text,
@@ -25340,9 +25438,12 @@ impl World {
         ticks: u16,
         color: [u8; 3],
         tag: Option<NotifyTag>,
+        seat: Option<Hx>,
     ) {
+        // The refresh law runs per audience: another seat's line with
+        // the same tag is not this one's predecessor.
         self.notifications
-            .retain(|n| n.text != text && (tag.is_none() || n.tag != tag));
+            .retain(|n| n.seat != seat || (n.text != text && (tag.is_none() || n.tag != tag)));
         if self.notifications.len() >= NOTIFY_MAX {
             self.notifications.remove(0);
         }
@@ -25351,6 +25452,7 @@ impl World {
             timer: ticks,
             color,
             tag,
+            seat,
         });
     }
 
@@ -25368,6 +25470,15 @@ impl World {
     pub fn notifications(&self) -> impl Iterator<Item = (&str, [u8; 3])> {
         self.notifications
             .iter()
+            .map(|n| (n.text.as_str(), n.color))
+    }
+
+    /// The live lines seat `hx`'s player sees (everyone's + his own),
+    /// oldest first.
+    pub fn notifications_for(&self, hx: Hx) -> impl Iterator<Item = (&str, [u8; 3])> {
+        self.notifications
+            .iter()
+            .filter(move |n| n.seat.is_none_or(|s| s == hx))
             .map(|n| (n.text.as_str(), n.color))
     }
 
@@ -27216,6 +27327,10 @@ impl Snap for Player {
             hit_flash,
             lost,
             mc2_respawn_timer_reg: mc2_respawn_timer,
+            // ⚠ Not in the snapshot: only a network game banishes, and
+            // a network game is never saved (the reconciliation stage
+            // will add it with a SNAPSHOT_VERSION bump).
+            banished: _,
         } = self;
         w.put(mana);
         w.put(mana_max);
@@ -27286,6 +27401,7 @@ impl Snap for Player {
             hit_flash: r.get()?,
             lost: r.get()?,
             mc2_respawn_timer_reg: r.get()?,
+            banished: false,
         })
     }
 }

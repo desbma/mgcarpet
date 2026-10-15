@@ -8,6 +8,34 @@ authority, retail's own model of shipping inputs only.
 
 ## Running it
 
+**In the game (MC2):** `mgcarpet --campaign mc2` → the temple's
+Multiplayer button → the "Enter Network Session" scroll: **Host** (a port,
+default 7777) or **Join** (the host's address; recent hosts listed), plus
+the passphrase → the lobby (retail HSCREEN0 case 7, `lobby_mc2.rs`):
+- totems = previous/next free wizard (your seat); the doorway shows your
+  portrait, the lintel windows every member incl. you (bright = agreed,
+  dim = not; hover one for the player's name); the lintel's left box (by
+  the figure) = the player limit (the host cycles it), right box (by the
+  ring) = players in;
+- the session rules on a parchment scroll at the right (`LOBBY_RULES`):
+  the host steps each row left/right (its first row is the passphrase),
+  clients read them;
+- client: the Play plaque agrees / takes the agreement back;
+- host: the level arrows (arenas 50-59), Play once everyone agreed, click a
+  lit window to kick (confirmed); the host's options (the scroll or the P
+  menu) ARE the rules — an edit reaches everyone and voids the agreements;
+- names: each member carries his campaign's player name (MC2 Set Name /
+  MC1's save name) — the in-game tags, map reveals and roster show it;
+  empty = the wizard's own name;
+- Exit (or Esc) leaves (the host: closes the lobby).
+In the game: the host's Esc → exit ends it for everyone (back to the
+lobby); a client's leaves the session. A won level returns to the lobby.
+The campaign steps aside for a lobby game (no campaign book — every seat
+gets the level's own — and no campaign progress or saves). Entries
+persist in `saves/netplay.json` (recent hosts, port, passphrase).
+
+**From the CLI:**
+
 ```
 mgcarpet --level baked/mc1/level-002.mgcl --host            # seat 1, port 7777, all interfaces
 mgcarpet --join 127.0.0.1                                    # seat 2 (the host assigns it)
@@ -22,6 +50,13 @@ mgcarpet --join 127.0.0.1                                    # seat 2 (the host 
   and prints which of his own options they override. Both must run the
   **same binary** (the handshake compares a hash of the executable); a
   mismatch is a refusal.
+- `--passphrase WORD`: the session's passphrase (host sets, joiner must
+  match; empty when omitted). Not a secret — just keeps strangers and kicked
+  players out.
+- Under the hood the CLI goes through the LOBBY (`lobby.rs` +
+  `net::Host`/`net::Guest`, protocol 2): `--join` agrees to the host's rules
+  by itself and `--host` presses Play once it has. The in-game lobby UI
+  drives the same calls.
 - Not with `--campaign`, `--replay`, `--record`, `--film`,
   `--set-spellbook` or the headless modes.
 
@@ -48,12 +83,23 @@ The session rules are one table, `rules::PINS` (`crates/mgc-app/src/rules.rs`):
 the host's values for those config paths travel in the Welcome and every
 peer plays by them.
 
-- **Sync** (the worlds fork without it): `sim` (incl. game speed — a faster
-  peer would only stall on turns), `gameplay.patches`, `gameplay.cheat`,
-  `controls.models`, `dev.plausible_spellbook`.
+- **Sync** (the worlds fork without it): `sim` (incl. game speed),
+  `gameplay.patches`, `gameplay.cheat`, `dev.plausible_spellbook`.
 - **Fair** (shows one seat more than another): fog distance, rival tags,
   owned buildings + jar spells on the map, map extent fog, beyond-sight
   areas, creature health bars, autoaim hints, trigger-area overlay.
+- ⚖ **The session's values** (player, 10-15): a multiplayer game runs
+  every pin at its DEFAULT — no cheats, the port's fixes (retail gameplay
+  may be unplayable without them), the aids and debug overlays as shipped
+  (MC2: rival tags and houses on the map on), the dev sim parameters off —
+  save `rules::HOST_CHOSEN` (the fog), the host's pick on the lobby's
+  scroll. `rules::session` builds it; the HOST plays by it too.
+- **Per seat**: the flight models (thrust / altitude) are each player's
+  own (designed near-equivalent): each member's travels with Start and the
+  sim flies every carpet with its own (`App::apply_net_models`); frozen in
+  a game (`rules::locked_in_game`). The one world-level arm keyed on the
+  altitude model, `mc2_leviathan_high_lunge`, is on when ANY seat flies
+  the enhanced lift (`App::world_patches_now`).
 - Everything else is the player's own (bindings, mouse, audio, the spell
   selector, autofire, look-only render options). ⚖ Autofire and the fly
   assistant are preferences (player, 10-15); the table gets fine-tuned
@@ -92,8 +138,9 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
    never persisted (see "Pinned for the session"). Today the host's own
    config IS the ruleset; the lobby (step 3) becomes its editor, sending
    each change before Start. ⏭ 1b: the **available spell set** as a rule
-   (a limited arsenal for every seat — sim-side withholding, MC2's
-   `BlockedSpells` is the precedent; MC1 has none).
+   (a limited arsenal for every seat — sim-side withholding). ⚖ MC1 ONLY
+   (player, 10-15): MC2's arenas make their own spell selection by which
+   jars they place; MC1 gives everyone everything.
 2. **AI opponents on/off** (a port option: retail NEVER fills network
    seats with AI in either game — MC1 recon §, MC2 EF:38449). Needs the
    win condition re-read with no rivals (last castle standing).
@@ -178,3 +225,98 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
   fog pin kill-switch-proved), `menu::tests::session_pins_lock_their_rows`;
   Xvfb two-app smoke: the joiner's `--fog-distance 70` overridden by the
   host's 40 (reported), 19/19 hash traces identical. Playtest deferred to the lobby (player, 10-15).
+- 2026-10-15 #5 (lobby core, no UI yet): `lobby::LobbyCore` (host model:
+  members, first-come wizards, rules revision, agreements, Play gate,
+  reopen) + `net::Host` / `net::Guest` (passphrase + build handshake, kick,
+  snapshot broadcast per change, Start) + `Lockstep` on the session's
+  connections with `end()` → back to the lobby (ruling 10); late joiners
+  refused mid-game. Lobby capacity `MAX_PLAYERS` = 2 (the lockstep is
+  N-seat; >2 humans in one world unproven). Tests: 6 lobby + 5 socket
+  tests (passphrase/build refusal, agreement void, kick + passphrase
+  change, first-come wizard, game → lobby → second game + late-join
+  refusal); kill-switch proved on the passphrase check and the stale-rev
+  guard. Xvfb two-app run via the CLI lobby: wrong passphrase refused,
+  right one in, 21/21 hash traces identical.
+- 2026-10-15 #6 (MC2 lobby UI): bake epoch 28 (`assets/mc2-ui/lobby-*`,
+  HSCREEN0 case 7 + 8 portraits); `lobby_mc2::LobbyScreen` (retail art,
+  palette windows as tinted masks — tints decoded to linear via
+  `entities::srgb_lin`, the swapchain is sRGB); the temple's Multiplayer
+  scroll (Host/Join/address/port/passphrase/recents, "Attempting
+  Connection" with the busy cursor, a message scroll for refusals); app
+  flow (`NetLobby`, `start_net_game`, `net_game_over`). Fixed on the way:
+  `load_level` refused seat 2 on the five arenas whose header says 1 player
+  (51/52/55/56/57) — a multi-seat launch now checks the start markers only
+  (test `every_mc2_arena_seats_two_humans`, kill-switch proved). Xvfb +
+  xdotool two-app run through the real UI: host, join (a doubled
+  passphrase was refused), agree, Play, 187 ticks / 8 of 8 hash checks
+  agreed, the host's exit → both back in the lobby with the agreement
+  cleared. ⏭ playtest.
+- 2026-10-15 #7 (playtest round on the lobby): (1) campaign names travel
+  (Hello/Start, protocol 3) and replace the table names on tags/roster
+  (`name_humans`; `RivalView::name` is a `String` now); (2) your own lintel
+  window lights too; (3) the lintel boxes = limit (left, host cycles,
+  `LobbyCore::set_capacity`) / players in (right); the passphrase moved to
+  the rules scroll; (4) the rules scroll (`LOBBY_RULES`, 17 pins +
+  passphrase; `settings::step` steps any Spec one notch; "Fixes" = port /
+  retail / custom). Tests: names travel, limit holds, scroll rows are all
+  pins and read, step, name override. Xvfb shots: names on hover, both
+  scrolls. ⏭ playtest.
+- 2026-10-15 #8 (playtest round 2 on the lobby): (1) the fog's left
+  chevron steps down (the click split the row, both chevrons sat in its
+  right half); (2) the limit cycles 2..8 — `MAX_PLAYERS` 8 after
+  `four_mc2_peers_stay_identical` / `three_mc1_peers_stay_identical` (the
+  real lobby, mixed per-seat models, 1,200 ticks identical); (3) the
+  session's values: defaults but the host's fog (`rules::session`), the
+  scroll shows passphrase + fog only; (4) per-seat flight models. Xvfb:
+  limit 8→2→3→4, fog 90→70→50. ⏭ playtest.
+- 2026-10-15 #9 (playtest, two windows on one desktop): after Play the
+  BACKGROUND window grabbed the pointer (an X11 grab is global) while the
+  focused one kept the keyboard — Esc went to the window not holding the
+  pointer, so neither could be freed. Fixed in `set_grab`: an unfocused
+  window never grabs; it arms the existing focus-gated wish (`boot_grab`),
+  completed when the window is focused (click / alt-tab). The map's
+  confinement got the same gate. Xvfb: the client logs "the grab waits for
+  this window's focus", the focused host grabs. ⏭ playtest.
+- 2026-10-15 #10 (playtest round 3): (1) a spell pick's toast and chime
+  reached every human — notifications now carry an optional seat
+  (`set_seat_notification*`, `World::notifications_for`; the MC2 pick and
+  level-up are seat-scoped, deaths stay global) and the app plays only its
+  own seat's PLAYER sounds (test `a_spell_pick_toasts_and_chimes_for_its_
+  own_player_only`, kill-switch proved); (2) names on the lintel, zigzag
+  at each window (player design: even below, odd above, centred); (3) a
+  taken name is refused at the join, case-blind (`LobbyCore::join`) — a
+  fresh MC2 campaign is "Zanzamar", so two fresh players collide by
+  design. ⏭ open: banishment in MP (interim until the ghost) + the game's
+  end + the AI-wizards rule.
+- 2026-10-15 #11 (banishment, the game's end, AI wizards — player-agreed
+  plan): (1) a castle-less death in a multi-human world BANISHES the seat
+  (`World::banish_instead` at the head of both respawn paths: "<name> has
+  been banished from the realm.", never respawns, no level restart; the
+  flag is `Player::banished`, hashed only once set, NOT in the snapshot —
+  lobby games are never saved); the banished player stays in the lockstep
+  watching ("Banished - waiting for the game to end"), the interim until
+  the spectator ghost; (2) `App::net_standings`: when one wizard alone
+  stands (humans not banished + rivals not eliminated ≤ 1) or no human
+  does, "<winner> is victorious!" and the fade takes everyone back to the
+  lobby; (3) "AI wizards" 0..(8 − players) on the rules scroll
+  (`LobbyCore::set_ai`, a rule — voids agreements; default 0 = retail),
+  seated by `World::seat_mc*_net` in the first free authored colours — all
+  eight colours seat humans now (a "1-player" arena header no longer
+  drops the second human's record). Given names replace table names in
+  event lines. Tests: banish (MC1+MC2, kill-switch proved), AI count (MC2
+  "1-player" arena 51 + MC1 50), lobby AI cap; 633/633 fixtures, 1,621
+  tests. The CLI `--host/--join` keeps the authored roster. ⏭ playtest.
+- 2026-10-15 #12: (1) the temple's message scroll wraps at word bounds and
+  grows to the text (`MainMenu::message_layout`) — the duplicate-name
+  refusal no longer runs off the scroll; (2) the session's fog now reaches
+  the CLIENT's renderer: adopting rules set the config only, and the fog
+  lives in the renderer once applied — `App::adopt_rules` re-applies every
+  pin the session changed (and again when the player's own values come
+  back). Xvfb: host fog 20 / client config 90 → the client draws 20.
+  ⏭ OPEN for the next session — **PAUSE IN NETPLAY** (player, 10-15): a
+  pause freezes the game for EVERY peer until the pauser unpauses (the
+  lockstep stalls on his inputs), and pause is today the only way into the
+  in-game menu (options, exit). Needs a design discussion: a menu that
+  does not pause in netplay, a host-only pause, a vote, a pause timeout…
+  (retail refused pause in multiplayer altogether, MC2 trace
+  "MULTIPLAYER_MODE gates").

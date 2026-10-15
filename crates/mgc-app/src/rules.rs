@@ -8,6 +8,16 @@
 //! Everything not in the table is the player's own (bindings, mouse,
 //! audio, the spell selector, look-only render options): it stays
 //! his on every peer.
+//!
+//! ⚖ The session's VALUES (player, 2026-10-15): a multiplayer game runs
+//! every pin at its DEFAULT — no cheats, the port's fixes, the
+//! visibility aids and debug overlays as shipped, the sim's dev
+//! parameters off — save the few the host chooses ([`HOST_CHOSEN`]: the
+//! fog). [`session`] builds that set; the host plays by it too.
+//!
+//! The flight models are each player's own (they are designed to be
+//! near-equivalent), but they steer the sim: each seat's travels with
+//! the game's start, and none may change mid-game ([`locked_in_game`]).
 
 use crate::config::Config;
 use serde_json::Value;
@@ -27,7 +37,6 @@ pub const PINS: &[(&str, Pin)] = &[
     ("sim", Pin::Sync),
     ("gameplay.patches", Pin::Sync),
     ("gameplay.cheat", Pin::Sync),
-    ("controls.models", Pin::Sync),
     ("dev.plausible_spellbook", Pin::Sync),
     ("render.preference.fog_distance", Pin::Fair),
     ("render.preference.rival_tags", Pin::Fair),
@@ -40,15 +49,42 @@ pub const PINS: &[(&str, Pin)] = &[
     ("render.debug.map_trigger_areas", Pin::Fair),
 ];
 
+/// The pins whose session value is the HOST's choice; every other pin
+/// runs at its default.
+pub const HOST_CHOSEN: &[&str] = &["render.preference.fog_distance"];
+
+/// Config paths that are each player's own but steer the sim: carried
+/// per seat at the start, frozen for the game.
+pub const PER_SEAT: &[&str] = &["controls.models"];
+
+/// May `path` not change during a netplay game? (a pin, or per-seat)
+pub fn locked_in_game(path: &str) -> bool {
+    pin_of(path).is_some() || PER_SEAT.iter().any(|p| covers(p, path))
+}
+
+/// `p` is `path` or one of its ancestors.
+fn covers(p: &str, path: &str) -> bool {
+    path == p
+        || path
+            .strip_prefix(p)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// The session's rules from the host's config: every pin at its
+/// default, the [`HOST_CHOSEN`] ones at the host's values.
+pub fn session(host: &Config) -> Value {
+    let mut rules = collect(&Config::default());
+    let theirs = collect(host);
+    for p in HOST_CHOSEN {
+        rules[*p] = theirs[*p].clone();
+    }
+    rules
+}
+
 /// The pin holding `path` (a dotted config path), if any.
 pub fn pin_of(path: &str) -> Option<Pin> {
     PINS.iter()
-        .find(|(p, _)| {
-            path == *p
-                || path
-                    .strip_prefix(p)
-                    .is_some_and(|rest| rest.starts_with('.'))
-        })
+        .find(|(p, _)| covers(p, path))
         .map(|&(_, pin)| pin)
 }
 
@@ -153,6 +189,37 @@ mod tests {
             overridden(&joiner, &collect(&host)),
             ["render.preference.fog_distance", "render.debug.health_bars"]
         );
+    }
+
+    /// A session forces every pin to its default — cheats off, the
+    /// port's fixes, the aids as shipped — but the host's fog.
+    #[test]
+    fn a_session_is_defaults_but_the_hosts_fog() {
+        let mut host = Config::default();
+        host.render.preference.fog_distance = 40;
+        host.gameplay.cheat.invincible = true;
+        host.render.debug.health_bars = !host.render.debug.health_bars;
+        host.gameplay.patches = crate::config::GameplayPatches::retail_all();
+        let mut joiner = Config::default();
+        adopt(&mut joiner, &session(&host)).unwrap();
+        assert_eq!(joiner.render.preference.fog_distance, 40);
+        assert!(!joiner.gameplay.cheat.invincible);
+        assert_eq!(
+            joiner.render.debug.health_bars,
+            Config::default().render.debug.health_bars
+        );
+        assert_eq!(
+            joiner.gameplay.patches,
+            crate::config::GameplayPatches::default()
+        );
+    }
+
+    #[test]
+    fn the_flight_models_are_per_seat_and_frozen_in_a_game() {
+        assert_eq!(pin_of("controls.models.thrust"), None, "not the host's");
+        assert!(locked_in_game("controls.models.thrust"));
+        assert!(locked_in_game("gameplay.cheat.ghost"));
+        assert!(!locked_in_game("controls.preferences.autofire"));
     }
 
     #[test]

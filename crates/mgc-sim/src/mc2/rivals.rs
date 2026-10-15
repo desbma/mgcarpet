@@ -2631,6 +2631,31 @@ impl World {
         }
     }
 
+    /// Seat a NETWORK game's roster (the port's netplay): every human
+    /// at his colour in colour order — all eight colours, retail's
+    /// network game seats the JOINED count, not the header's
+    /// NumberOfPlayers — and AI wizards in the first `ai` free colours
+    /// the level authors a rival for (retail's network game seats none;
+    /// the count is the session's rule). Same per-colour arms as
+    /// [`World::seat_mc2_wizards`].
+    pub fn seat_mc2_net(&mut self, configs: &[Option<Mc2RivalConfig>; 8], ai: u8) {
+        let mut left = ai;
+        for slot in 0..8u8 {
+            if let Some(hx) = self.hx_at_wizard(slot) {
+                let fresh = self.mc2_carpet_slot[hx] == 0;
+                self.mc2_spawn_human_record(hx);
+                if fresh {
+                    self.mc2_seed_default_spells(hx);
+                }
+            } else if left > 0
+                && let Some(cfg) = &configs[slot as usize]
+            {
+                self.mc2_spawn_rival(slot, cfg.clone());
+                left -= 1;
+            }
+        }
+    }
+
     /// `sub_5C950` (EF:43600), the fresh-spawn arm: the (3,1) carpet
     /// at `array_0x2362[color]` raised ground+0x100, base stats, the
     /// AI personality + Life scalar, the book from the map masks,

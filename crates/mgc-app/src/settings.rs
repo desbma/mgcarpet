@@ -490,6 +490,75 @@ macro_rules! toggle {
 
 /// The full registry. Order = summary order (grouped by heading) =
 /// menu row order within each domain tab.
+/// Step `spec`'s value one notch (`forward` = next / up) — the lobby's
+/// left-right rule rows: a toggle flips, a choice cycles past variants
+/// that do not land (a preset's "custom"), a slider moves one `step`,
+/// stops move to the neighbouring stop. False when nothing changed.
+pub fn step(spec: &Spec, cfg: &mut Config, forward: bool) -> bool {
+    match &spec.ctl {
+        Ctl::ReadOnly => false,
+        Ctl::Toggle { set, .. } => match (spec.read)(cfg) {
+            Val::Toggle { on, .. } => {
+                set(cfg, !on);
+                true
+            }
+            _ => false,
+        },
+        Ctl::Choice { set, .. } => {
+            let (cur, n) = match (spec.read)(cfg) {
+                Val::Choice { cur, variants, .. } => (cur, variants.len()),
+                _ => return false,
+            };
+            let mut next = cur;
+            for _ in 1..n {
+                next = if forward {
+                    (next + 1) % n
+                } else {
+                    (next + n - 1) % n
+                };
+                set(cfg, next);
+                if matches!((spec.read)(cfg), Val::Choice { cur, .. } if cur == next) {
+                    return true;
+                }
+            }
+            set(cfg, cur);
+            false
+        }
+        Ctl::Slider {
+            get,
+            set,
+            min,
+            max,
+            step,
+        } => {
+            let v = get(cfg);
+            let to = (v + if forward { *step } else { -*step }).clamp(*min, *max);
+            set(cfg, to);
+            to != v
+        }
+        Ctl::Stops { get, set, stops } => {
+            let v = get(cfg);
+            let i = stops
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (s, _))| s.abs_diff(v))
+                .map_or(0, |(i, _)| i);
+            let j = if forward {
+                (i + 1).min(stops.len().saturating_sub(1))
+            } else {
+                i.saturating_sub(1)
+            };
+            match stops.get(j) {
+                Some(&(to, _)) if to != v => {
+                    set(cfg, to);
+                    true
+                }
+                _ => false,
+            }
+        }
+    }
+}
+
 pub fn registry() -> Vec<Spec> {
     use Class::*;
     use Domain::*;

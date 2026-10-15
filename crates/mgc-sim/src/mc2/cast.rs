@@ -2499,7 +2499,7 @@ impl World {
                 // `sub_6DC40_improve_ability`: on-screen message
                 // (string 159 + 160+idx) + sound 61.
                 let msg = self.mc2_relevel_message(spell);
-                self.set_notification(msg, NOTIFY_TICKS_LEVELUP, NOTIFY_RED);
+                self.set_seat_notification(hx, msg, NOTIFY_TICKS_LEVELUP, NOTIFY_RED);
                 self.g.snd_player(hx, 61);
             }
         }
@@ -2765,7 +2765,8 @@ impl World {
         // ("Possession" / "Mana Magnet" / "Thunderstorm"), so a level-N
         // pick reads as its distinct spell, not a generic label.
         let name = self.mc2_spell_name(s, t as usize);
-        self.set_notification_tagged(
+        self.set_seat_notification_tagged(
+            hx,
             crate::engine::world::NotifyTag::SpellSelect,
             name,
             NOTIFY_TICKS_SELECT,

@@ -114,6 +114,12 @@ const VULCAN_ISLAND: [(usize, (f32, f32)); 12] = [
 /// `LevelsNames_D9204` (EF:2305) — the MC2 level names by level
 /// number (main 0-24, secrets 30-34, multiplayer 50-59), as the
 /// executable carries them (trailing spaces trimmed at the draw).
+/// Retail level `n`'s name (`LevelsNames_D9204`; the arenas 50-59 carry
+/// bare names — the lobby prefixes `n − 49`).
+pub(crate) fn mc2_level_name(n: u32) -> &'static str {
+    MC2_LEVEL_NAMES.get(n as usize).copied().unwrap_or("")
+}
+
 const MC2_LEVEL_NAMES: [&str; 61] = [
     "1. Jahwl",
     "2. Kopahk",

@@ -513,6 +513,13 @@ fn saves_root() -> PathBuf {
     PathBuf::from("saves")
 }
 
+/// The player's netplay entries (recent hosts, last port and
+/// passphrase) — beside the saves, not in the config: they are the
+/// player's history, not a preference.
+pub fn netplay_path() -> PathBuf {
+    saves_root().join("netplay.json")
+}
+
 /// The retail-format path for a slot, per game.
 pub fn retail_path(tag: &str, slot: usize) -> PathBuf {
     retail_path_in(&saves_root(), tag, slot)
