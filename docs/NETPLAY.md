@@ -18,10 +18,10 @@ mgcarpet --join 127.0.0.1                                    # seat 2 (the host 
 - `--join ADDR`: `host:port` or a bare host (port 7777). Retries for 60 s,
   so either side may start first. `--seat N` asks for a seat; without it
   the host assigns seat 2 (seat 1 if the host flies another).
-- The joiner **adopts** the host's level and sim-affecting options
-  (`sim`, `gameplay` incl. patches + cheats, `controls.models`,
-  `dev.plausible_spellbook`). Both must run the **same binary** (the
-  handshake compares a hash of the executable); a mismatch is a refusal.
+- The joiner **adopts** the host's level and the session rules (below),
+  and prints which of his own options they override. Both must run the
+  **same binary** (the handshake compares a hash of the executable); a
+  mismatch is a refusal.
 - Not with `--campaign`, `--replay`, `--record`, `--film`,
   `--set-spellbook` or the headless modes.
 
@@ -44,8 +44,25 @@ mgcarpet --join 127.0.0.1                                    # seat 2 (the host 
 
 ## Pinned for the session
 
-- Sim-affecting options (menu or keys) snap back to the agreed set with a
-  toast; game speed may change (it only paces).
+The session rules are one table, `rules::PINS` (`crates/mgc-app/src/rules.rs`):
+the host's values for those config paths travel in the Welcome and every
+peer plays by them.
+
+- **Sync** (the worlds fork without it): `sim` (incl. game speed — a faster
+  peer would only stall on turns), `gameplay.patches`, `gameplay.cheat`,
+  `controls.models`, `dev.plausible_spellbook`.
+- **Fair** (shows one seat more than another): fog distance, rival tags,
+  owned buildings + jar spells on the map, map extent fog, beyond-sight
+  areas, creature health bars, autoaim hints, trigger-area overlay.
+- Everything else is the player's own (bindings, mouse, audio, the spell
+  selector, autofire, look-only render options). ⚖ Autofire and the fly
+  assistant are preferences (player, 10-15); the table gets fine-tuned
+  over time.
+- In play, a pinned option snaps back with a toast (keys), and its menu row
+  is locked "fixed by the host" — a preset row too when it would set a
+  pinned member (Controls: the flight models; Visuals: fog, tags, map aids).
+- A pinned value is never written to the player's `mgcarpet.json` (it is
+  the host's, not his).
 - Pause (P) stalls BOTH peers and burns no draws (a one-sided draw would
   fork the worlds — the netplay-only exception to the paused-draw law).
 - A castle-less death's level restart ends the tick burst on its tick, so
@@ -70,14 +87,13 @@ mgcarpet --join 127.0.0.1                                    # seat 2 (the host 
 
 Roadmap agreed with the player 2026-10-15 (recommended order):
 
-1. **Session rules from the host.** A lobby phase before the level starts:
-   the host edits one ruleset, clients receive every change, Start freezes
-   it. Two kinds of pin: *determinism* (`sim`, `gameplay.patches`,
-   `gameplay.cheat`, `controls.models` — already adopted at the handshake
-   and re-adopted on a local toggle) and *fairness* (render-side: fog
-   distance, map extent fog, beyond-sight areas, trigger overlays, rival
-   tags/selector surfaces, sight mist; the available spell set). Pinned options show locked in the
-   client's menu.
+1. **Session rules from the host.** ✅ 1a (10-15): `rules::PINS` — sync +
+   fairness pins, adopted at the handshake, held in play, menu-locked,
+   never persisted (see "Pinned for the session"). Today the host's own
+   config IS the ruleset; the lobby (step 3) becomes its editor, sending
+   each change before Start. ⏭ 1b: the **available spell set** as a rule
+   (a limited arsenal for every seat — sim-side withholding, MC2's
+   `BlockedSpells` is the precedent; MC1 has none).
 2. **AI opponents on/off** (a port option; retail always fills). Needs the
    win condition re-read with no rivals (last castle standing).
 3. **In-game connect + lobby UI — its own development (player, 10-15).**
@@ -120,3 +136,11 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
   yet), feeding the tag, the Beyond-Sight map reveal and the roster. Test
   `each_human_sees_the_other_on_tag_and_roster` (kill-switch proved).
   Playtest passed.
+- 2026-10-15 #4 (step 1a, session rules): `rules::PINS` replaces the
+  ad-hoc `net_config`. Fixed on the way: a joiner touching a pinned option
+  used to snap it back AND save the host's value into his own
+  `mgcarpet.json`; `gameplay.enhancement` (spell selector, wheel) was
+  adopted from the host but is a preference. Tests: `rules::tests` (5, the
+  fog pin kill-switch-proved), `menu::tests::session_pins_lock_their_rows`;
+  Xvfb two-app smoke: the joiner's `--fog-distance 70` overridden by the
+  host's 40 (reported), 19/19 hash traces identical. Playtest deferred to the lobby (player, 10-15).

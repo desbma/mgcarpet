@@ -62,6 +62,9 @@ pub struct MenuState {
     /// Each option's value text at `Config::default()` — the
     /// "is this at its default" baseline for the grey/green widget ink.
     default_texts: Vec<String>,
+    /// Rows a netplay session holds fixed (the host's rules): drawn
+    /// locked, never applied.
+    pinned: Vec<bool>,
 }
 
 impl MenuState {
@@ -73,7 +76,20 @@ impl MenuState {
             scroll: 0,
             scroll_acc: 0.0,
             default_texts: specs.iter().map(|s| (s.read)(&d).current_text()).collect(),
+            pinned: vec![false; specs.len()],
         }
+    }
+
+    /// Lock the rows the netplay session pins ([`crate::rules`]); a
+    /// preset row locks when any member it would set is pinned.
+    pub fn pin_session_rules(&mut self, specs: &[Spec]) {
+        self.pinned = specs
+            .iter()
+            .map(|s| match settings::preset_group(s.cfg_path) {
+                Some(g) => g.members.iter().any(|m| crate::rules::pin_of(m).is_some()),
+                None => crate::rules::pin_of(s.cfg_path).is_some(),
+            })
+            .collect();
     }
 
     /// Switch tabs (resets the scroll).
@@ -220,9 +236,12 @@ fn tab_rect(l: &Layout, i: usize) -> [f32; 4] {
     [l.panel[0] + tw * i as f32, l.panel[1], tw, l.tab_h]
 }
 
-/// Is this row's widget interactive in the menu?
-fn row_live(spec: &Spec) -> bool {
-    !matches!(spec.ctl, Ctl::ReadOnly) && spec.mutability() == Mutability::Live
+/// Is row `i`'s widget interactive in the menu?
+fn row_live(st: &MenuState, specs: &[Spec], i: usize) -> bool {
+    let spec = &specs[i];
+    !matches!(spec.ctl, Ctl::ReadOnly)
+        && spec.mutability() == Mutability::Live
+        && !st.pinned.get(i).copied().unwrap_or(false)
 }
 
 /// Scroll the active tab by a (possibly fractional) number of rows —
@@ -269,7 +288,7 @@ pub fn hit_test(
     for row in &l.rows {
         let Some(i) = row.spec else { continue };
         let widget = [l.widget_x, row.y, l.widget_w, l.row_h];
-        if inside(widget, cursor) && row_live(&specs[i]) {
+        if inside(widget, cursor) && row_live(st, specs, i) {
             return Hit::Widget(i);
         }
     }
@@ -513,7 +532,7 @@ pub fn draw(
         }
         let i = row.spec.unwrap();
         let spec = &specs[i];
-        let live = row_live(spec);
+        let live = row_live(st, specs, i);
         let val = (spec.read)(cfg);
         let cur_text = val.current_text();
         let changed = cur_text != st.default_texts[i];
@@ -654,7 +673,9 @@ pub fn draw(
     match hovered {
         Some(i) => {
             let spec = &specs[i];
-            let lock = if spec.mutability() == Mutability::Startup {
+            let lock = if st.pinned.get(i).copied().unwrap_or(false) {
+                " (fixed by the host for this session)"
+            } else if spec.mutability() == Mutability::Startup {
                 " (applies at level load)"
             } else {
                 ""
@@ -681,4 +702,35 @@ pub fn draw(
         }
     }
     quads
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Under netplay the session's pinned rows lock — a preset too
+    /// when it would set a pinned member — and the player's own rows
+    /// stay live.
+    #[test]
+    fn session_pins_lock_their_rows() {
+        let specs = settings::registry();
+        let mut st = MenuState::new(&specs);
+        let at = |path: &str| specs.iter().position(|s| s.cfg_path == path).unwrap();
+        let fog = at("render.preference.fog_distance");
+        let volume = at("audio.music_volume");
+        assert!(row_live(&st, &specs, fog), "free outside netplay");
+        st.pin_session_rules(&specs);
+        assert!(!row_live(&st, &specs, fog), "a fairness pin locks");
+        assert!(row_live(&st, &specs, volume), "a preference stays live");
+        let presets: Vec<_> = specs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| settings::preset_group(s.cfg_path).map(|g| (i, g)))
+            .collect();
+        assert!(!presets.is_empty());
+        for (i, g) in presets {
+            let pinned = g.members.iter().any(|m| crate::rules::pin_of(m).is_some());
+            assert_eq!(!row_live(&st, &specs, i), pinned, "{}", g.cfg_path);
+        }
+    }
 }

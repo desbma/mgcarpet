@@ -24,6 +24,7 @@ mod minimenu;
 mod movie;
 mod net;
 mod replay;
+mod rules;
 mod saves;
 mod settings;
 mod sight;
@@ -3288,25 +3289,17 @@ impl App {
             }
             return;
         }
-        // Netplay: the sim-affecting options are the session's, agreed
-        // at the handshake — a local change would fork the worlds. Put
-        // the agreed set back (game speed only paces; it may change).
+        // Netplay: the pinned options are the session's, agreed at the
+        // handshake (the host's rules) — a local change would fork the
+        // worlds or break fairness. Put the agreed set back.
         if let Some(ls) = &self.net
-            && cfg_path != "sim.options.game_speed"
-            && [
-                "sim.",
-                "gameplay.cheat.",
-                "gameplay.patches.",
-                "controls.models.",
-            ]
-            .iter()
-            .any(|p| cfg_path.starts_with(p))
+            && rules::pin_of(cfg_path).is_some()
         {
             let agreed = ls.config().clone();
-            if let Err(e) = adopt_net_config(&mut self.cfg, &agreed) {
+            if let Err(e) = rules::adopt(&mut self.cfg, &agreed) {
                 eprintln!("{e}");
             }
-            self.mini_toast("netplay: this option is fixed for the session");
+            self.mini_toast("netplay: the host fixed this option for the session");
             return;
         }
         match cfg_path {
@@ -3670,9 +3663,23 @@ impl App {
         }
     }
 
+    /// A fresh options menu; under netplay the session's pinned rows
+    /// come up locked.
+    fn options_menu(&self) -> menu::MenuState {
+        let mut m = menu::MenuState::new(&self.specs);
+        if self.net.is_some() {
+            m.pin_session_rules(&self.specs);
+        }
+        m
+    }
+
     /// Persist one dotted config path's current value (see
     /// [`Self::persist_option`]).
     fn persist_path(&self, cfg_path: &str) {
+        // A session pin holds the HOST's value: never the player's own.
+        if self.net.is_some() && rules::pin_of(cfg_path).is_some() {
+            return;
+        }
         let full = match serde_json::to_value(&self.cfg) {
             Ok(v) => v,
             Err(e) => {
@@ -3725,7 +3732,7 @@ impl App {
                 if self.screen == Screen::Level {
                     self.mini = Some(minimenu::MiniMenu::new());
                 } else {
-                    self.menu = Some(menu::MenuState::new(&self.specs));
+                    self.menu = Some(self.options_menu());
                 }
                 self.menu_grab_restore = self.grabbed;
                 self.set_grab(false);
@@ -3953,6 +3960,10 @@ impl App {
             _ => return false,
         };
         self.apply_option(path);
+        // A session pin was put back (and said so): no "on/off" echo.
+        if self.net.is_some() && rules::pin_of(path).is_some() {
+            return true;
+        }
         // The in-game echo (the retail F3-style live feedback): ride
         // the sim's notification line when a world is up. Set while
         // paused it simply shows once the clock resumes.
@@ -4204,7 +4215,7 @@ impl App {
                 }
             }
             minimenu::Hit::Options => {
-                self.menu = Some(menu::MenuState::new(&self.specs));
+                self.menu = Some(self.options_menu());
             }
             minimenu::Hit::Back => mini.reset_to_root(),
             minimenu::Hit::Slot(i) => {
@@ -12648,27 +12659,6 @@ pub fn game_main(event_loop: Option<EventLoop<()>>) -> std::process::ExitCode {
 
 /// The sim-affecting configuration a netplay host imposes on the
 /// joiner: both peers must build and step identical worlds.
-fn net_config(cfg: &config::Config) -> serde_json::Value {
-    serde_json::json!({
-        "sim": cfg.sim,
-        "gameplay": cfg.gameplay,
-        "models": cfg.controls.models,
-        "plausible_spellbook": cfg.dev.plausible_spellbook,
-    })
-}
-
-fn adopt_net_config(cfg: &mut config::Config, v: &serde_json::Value) -> Result<(), String> {
-    fn take<T: serde::de::DeserializeOwned>(v: &serde_json::Value, k: &str) -> Result<T, String> {
-        serde_json::from_value(v.get(k).cloned().unwrap_or_default())
-            .map_err(|e| format!("net: the host's {k} config: {e}"))
-    }
-    cfg.sim = take(v, "sim")?;
-    cfg.gameplay = take(v, "gameplay")?;
-    cfg.controls.models = take(v, "models")?;
-    cfg.dev.plausible_spellbook = take(v, "plausible_spellbook")?;
-    Ok(())
-}
-
 /// `--host` / `--join`: refuse what netplay cannot carry, connect, and
 /// fold the agreed session into the launch (level, seat, options) and
 /// the app's seat globals.
@@ -12701,12 +12691,16 @@ fn net_handshake(
                 return Err("--host needs a --level".into());
             }
             let level = level_path.to_string_lossy().into_owned();
-            net::host(addr, args.seat, &level, net_config(cfg), &build)?
+            net::host(addr, args.seat, &level, rules::collect(cfg), &build)?
         }
         NetArg::Join(addr) => {
             // No `--seat` (seat 1, the default): the host assigns one.
             let link = net::join(addr, (args.seat != 0).then_some(args.seat), &build)?;
-            adopt_net_config(cfg, &link.config)?;
+            let changed = rules::overridden(cfg, &link.config);
+            if !changed.is_empty() {
+                println!("net: the host's rules override {}", changed.join(", "));
+            }
+            rules::adopt(cfg, &link.config)?;
             *level_path = PathBuf::from(&link.level);
             link
         }
