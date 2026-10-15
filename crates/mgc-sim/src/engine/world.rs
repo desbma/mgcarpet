@@ -20241,6 +20241,13 @@ impl World {
         std::mem::take(&mut self.pending_restart)
     }
 
+    /// A castle-less death has been confirmed and awaits
+    /// [`Self::take_restart`] (netplay ends its tick burst on it, so
+    /// every peer restarts at the same tick).
+    pub fn restart_pending(&self) -> bool {
+        self.pending_restart
+    }
+
     /// The RELOAD's THING-table restore (`sub_408D0` :51596 →
     /// LoadLevel): the reload re-reads the level from disk,
     /// un-consuming every one-shot disposition the previous life

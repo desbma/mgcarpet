@@ -766,6 +766,11 @@ impl Simulation {
         self.thrust_model[hx] = model;
     }
 
+    /// The human seats, in seat order.
+    pub fn seat_ixs(&self) -> impl Iterator<Item = Hx> + 'static {
+        self.flyer.ixs()
+    }
+
     /// Advance exactly one fixed tick — the one-seat turn.
     pub fn step(&mut self, input: &FlightInput) {
         self.step_seats(std::slice::from_ref(input));
