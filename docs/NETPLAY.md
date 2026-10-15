@@ -74,5 +74,15 @@ mgcarpet --join 127.0.0.1                                    # seat 2 (the host 
 - Per-seat flight models (today the joiner flies the host's models).
 - The sim's `Gen::local_seat()` (retail `playerIndex`) is `Hx::FIRST` on
   every peer — consistent, but retail evaluated those rules per peer.
-- Level end / campaign play; more than two seats. Unverified by eye: how
-  the other human (and the HUD/camera on the client's seat 2) look.
+- Level end / campaign play; more than two seats.
+
+## Playtest log
+
+- 10-15 (MC1, seats 1 + 2 = Zanzamar + Vodor): works; seat, castle and HUD
+  colours right. BUG: both humans drew Zanzamar's carpet sprite — the MC1
+  human record kept the constructor's row 44 and never took retail's
+  per-seat art (`sub_44D30` :54927-55, run for every wizard incl. the
+  human). Fixed: `mc1_wizard_sprite_row(seat)` on the human record's class
+  flip (seat 0 unchanged = 44, so single-player is byte-identical; MC2
+  already used `carpet_sprite_row(seat)`). Test
+  `each_human_wears_his_seats_art` (kill-switch proved).

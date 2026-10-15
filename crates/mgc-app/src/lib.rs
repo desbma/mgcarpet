@@ -12963,6 +12963,35 @@ mod net_lockstep_tests {
         );
     }
 
+    /// Each human carpet wears ITS seat's wizard art (`sub_44D30`),
+    /// seen from the other seat — not seat 0's row 44 for everyone.
+    #[test]
+    fn each_human_wears_his_seats_art() {
+        for game in ["mc1", "mc2"] {
+            let Some(mut sim) = (0..25).find_map(|i| peer_sim(&level(game, i), &[0, 1])) else {
+                eprintln!("skipping: no baked {game} level seats two humans");
+                continue;
+            };
+            for _ in 0..4 {
+                sim.step_seats(&[FlightInput::default(); 2]);
+            }
+            let w = sim.world.as_ref().unwrap();
+            for (viewer, seen) in [(Hx(1), 0u8), (Hx::FIRST, 1)] {
+                let rows: Vec<u16> = w
+                    .live_poses(viewer)
+                    .iter()
+                    .filter(|p| p.class == 3 && p.model == 0)
+                    .map(|p| p.type_index)
+                    .collect();
+                let expect = match game {
+                    "mc2" => mgc_sim::mc2::carpet_sprite_row(seen),
+                    _ => [44, 273][usize::from(seen)],
+                };
+                assert_eq!(rows, vec![expect], "{game}: seat {} drawn wrong", seen + 1);
+            }
+        }
+    }
+
     #[test]
     fn mc1_peers_stay_identical() {
         two_peers_stay_identical("mc1", 0..25);

@@ -1490,6 +1490,16 @@ pub struct RivalAiDebug {
     pub castle_stored: Option<u32>,
 }
 
+/// A wizard record's per-seat art — the switch on the wizard index in
+/// the per-wizard init `sub_44D30` (:54927-55), run on a FRESH spawn
+/// for EVERY seat, the human's included: sprite-stats rows 273-279,
+/// seat 0 keeps 44 (the record constructor's own row, `sub_37820`).
+/// Seat 0 is reached by a rival only when the human flies another
+/// seat; a human off seat 0 (`--seat`, netplay) wears his colour's.
+pub(crate) fn mc1_wizard_sprite_row(slot: u8) -> u16 {
+    if slot == 0 { 44 } else { 272 + u16::from(slot) }
+}
+
 impl World {
     /// Wire the level's wizards from the baked config: one rival per
     /// active AI slot (1..player_count), spawned at its start marker
@@ -1660,11 +1670,8 @@ impl World {
         let Some(i) = self.g.spawn_class3(1, x, y, z) else {
             return;
         };
-        // Per-slot rival art (:54927-55): sprite-stats rows 273-279,
-        // and seat 0 keeps 44 — reached only when the human flies
-        // another seat. Draw type 0x11: 16 views by mirror.
-        self.g
-            .set_sprite(i, if slot == 0 { 44 } else { 272 + slot as u16 });
+        // Per-slot wizard art (draw type 0x11: 16 views by mirror).
+        self.g.set_sprite(i, mc1_wizard_sprite_row(slot));
         self.g.refill_life(i);
         // Retail keeps a wizard's mana ON the entity (+140); the
         // port's authority is `Rival::mana`, with the entity as the

@@ -8887,7 +8887,9 @@ impl World {
                 self.g.mc2_set_sprite(cs, row);
             } else {
                 e.row156 = 7;
-                self.g.set_sprite(cs, 44);
+                // The constructor's 44, then `sub_44D30`'s per-seat art.
+                let row = crate::mc1::rivals::mc1_wizard_sprite_row(self.g.human_seat(hx));
+                self.g.set_sprite(cs, row);
             }
         }
         let e = &mut self.g.ent[cs];
