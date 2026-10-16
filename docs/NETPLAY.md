@@ -320,3 +320,12 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
   does not pause in netplay, a host-only pause, a vote, a pause timeout…
   (retail refused pause in multiplayer altogether, MC2 trace
   "MULTIPLAYER_MODE gates").
+- 2026-10-16 #13: the lobby's rules no longer leak into the host's own
+  game (player-reported: a lobby fog persisted into single-player). The
+  scroll's chevrons stepped the HOST's config — applied to his renderer and
+  written to his `mgcarpet.json`. Now the rules belong to the lobby
+  (`LobbyCore`): seeded once from `rules::session(cfg)` when the lobby
+  opens, stepped on a scratch config (`step_lobby_rule`), never applied or
+  persisted; the per-frame push of the host's config into the rules is
+  gone. In a game everyone adopts the session and gets his own back at the
+  end (unchanged). Test `a_lobby_rule_step_leaves_the_players_config_alone`.

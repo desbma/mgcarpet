@@ -12873,6 +12873,25 @@ struct NetLobby {
 /// default in a multiplayer game).
 const LOBBY_RULES: [(&str, &str); 1] = [("Fog", "render.preference.fog_distance")];
 
+/// Step the scroll's `row` in a session's rules: the stepped rules, or
+/// `None` when the value stays put. Works on a scratch config — the
+/// session's rules are the lobby's, never the player's own options.
+fn step_lobby_rule(
+    rules: &serde_json::Value,
+    row: usize,
+    forward: bool,
+    specs: &[settings::Spec],
+) -> Option<serde_json::Value> {
+    let &(_, path) = LOBBY_RULES.get(row)?;
+    let spec = specs.iter().find(|s| s.cfg_path == path)?;
+    let mut scratch = config::Config::default();
+    if let Err(e) = rules::adopt(&mut scratch, rules) {
+        eprintln!("{e}");
+        return None;
+    }
+    settings::step(spec, &mut scratch, forward).then(|| rules::collect(&scratch))
+}
+
 /// The scroll's rows read off a session's rules.
 fn lobby_rule_rows(rules: &serde_json::Value, specs: &[settings::Spec]) -> Vec<lobby_mc2::RuleRow> {
     let mut cfg = config::Config::default();
@@ -13219,16 +13238,12 @@ impl App {
 
     /// One frame of the lobby (in place of the temple screen).
     fn lobby_frame(&mut self, dt: f32) {
-        let rules = rules::session(&self.cfg);
         let models = serde_json::to_value(&self.cfg.controls.models).expect("models serialize");
         let (size, cursor) = (self.view_size(), self.cursor);
         let Some(nl) = &mut self.netlobby else { return };
-        // The host's options ARE the rules: an edit (the P options
-        // menu) reaches every client and voids the agreements.
         let mut closed = None;
         match &mut nl.session {
             net::Session::Host(h) => {
-                h.set_rules(rules);
                 h.set_models(models);
                 h.poll();
                 for n in h.take_notes() {
@@ -13384,15 +13399,14 @@ impl App {
                     view.ai.saturating_sub(1)
                 });
             }
-            (net::Session::Host(_), A::StepRule { row, forward }) => {
-                let Some(&(_, path)) = LOBBY_RULES.get(row) else {
-                    return;
-                };
-                if let Some(i) = self.specs.iter().position(|s| s.cfg_path == path)
-                    && settings::step(&self.specs[i], &mut self.cfg, forward)
-                {
-                    self.apply_option(path);
-                    self.persist_option(&self.specs[i]);
+            (net::Session::Host(h), A::StepRule { row, forward }) => {
+                // The session's rules are the LOBBY's, not the host's
+                // own options: step a scratch copy, so a lobby choice
+                // never reaches his config, his screen or his
+                // `mgcarpet.json` (player-reported 2026-10-16: a lobby
+                // fog leaked into single-player).
+                if let Some(rules) = step_lobby_rule(&view.rules, row, forward, &self.specs) {
+                    h.set_rules(rules);
                 }
             }
             (net::Session::Host(h), A::SetPassphrase(p)) => {
@@ -13577,7 +13591,29 @@ fn get_baked_directory() -> PathBuf {
 
 #[cfg(test)]
 mod lobby_rules_tests {
-    use super::{LOBBY_RULES, config, lobby_rule_rows, rules, settings};
+    use super::{LOBBY_RULES, config, lobby_rule_rows, rules, settings, step_lobby_rule};
+
+    /// A lobby choice steps the SESSION's rules only: the rules seeded
+    /// from the host's config move, the config itself does not (player
+    /// 2026-10-16: a lobby fog leaked into single-player).
+    #[test]
+    fn a_lobby_rule_step_leaves_the_players_config_alone() {
+        let specs = settings::registry();
+        let mut own = config::Config::default();
+        own.render.preference.fog_distance = 90;
+        let seeded = rules::session(&own);
+        let fog = |r: &serde_json::Value| r["render.preference.fog_distance"].clone();
+        let down = step_lobby_rule(&seeded, 0, false, &specs).expect("fog steps down");
+        assert_ne!(fog(&down), fog(&seeded));
+        assert_eq!(own.render.preference.fog_distance, 90);
+        // Every other pin holds the session's value.
+        let mut a = down.clone();
+        let mut b = seeded.clone();
+        a.as_object_mut().unwrap().remove("render.preference.fog_distance");
+        b.as_object_mut().unwrap().remove("render.preference.fog_distance");
+        assert_eq!(a, b);
+        assert!(step_lobby_rule(&seeded, LOBBY_RULES.len(), true, &specs).is_none());
+    }
 
     /// Every row of the lobby's rules scroll is a SESSION PIN (else the
     /// host's change would never reach the clients) and reads a value.
