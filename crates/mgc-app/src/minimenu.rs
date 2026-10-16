@@ -24,6 +24,14 @@
 //! the only way out — and unpause closes the Options layer with it.
 //! Esc closes only that layer, dropping back here.
 //!
+//! # Netplay
+//!
+//! A network game never pauses (one peer's pause would freeze every
+//! peer's lockstep — player ruling 2026-10-16): P opens this same panel
+//! over the RUNNING world, the carpet held in an idle hover while it is
+//! up. It offers only what makes sense mid-match — Options and Leave;
+//! there is no campaign to save or load (see [`MiniMenu::netplay`]).
+//!
 //! The panel is hidden while the Options layer is up (they are
 //! mutually exclusive on screen). It carries no "PAUSED" text of its
 //! own — the retail indicator (`ui::pause_quads`) reports the pause
@@ -66,7 +74,7 @@ const INK_STALE: [f32; 4] = [0.90, 0.72, 0.30, 1.0];
 /// Which face the panel is showing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// Save / Load / Options.
+    /// The actions ([`root_rows`]).
     Root,
     /// The slot list. `saving` picks the verb: writing a slot versus
     /// reading one.
@@ -78,6 +86,8 @@ pub struct MiniMenu {
     /// Slot rows, refreshed whenever the list is opened (never per
     /// frame — this is a directory scan).
     pub slots: Vec<SlotInfo>,
+    /// The netplay face: Options and Leave, no slots.
+    pub net: bool,
 }
 
 impl Default for MiniMenu {
@@ -85,6 +95,7 @@ impl Default for MiniMenu {
         MiniMenu {
             mode: Mode::Root,
             slots: Vec::new(),
+            net: false,
         }
     }
 }
@@ -92,6 +103,14 @@ impl Default for MiniMenu {
 impl MiniMenu {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The network game's menu (the world keeps running under it).
+    pub fn netplay() -> Self {
+        MiniMenu {
+            net: true,
+            ..Self::default()
+        }
     }
 
     /// Return to the root face, dropping any stale slot list.
@@ -108,9 +127,32 @@ pub enum Hit {
     Save,
     Load,
     Options,
+    /// Leave the network game (the abandon confirm).
+    Leave,
     /// A slot row on the list face.
     Slot(usize),
     Back,
+}
+
+/// The root face's rows, top to bottom — the contract `hit_test` and
+/// `draw` share.
+fn root_rows(m: &MiniMenu) -> &'static [Hit] {
+    if m.net {
+        &[Hit::Options, Hit::Leave]
+    } else {
+        &[Hit::Save, Hit::Load, Hit::Options]
+    }
+}
+
+fn label(hit: Hit) -> &'static str {
+    match hit {
+        Hit::Save => "Save",
+        Hit::Load => "Load",
+        Hit::Options => "Options",
+        Hit::Leave => "Leave",
+        Hit::Back => "Back",
+        Hit::None | Hit::Slot(_) => "",
+    }
 }
 
 struct Layout {
@@ -132,10 +174,10 @@ fn layout(assets: &UiAssets, m: &MiniMenu, w: f32, h: f32) -> Layout {
     let row_h = lh * 1.3;
     let pad = 8.0 * s;
 
-    // Root has three actions; the slot list has one row per slot plus
-    // a Back row.
+    // Root has its actions; the slot list has one row per slot plus a
+    // Back row.
     let rows = match m.mode {
-        Mode::Root => 3,
+        Mode::Root => root_rows(m).len(),
         Mode::Slots { .. } => m.slots.len() + 1,
     };
     // No heading row on a face that has no heading — otherwise the
@@ -192,12 +234,7 @@ pub fn hit_test(assets: &UiAssets, m: &MiniMenu, w: f32, h: f32, cursor: (f32, f
     let row = (0..l.rows).find(|&i| inside(row_rect(&l, i), cursor));
     let Some(row) = row else { return Hit::None };
     match m.mode {
-        Mode::Root => match row {
-            0 => Hit::Save,
-            1 => Hit::Load,
-            2 => Hit::Options,
-            _ => Hit::None,
-        },
+        Mode::Root => root_rows(m).get(row).copied().unwrap_or(Hit::None),
         Mode::Slots { .. } => {
             if row < m.slots.len() {
                 Hit::Slot(row)
@@ -210,7 +247,7 @@ pub fn hit_test(assets: &UiAssets, m: &MiniMenu, w: f32, h: f32, cursor: (f32, f
 
 /// The panel's heading, or None when it would say nothing useful.
 ///
-/// The root face has none: its three rows name themselves, and the
+/// The root face has none: its rows name themselves, and the
 /// retail PAUSED indicator (`ui::pause_quads`) is what reports the
 /// pause state. The slot list keeps one, because "SAVE TO" and
 /// "LOAD FROM" are the only thing distinguishing two identical lists.
@@ -298,8 +335,8 @@ pub fn draw(assets: &UiAssets, m: &MiniMenu, w: f32, h: f32, cursor: (f32, f32))
 
     match m.mode {
         Mode::Root => {
-            for (i, label) in ["Save", "Load", "Options"].into_iter().enumerate() {
-                row_text(&mut quads, i, label, INK_LABEL);
+            for (i, &hit) in root_rows(m).iter().enumerate() {
+                row_text(&mut quads, i, label(hit), INK_LABEL);
             }
         }
         Mode::Slots { saving } => {
@@ -436,31 +473,19 @@ mod tests {
         assert_ne!(slot_row(&bad, 0, true).1, slot_row(&empty, 0, true).1);
     }
 
+    /// Single-player keeps Save/Load/Options; a network game has no
+    /// campaign to save — Options and Leave only.
     #[test]
     fn root_rows_map_to_their_actions() {
-        let m = MiniMenu::new();
-        assert_eq!(m.mode, Mode::Root);
-        // Row order is the contract `hit_test` and `draw` share.
-        for (i, want) in [Hit::Save, Hit::Load, Hit::Options].into_iter().enumerate() {
-            let l = Layout {
-                s: 1.0,
-                fs: 2.0,
-                lh: 8.0,
-                row_h: 10.0,
-                panel: [0.0, 0.0, 100.0, 100.0],
-                rows_y: 0.0,
-                rows: 3,
-            };
-            let r = row_rect(&l, i);
-            let c = (r[0] + 1.0, r[1] + 1.0);
-            let row = (0..l.rows).find(|&k| inside(row_rect(&l, k), c)).unwrap();
-            let got = match row {
-                0 => Hit::Save,
-                1 => Hit::Load,
-                2 => Hit::Options,
-                _ => Hit::None,
-            };
-            assert_eq!(got, want, "row {i}");
+        assert_eq!(
+            root_rows(&MiniMenu::new()),
+            [Hit::Save, Hit::Load, Hit::Options]
+        );
+        assert_eq!(root_rows(&MiniMenu::netplay()), [Hit::Options, Hit::Leave]);
+        for m in [MiniMenu::new(), MiniMenu::netplay()] {
+            for &hit in root_rows(&m) {
+                assert!(!label(hit).is_empty(), "{hit:?} has no label");
+            }
         }
     }
 

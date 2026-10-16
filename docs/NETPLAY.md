@@ -109,8 +109,14 @@ peer plays by them.
   pinned member (Controls: the flight models; Visuals: fog, tags, map aids).
 - A pinned value is never written to the player's `mgcarpet.json` (it is
   the host's, not his).
-- Pause (P) stalls BOTH peers and burns no draws (a one-sided draw would
-  fork the worlds — the netplay-only exception to the paused-draw law).
+- A network game never pauses (player ruling 2026-10-16; retail refused
+  pause in multiplayer): P opens the netplay panel — Options and Leave, no
+  Save/Load — over the RUNNING world, and the carpet holds an idle hover
+  while it is up (no movement read, a full stop every tick, no fire;
+  equips and spell picks still pass). Leave = the abandon confirm. No
+  host-only pause either (ruled out). The sim-side guard stays: were a
+  peer ever paused, it would burn no draws (a one-sided draw would fork
+  the worlds).
 - A castle-less death's level restart ends the tick burst on its tick, so
   both peers rebuild before the same next tick.
 - The peer leaving ends netplay: the game goes on locally, the other
@@ -329,3 +335,14 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
   persisted; the per-frame push of the host's config into the rules is
   gone. In a game everyone adopts the session and gets his own back at the
   end (unchanged). Test `a_lobby_rule_step_leaves_the_players_config_alone`.
+- 2026-10-16 #14: **PAUSE IN NETPLAY — SOLVED** (player ruling: a menu
+  without pausing, idle hover, no host pause). `App::toggle_menu` opens
+  `MiniMenu::netplay()` (Options, Leave) without setting `paused`;
+  `menu_up()` (paused OR the panel) keeps the pointer free; `net_menu()`
+  folds into `tick_input`'s movement-suspend (`book`) and sets `full_stop`.
+  Xvfb, 2 peers: B's menu open 5 s, then both menus 4 s — both peers kept
+  one hash check per second (no stall, no desync); B held W into the menu
+  and its position froze (Y 9149 over 3 s); Leave → Enter left the game
+  (14 checks agreed). Noted: when a CLIENT leaves, the host's game goes on
+  with the leaver's carpet idling (no game over — it still counts as a
+  contender).

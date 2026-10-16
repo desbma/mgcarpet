@@ -3792,15 +3792,29 @@ impl App {
     /// behaviour that a full-screen menu regressed. On the frontend
     /// screens there is no sim to pause and no HUD to preserve, so P
     /// opens the options menu directly, as before.
+    ///
+    /// A NETWORK game never pauses: one peer's pause starved every
+    /// peer's lockstep until he came back (player-reported 2026-10-15;
+    /// retail refused pause in multiplayer). There P opens the netplay
+    /// panel (Options, Leave) over the running world, and the carpet
+    /// holds an idle hover while it is up ([`Self::net_menu`]).
     fn toggle_menu(&mut self) {
-        if !self.paused {
-            self.paused = true;
+        if !self.menu_up() {
+            let net = self.net.is_some() && self.screen == Screen::Level;
+            self.paused = !net;
             // Frontend screens need the frontend-owned UI bank for
             // the menu's fonts/panels (no session to borrow from).
             self.ensure_frontend_ui();
             // Without a baked font there is no menu — plain pause.
             if ui_assets!(self).is_some() {
-                if self.screen == Screen::Level {
+                if net {
+                    self.mini = Some(minimenu::MiniMenu::netplay());
+                    // Hover where the menu caught you: the stop, and
+                    // the steering stick recentred (`tick_input`
+                    // holds both while the panel is up).
+                    self.pending_full_stop = true;
+                    self.stick = VirtualStick::default();
+                } else if self.screen == Screen::Level {
                     self.mini = Some(minimenu::MiniMenu::new());
                 } else {
                     self.menu = Some(self.options_menu());
@@ -3812,9 +3826,10 @@ impl App {
             }
         } else {
             self.paused = false;
-            // Unpause is the ONLY way out of the mini-menu (the
-            // standing Esc law), and it closes the options layer with
-            // it if one is stacked on top.
+            // Unpause (netplay: closing the panel) is the ONLY way
+            // out of the mini-menu (the standing Esc law), and it
+            // closes the options layer with it if one is stacked on
+            // top.
             let closed = self.menu.take().is_some() | self.mini.take().is_some();
             match self.screen {
                 // In-level: unpause re-locks the pointer if flight
@@ -3846,7 +3861,26 @@ impl App {
         if let Some(a) = &mut self.audio {
             a.set_paused(self.paused);
         }
-        println!("{}", if self.paused { "paused" } else { "unpaused" });
+        println!(
+            "{}",
+            match (self.paused, self.net_menu()) {
+                (true, _) => "paused",
+                (false, true) => "menu (netplay: the game runs on)",
+                (false, false) => "unpaused",
+            }
+        );
+    }
+
+    /// Is the pause menu up — paused, or the netplay panel over the
+    /// running world? The pointer stays free while it is.
+    fn menu_up(&self) -> bool {
+        self.paused || self.mini.is_some()
+    }
+
+    /// The netplay panel is up over the running world: the carpet
+    /// hovers idle (no steering, no thrust, no fire).
+    fn net_menu(&self) -> bool {
+        self.net.is_some() && self.mini.is_some() && !self.paused
     }
 
     /// The runtime option keys (session-only — never persisted; the
@@ -4296,6 +4330,13 @@ impl App {
             }
             minimenu::Hit::Options => {
                 self.menu = Some(self.options_menu());
+            }
+            // The netplay panel's way out: the abandon confirm, as Esc
+            // (confirming leaves the game — the host's ends it for all).
+            minimenu::Hit::Leave => {
+                if self.quit_fade.is_none() {
+                    self.exit_confirm = true;
+                }
             }
             minimenu::Hit::Back => mini.reset_to_root(),
             minimenu::Hit::Slot(i) => {
@@ -4946,7 +4987,11 @@ impl App {
         // replaces the movement read with the OkCancel event read,
         // PlayerInput.cpp:2356 — steering decays, speed persists,
         // the world keeps running).
-        let book = (self.book_open() && self.selector.map_book) || self.exit_confirm;
+        //
+        // The netplay menu holds the carpet in an idle hover: no
+        // movement read (as the dialog), and the speed stopped too.
+        let net_menu = self.net_menu();
+        let book = (self.book_open() && self.selector.map_book) || self.exit_confirm || net_menu;
         let mc1 = self.cfg.controls.models.thrust == config::ThrustModel::Classic;
         // MC2's barrel roll: both strafe keys down this tick with
         // NEITHER down the last — retail's edge detect against the
@@ -5011,7 +5056,7 @@ impl App {
                 .map(mgc_sim::mc1::spells::SpellId),
             mc2_select: self.pending_mc2_select.take(),
             spell_ring: self.pending_ring.take(),
-            full_stop: std::mem::take(&mut self.pending_full_stop),
+            full_stop: std::mem::take(&mut self.pending_full_stop) || net_menu,
             respawn: std::mem::take(&mut self.pending_respawn),
             demolish: std::mem::take(&mut self.pending_demolish),
             suicide: std::mem::take(&mut self.pending_suicide),
@@ -6948,7 +6993,7 @@ impl App {
         // closing the big map is the obvious one. Re-grabbing there
         // left the mini-menu clickable but the pointer invisible.
         // Unpause re-grabs by clearing `paused` BEFORE calling here.
-        if grab && self.paused {
+        if grab && self.menu_up() {
             return;
         }
         // An UNFOCUSED window never takes the pointer: an X11 grab
@@ -7066,7 +7111,7 @@ impl App {
     fn level_wants_grab(&self) -> bool {
         self.screen == Screen::Level
             && self.session.is_some()
-            && !self.paused
+            && !self.menu_up()
             && !self.exit_confirm
             && !self.ctrl_held
             && !(self.book_open() && self.selector.map_book)
