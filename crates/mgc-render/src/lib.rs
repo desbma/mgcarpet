@@ -5471,6 +5471,55 @@ impl Renderer {
     /// Returns the instances with all opaque ones first and the
     /// translucent tail sorted back-to-front, plus the opaque count —
     /// the two draw ranges (opaque pipeline / blend pipeline).
+    /// Where the TOP of the drawn sprite standing at `(x, y, z)` sits,
+    /// as a world offset from those feet: the quad's top-centre, along
+    /// the same pitched up axis (`camera_flat_basis`) and picture
+    /// anchor the billboard pass expands it with — so the point rides
+    /// the sprite's real head at any distance and any viewing angle.
+    /// The sprite is the billboard nearest the feet (within half a
+    /// tile); `None` when nothing is drawn there.
+    pub fn sprite_top(&self, cam: &CameraView, x: f32, y: f32, z: f32) -> Option<[f32; 3]> {
+        let pack = &self.impostors.as_ref()?.index;
+        let full = MAP_TILES as f32;
+        let wrap = |d: f32| (d + full / 2.0).rem_euclid(full) - full / 2.0;
+        let b = self
+            .billboards
+            .iter()
+            .map(|b| {
+                let (dx, dy, dz) = (wrap(b.x - x), b.y - y, wrap(b.z - z));
+                (dx * dx + dy * dy + dz * dz, b)
+            })
+            .filter(|(d2, _)| *d2 <= 0.25)
+            .min_by(|a, b| a.0.total_cmp(&b.0))?
+            .1;
+        let elevation = (cam.y - b.y)
+            .atan2(wrap(b.x - cam.x).hypot(wrap(b.z - cam.z)))
+            .to_degrees();
+        let key = mgc_formats::impostor::ModelKey {
+            sprite_base: b.sprite_base,
+            draw_type: b.draw_type,
+        };
+        let view = pack.view(
+            key,
+            b.frame,
+            b.yaw - cam.yaw,
+            elevation,
+            b.flc_frame,
+            self.anim_turn as usize,
+        )?;
+        let im = view.image;
+        let world_w = b.world_h * im.w as f32 / im.h as f32;
+        let world_h = b.world_h * b.h_stretch;
+        let ax = if view.mirror {
+            1.0 - im.anchor[0]
+        } else {
+            im.anchor[0]
+        };
+        let (right, up, _) = camera_flat_basis(cam);
+        let (r, u) = ((0.5 - ax) * world_w, (1.0 - im.anchor[1]) * world_h);
+        Some(std::array::from_fn(|i| right[i] * r + up[i] * u))
+    }
+
     fn billboard_instances(&self, cam: &CameraView) -> (Vec<BillboardInstance>, u32) {
         use mgc_formats::impostor::ModelKey;
         let Some(pack) = &self.impostors else {

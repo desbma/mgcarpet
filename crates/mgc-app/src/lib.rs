@@ -8266,10 +8266,15 @@ impl App {
                             &sess.level.palette_rgba,
                         );
                         let s = ui::HudFrame::new(size.0, size.1).s;
-                        // The anchor rides the wizard sprite: its top
-                        // approximated as this much above the entity
-                        // datum (tiles), then retail's 20px lift
-                        // (GameRenderHD.cpp:2841).
+                        // The anchor rides the wizard sprite's real TOP
+                        // (`Renderer::sprite_top` — the drawn quad's
+                        // top edge along the pitched up axis), then
+                        // retail's 20px lift (GameRenderHD.cpp:2841):
+                        // the tag clears the head at every distance and
+                        // pitch. It used to sit a fixed 0.6 tiles up the
+                        // WORLD axis — on the face when near, and when
+                        // looking down (player 2026-10-17). No sprite
+                        // drawn there: that fallback.
                         const WIZ_TOP: f32 = 0.6;
                         for r in &self.rival_tags_cur {
                             if !r.alive || r.invisible {
@@ -8301,13 +8306,18 @@ impl App {
                             if fog_cut(&cam, x, alt, z, fog_wall) {
                                 continue;
                             }
+                            let top = self
+                                .renderer
+                                .as_ref()
+                                .and_then(|rd| rd.sprite_top(&cam, x, alt, z))
+                                .unwrap_or([0.0, WIZ_TOP, 0.0]);
                             let Some((sx, sy)) = mgc_render::world_to_screen(
                                 &cam,
                                 size.0,
                                 size.1,
-                                x,
-                                alt + WIZ_TOP,
-                                z,
+                                x + top[0],
+                                alt + top[1],
+                                z + top[2],
                             ) else {
                                 continue;
                             };
