@@ -1,7 +1,7 @@
 //! The MC2 multiplayer lobby screen — retail HSCREEN0 case 7
 //! (`sub_77680`, MenusAndIntros.cpp:5903-6125; recon
 //! docs/traces/mc2-multiplayer-lobby.md), a VIEW over the
-//! host-authoritative lobby (`lobby.rs`, `net::Host`/`net::Guest`).
+//! server-authoritative lobby (`lobby.rs`, `net::Server`/`net::Guest`).
 //!
 //! Retail law reproduced: the cave doorway background with its own
 //! palette; six buttons whose art is part of the background, the
@@ -170,6 +170,8 @@ pub struct LobbyScreen {
     rules: Vec<RuleRow>,
     /// The host's passphrase (the scroll's first row; none for clients).
     passphrase: Option<String>,
+    /// A message over the status line, and its seconds left.
+    alert: Option<(String, f32)>,
 }
 
 /// A row-major 8bpp image to place in the atlas.
@@ -403,6 +405,7 @@ impl LobbyScreen {
             sounds: Vec::new(),
             rules: Vec::new(),
             passphrase: None,
+            alert: None,
         })
     }
 
@@ -451,6 +454,12 @@ impl LobbyScreen {
     /// The portrait fades (retail +16/255 per 70 Hz frame).
     pub fn tick(&mut self, dt: f32) {
         self.anim += dt;
+        if let Some((_, t)) = &mut self.alert {
+            *t -= dt;
+            if *t <= 0.0 {
+                self.alert = None;
+            }
+        }
         let want = self
             .view
             .as_ref()
@@ -512,15 +521,15 @@ impl LobbyScreen {
     }
 
     fn is_host(&self) -> bool {
-        self.view.as_ref().is_some_and(LobbyView::is_host)
+        self.view.as_ref().is_some_and(LobbyView::is_admin)
     }
 
     /// Does `btn` answer this member now?
     fn enabled(&self, btn: Btn) -> bool {
         let Some(v) = &self.view else { return false };
         match btn {
-            Btn::PrevLevel | Btn::NextLevel => v.is_host(),
-            Btn::Play => !v.is_host() || v.all_agreed(),
+            Btn::PrevLevel | Btn::NextLevel => v.is_admin(),
+            Btn::Play => !v.is_admin() || v.all_agreed(),
             Btn::Exit => true,
             Btn::PrevWizard | Btn::NextWizard => {
                 v.me().is_some_and(|m| v.next_free(m.wizard, 1).is_some())
@@ -641,6 +650,11 @@ impl LobbyScreen {
         self.sounds.push(SND_CLICK);
     }
 
+    /// Show `text` over the status line for a few seconds.
+    pub fn alert(&mut self, text: String) {
+        self.alert = Some((text, 5.0));
+    }
+
     /// A game is in progress without us: we left it, or joined during
     /// it — the lobby waits for it to finish (only Exit is live).
     fn waiting(&self) -> bool {
@@ -655,9 +669,8 @@ impl LobbyScreen {
         if v.playing {
             return "Waiting for the current game to finish".into();
         }
-        let clients = v.members.len().saturating_sub(1);
-        let agreed = v.members.iter().skip(1).filter(|m| m.agreed).count();
-        if v.is_host() {
+        let (clients, agreed) = v.agreement();
+        if v.is_admin() {
             if clients == 0 {
                 "Waiting for players to join".into()
             } else if v.all_agreed() {
@@ -797,9 +810,13 @@ impl LobbyScreen {
         }
         self.rules_scroll(mx, my, scale, &mut q);
         self.window_names(scale, &mut q);
-        let status = match self.hovered_member(mx, my).filter(|_| self.modal.is_none()) {
-            Some((id, _)) => self.member_name(id),
-            None => self.status(),
+        let status = match (
+            &self.alert,
+            self.hovered_member(mx, my).filter(|_| self.modal.is_none()),
+        ) {
+            (Some((text, _)), _) => text.clone(),
+            (None, Some((id, _))) => self.member_name(id),
+            (None, None) => self.status(),
         };
         let sx = (W - self.text_width(&status)) / 2.0;
         self.text(&status, sx, 452.0, [1.0; 4], scale, &mut q);
@@ -994,6 +1011,7 @@ mod tests {
             sounds: Vec::new(),
             rules: Vec::new(),
             passphrase: None,
+            alert: None,
         }
     }
 
@@ -1001,6 +1019,7 @@ mod tests {
         LobbyView {
             you,
             rev: 0,
+            game: crate::lobby::NetGame::Mc2,
             level: "lvl".into(),
             rules: serde_json::json!({}),
             members: vec![
@@ -1019,6 +1038,8 @@ mod tests {
                     agreed,
                 },
             ],
+            admin: Some(0),
+            passphrase: None,
             capacity: 2,
             ai: 0,
             playing: false,

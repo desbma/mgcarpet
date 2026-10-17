@@ -1,10 +1,17 @@
 # Netplay (MVP, 2026-10-15)
 
-Two app instances, one world, **deterministic lockstep over TCP**, star
-topology with the host as the authority. Code: `crates/mgc-app/src/net.rs`
-(wire + lockstep), `App::net_turn` (the per-tick gate), `net_handshake`
-(launch folding). Rulings behind it: TCP only (10-14), star + host
-authority, retail's own model of shipping inputs only.
+App instances sharing one world, **deterministic lockstep over TCP**, star
+topology with a **server** at the centre (2026-10-17): it holds the lobby,
+assembles the turns and runs the world itself, headless — the authority
+every player's hash is checked against, and the one that names the winner.
+Every player is a client; one is the **admin** (the lobby's powers). The
+server runs dedicated (`--serve`) or as a thread of the hosting player's
+app (the UI's Host, `--host`) — one implementation. Code:
+`crates/mgc-app/src/net.rs` (wire, `Server`, `Guest`, `Lockstep`),
+`ServerWorld` in `lib.rs` (the server's world), `App::net_turn` (the
+per-tick gate), `net_handshake` (launch folding). Rulings behind it: TCP
+only (10-14), star, the server ticks (10-17), retail's own model of
+shipping inputs only.
 
 ## Running it
 
@@ -27,9 +34,14 @@ the passphrase → the lobby (retail HSCREEN0 case 7, `lobby_mc2.rs`):
 - names: each member carries his campaign's player name (MC2 Set Name /
   MC1's save name) — the in-game tags, map reveals and roster show it;
   empty = the wizard's own name;
-- Exit (or Esc) leaves (the host: closes the lobby).
-In the game: the host's Esc → exit ends it for everyone (back to the
-lobby); a client's leaves the session. A won level returns to the lobby.
+- Exit (or Esc) leaves (the hosting player: stops his server — the
+  session ends for everyone in it).
+In the game: Esc → exit leaves the game for everyone alike, the hosting
+player too — banished, back to the lobby, waiting for the game to finish.
+The server's verdict (one wizard standing) returns everyone to the lobby.
+Closing the hosting app with other players on its server warns first
+("N players still in this session - close again…"); the second close
+within 5 s stops the server.
 The campaign steps aside for a lobby game (no campaign book — every seat
 gets the level's own — and no campaign progress or saves). Entries
 persist in `saves/netplay.json` (recent hosts, port, passphrase).
@@ -37,45 +49,79 @@ persist in `saves/netplay.json` (recent hosts, port, passphrase).
 **From the CLI:**
 
 ```
-mgcarpet --level baked/mc1/level-002.mgcl --host            # seat 1, port 7777, all interfaces
-mgcarpet --join 127.0.0.1                                    # seat 2 (the host assigns it)
+mgcarpet --serve 7777 --game mc2 --passphrase pw             # dedicated server, headless
+mgcarpet --level baked/mc1/level-002.mgcl --host              # a server in this app + its admin player
+mgcarpet --join 127.0.0.1                                     # a player (the server assigns the seat)
 ```
 
-- `--host [ADDR]`: `host:port`, a bare port, or nothing (`0.0.0.0:7777`).
-  Needs a `--level`; `--seat N` picks the host's wizard seat.
+- `--serve [ADDR] --game mc1|mc1hw|mc2`: the DEDICATED server — no
+  window, runs until killed; `host:port`, a bare port, or nothing
+  (`0.0.0.0:7777`). `--game` is REQUIRED: a server plays one game for its
+  whole life (⚖ player 2026-10-17 — never the first player's; players of
+  different games in one session would be a mess). The first player in is
+  the admin (the next in line when he leaves the session). The lobby opens
+  on `--level` (one of that game's; default: its first arena, level 50)
+  under the default session rules; the admin changes them in the lobby,
+  levels within the game only.
+- `--host [ADDR]`: a server on a thread of this app, joined over loopback
+  as the admin (a key only this app knows claims the role). Needs a
+  `--level`; `--seat N` picks the admin's wizard seat.
+- The game travels in the handshake (protocol 6): a player of another
+  game is refused — "this server runs Magic Carpet 2". The in-game lobby
+  sends its campaign's game; `--host` the game of its `--level`; `--join`
+  sends `--game` when given, else adopts the server's.
 - `--join ADDR`: `host:port` or a bare host (port 7777). Retries for 60 s,
   so either side may start first. `--seat N` asks for a seat; without it
-  the host assigns seat 2 (seat 1 if the host flies another).
-- The joiner **adopts** the host's level and the session rules (below),
-  and prints which of his own options they override. Both must run the
-  **same binary** (the handshake compares a hash of the executable); a
+  the server assigns the first free one.
+- Every player **adopts** the server's level and the session rules
+  (below), and prints which of his own options they override. All must run
+  the **same binary** (the handshake compares a hash of the executable); a
   mismatch is a refusal.
-- `--passphrase WORD`: the session's passphrase (host sets, joiner must
-  match; empty when omitted). Not a secret — just keeps strangers and kicked
-  players out.
+- `--passphrase WORD`: the session's passphrase (the server's; players
+  must match; empty when omitted). Not a secret — just keeps strangers and
+  kicked players out.
 - Under the hood the CLI goes through the LOBBY (`lobby.rs` +
-  `net::Host`/`net::Guest`, protocol 2): `--join` agrees to the host's rules
-  by itself and `--host` presses Play once it has. The in-game lobby UI
-  drives the same calls.
+  `net::Server`/`net::Guest`, protocol 5): a `--join` that is not the
+  admin agrees to whatever is set by itself; the admin (`--host`'s player,
+  or a dedicated server's first `--join`) presses Play once everyone has.
+  The in-game lobby UI drives the same calls.
+- The CLI seats the session's AI count (0 by default — retail's network
+  rule), like the lobby; it used to keep the level's authored roster.
 - Not with `--campaign`, `--replay`, `--record`, `--film`,
   `--set-spellbook` or the headless modes.
 
 ## How it works
 
-- Every peer builds the SAME two-human world (`load_level(.., seats)`:
-  `seats[0]` is the host's wizard, the rest `World::add_human_seat`);
-  the host flies `Hx(0)`, the client `Hx(1)` (`local_hx()`).
+- Every peer — and the server — builds the SAME world (`net_level` +
+  `session_sim`, one function for all: seats in member order, `Hx(k)` =
+  member k; `World::add_human_seat` for the others); each app flies its
+  own `Hx` (`local_hx()`).
 - Each seat's input is sampled `INPUT_DELAY` = 3 ticks (125 ms) ahead
-  and sent to the host; the host pairs it with its own and broadcasts
-  `Turn t` (every seat's `PortInput`, seat order). A tick steps
-  (`Simulation::step_seats`) only once its turn exists — a starved peer
-  waits ("waiting for the other player…").
+  and sent to the server; once every seat's is in, the server steps its
+  world and broadcasts `Turn t` (every seat's `PortInput`, seat order). A
+  tick steps (`Simulation::step_seats`) only once its turn exists — a
+  starved peer waits ("waiting for the other player…"). The server keeps
+  no clock: the players' clocks pace the game.
+- The server's world (`ServerWorld`, a `net::Referee`) is built from the
+  Start's data over a DEFAULT config + the session's rules — so every
+  sim-affecting option must be a pin (or reach the world through the
+  inputs). It also drains each step's sound requests, as every app does
+  (`drain_sounds`: the pending vec is hashed).
 - Wire: little-endian `u32` length + one JSON message. Idle input is `{}`.
-- **Desync detection**: the host stamps its pre-step `state_hash` every
-  24 ticks onto a turn; the client compares and toasts/logs the first
-  `DESYNC at tick N`. Detection only — no reconciliation yet.
-  `MGC_NET_TRACE=1` prints every check on both peers (diff the logs).
-- On exit each peer prints `net: N ticks stepped, M hash checks agreed`.
+- **Desync detection**: the server stamps its own world's pre-step
+  `state_hash` every 24 ticks onto that tick's turn; every player — the
+  hosting one too — compares and toasts/logs the first `DESYNC at tick N`.
+  Detection only — no reconciliation yet. `MGC_NET_TRACE=1` prints every
+  check on the server and the players (diff the logs).
+- **The game's end**: the server's world decides (`net_verdict`: one
+  wizard standing, or no human); the announcement rides the next turn
+  (`Turn::over`), every player shows "<name> is victorious!" and fades
+  out, then leaves (`Msg::Leave` — after the verdict it banishes nobody).
+  The server reopens the lobby when nobody plays any more, or 10 s after
+  the verdict (`GAME_OVER_GRACE`). A player whose session is lost judges
+  his own world.
+- On exit each player prints `net: N ticks stepped, M hash checks agreed`;
+  the server `game over after N ticks, M hash checks stamped`.
 
 ## Pinned for the session
 
@@ -126,9 +172,10 @@ peer plays by them.
   carries `left` (protocol 4); every peer calls `World::depart` before
   stepping it. A send failure to one client departs that client only. The
   usual game over follows (one contender left → "<name> is victorious!",
-  back to the lobby). The HOST leaving still ends netplay: a client whose
-  host is gone goes on locally, the other carpets idle (host handover is
-  a later stage).
+  back to the lobby). The hosting player leaving is no different (his
+  server plays on). Only the SERVER stopping (`--serve` killed, the
+  hosting app closed) ends netplay: a player whose server is gone goes on
+  locally, the other carpets idle.
 
 ## Evidence
 
@@ -213,14 +260,24 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
    interact, not a local-only camera.
    Also later: level end / campaign. (Per-seat flight models ✅, more than
    two seats ✅.)
-6. 🏦 **Dedicated server + admin role** (player 2026-10-17, banked for its
-   own session) — REPLACES host handover, which cannot work behind a port
+6. ✅ **Dedicated server + admin role** (player 2026-10-17; LANDED the
+   same day, playtest log #25) — REPLACES host handover, which cannot work behind a port
    forward (clients reach only the server). A headless server process; the
    admin is the first member, a player with more privileges, who may quit
    while the rest play on. Open: does the server run the sim (authority,
    hash + snapshot source) or only relay? Desync prevention (`libm` for the
    sim's ~7 transcendental calls), a sectioned hash report, then snapshot
    recovery follow in the same session (item 4 depends on it).
+   ⚖ (player 2026-10-17) The server AUGMENTS hosting, it does not replace
+   it: `mgcarpet` from the command line can run a bare server (every player
+   a client, one of them admin), AND the UI's Host still works — it starts
+   the same server in the background and joins it as the admin. Most
+   players will host for friends (VPN), so the one-click path stays.
+   ⚖ The UI's server runs as a THREAD in the game process; whoever needs
+   process isolation runs the command-line server instead.
+   ⚖ A UI host leaving the MATCH goes back to the waiting lobby like any
+   client while the rest play on; only closing the APP ends the session
+   (as if the server were stopped), after a "N players still in game" warning.
 
 ## Playtest log
 
@@ -488,3 +545,40 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
   plays every narration one by one — the board is empty), so the
   seat-0 stage engine is moot there; two Global Death flashes coalescing
   is EXPECTED. The seat audit is closed.
+- 2026-10-17 #25: **THE SERVER SPLIT** (player rulings: the server ticks;
+  it augments hosting — `--serve` dedicated, the UI's Host = the same
+  server on a thread + its player as admin; leaving a game = the waiting
+  lobby for everyone; closing the hosting app warns, then stops it).
+  `net::Server` (lobby + turn assembly + `Referee`), `ServerHandle`
+  (thread, admin key, status), every player a `Guest` (admin requests:
+  level / AI / rules / limit / passphrase / kick / Play; non-admin ones
+  ignored), a client-only `Lockstep` (`finish`), `LobbyCore` with no host
+  member (`admin`: first in / key claim / next in line), protocol 5.
+  App: `ServerWorld` + `session_sim` (the one world build, shared with
+  `install_level`), the verdict from the server (`Turn::over`), the close
+  warning. FOUND by the server: the world's pending SOUND vec is hashed
+  and every app drains it per tick — the headless server did not (DESYNC
+  at tick 24 in the first three-process run); and an app with sound AND
+  music off had no mixer and never drained (a latent fork between
+  players). Both drain now (`drain_sounds`). Tests: `net::tests` (14,
+  incl. admin key/role passing, a fork from the SERVER reported, the
+  verdict → lobby, a level the server can't build), `lobby::tests` (10),
+  `net_lockstep_tests` against the real `ServerWorld` (2-4 players, MC1 +
+  MC2, AI rivals 0/3, leaving players incl. the admin, the verdict);
+  kill-switch proved twice (the server skipping banishment / skipping the
+  drain → "forked from the server"). 1,637 workspace tests, clippy clean.
+  Xvfb: `--serve` + two `--join` 28/29 checks, no desync, the verdict
+  reached the last player; `--host` + `--join` 22/22. ⏭ playtest (UI
+  Host → lobby → game → leave → waiting lobby; the close warning).
+- 2026-10-17 #26: ⚖ **THE SESSION'S GAME IS EXPLICIT** (player): it was
+  implicit in the server's level path and unchecked at the door.
+  `lobby::NetGame` (mc1 / mc1hw / mc2 — the baked tree's keys; `arenas()`,
+  `of_level`), `ServerOpts::game`, `LobbyView::game`, `Hello::game`
+  (protocol 6): a player of another game is refused, an admin's level of
+  another game ignored (`LobbyCore::set_level`). `--serve` REQUIRES
+  `--game` (its `--level` must be of it; default level 50); `--host` takes
+  it from its level; `--join --game` optional. Tests
+  `the_session_plays_the_servers_game_only` (kill-switch proved),
+  `a_level_names_its_game`; 1,639 workspace tests, clippy clean. CLI: no
+  `--game` → exit 2; MC2 level under `--game mc1` → refused; an MC1 joiner
+  at an MC2 server → "this server runs Magic Carpet 2".

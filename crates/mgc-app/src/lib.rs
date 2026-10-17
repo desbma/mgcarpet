@@ -2583,6 +2583,13 @@ struct App {
     netlobby: Option<NetLobby>,
     /// A join under way ("Attempting Connection").
     net_connecting: Option<std::thread::JoinHandle<Result<net::Guest, String>>>,
+    /// The server this app hosts (the UI's Host, `--host`): a thread
+    /// of the app, alive until the app closes or its player leaves the
+    /// lobby — every member's session ends with it.
+    net_server: Option<net::ServerHandle>,
+    /// A close with other players still on the hosted server: asked
+    /// once, the second close within the window goes through.
+    close_warned: Option<std::time::Instant>,
     /// A lobby game is running: the campaign is stashed out of its way
     /// (no campaign book, no campaign progress, no saves) …
     lobby_game: bool,
@@ -2886,6 +2893,8 @@ impl App {
             net_end_told: false,
             netlobby: None,
             net_connecting: None,
+            net_server: None,
+            close_warned: None,
             lobby_game: false,
             net_campaign: None,
             net_own_rules: None,
@@ -4100,7 +4109,20 @@ impl App {
                     .iter()
                     .any(|p| p.level != 0 && matches!(p.activated, 1 | 2))
             });
-        let Some(audio) = &mut self.audio else { return };
+        let Some(audio) = &mut self.audio else {
+            // No mixer (sound and music off): the world's sound
+            // requests drain every tick all the same — the pending vec
+            // is HASHED, so a netplay peer that kept it forked from
+            // every other one, and from the server's world.
+            if let Some(w) = self
+                .session
+                .as_deref_mut()
+                .and_then(|s| s.sim.world.as_mut())
+            {
+                drain_sounds(w);
+            }
+            return;
+        };
         let Some(sess) = self.session.as_deref_mut() else {
             return;
         };
@@ -4785,45 +4807,12 @@ impl App {
         self.paused = false;
         self.menu = None;
         self.mini = None;
-        let mut sim = match level.world.take() {
-            Some(mut w) => {
-                w.terrain_dirty = true;
-                w.entities_dirty = true;
-                apply_instruments(
-                    &mut w,
-                    self.cfg.gameplay.cheat.dev_spells,
-                    &level.plausible_book_mc2,
-                    self.cfg.gameplay.cheat.invincible,
-                    self.cfg.gameplay.cheat.ghost,
-                    self.cfg.gameplay.cheat.inert,
-                    self.world_patches_now(),
-                );
-                if let Some(run) = &self.campaign {
-                    apply_campaign_book(&mut w, run, &level.mc2_human_blocked);
-                }
-                Simulation::with_world(w)
-            }
-            None => Simulation::with_terrain(level.height.clone()),
-        };
-        // Each seat its player's models (netplay); else everyone the
-        // local config's.
-        for hx in sim.seat_ixs() {
-            let m = self
-                .net_models
-                .get(usize::from(hx.0))
-                .unwrap_or(&self.cfg.controls.models);
-            sim.thrust_model[hx] = sim_thrust(m.thrust);
-            sim.altitude_model[hx] = sim_altitude(m.altitude);
-        }
-        // Weightless cheat: unclamp the enhanced-altitude band to the
-        // global lift ceiling (highest terrain + the 4-tile margin).
-        sim.weightless = self.cfg.gameplay.cheat.weightless;
-        // `level.start` is the world's FIRST seat's marker (the other
-        // seats stand on their carpet records — `Simulation::with_world`).
-        if let Some(start) = level.start {
-            sim.flyer[mgc_sim::Hx::FIRST] = start;
-            sim.sync_carpet_from_flyer(mgc_sim::Hx::FIRST);
-        }
+        let sim = session_sim(
+            &mut level,
+            &self.cfg,
+            &self.net_models,
+            self.campaign.as_ref(),
+        );
         let prev_flyer = sim.flyer[local_hx()];
         // A button held across the level change must not resume its
         // autofire chain in the new world.
@@ -6974,18 +6963,12 @@ impl App {
     fn confirm_exit(&mut self, event_loop: &ActiveEventLoop) {
         self.exit_confirm = false;
         if self.lobby_game {
-            // The host ends the game for everyone (the lobby reopens);
-            // a client leaves the GAME, not the session: the host plays
-            // on, and his lobby waits for the game to finish
-            // (`Lockstep::leave`; its Exit goes elsewhere).
-            if self.net.as_ref().is_some_and(|n| n.is_host()) {
-                println!("net: ending the game — back to the lobby");
-                self.net_game_over();
-            } else {
-                println!("net: left the game");
-                let session = self.net.take().and_then(net::Lockstep::leave);
-                self.end_lobby_game(session);
-            }
+            // Everyone — the hosting player too (player 2026-10-17) —
+            // leaves the GAME, not the session: the rest play on, and
+            // his lobby waits for the game to finish
+            // (`Lockstep::finish`; its Exit goes elsewhere).
+            println!("net: left the game");
+            self.net_game_over();
             return;
         }
         if self
@@ -9005,7 +8988,7 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => self.request_close(event_loop),
             WindowEvent::Resized(size) => {
                 if let Some(r) = &mut self.renderer {
                     r.resize(size.width, size.height);
@@ -10169,11 +10152,15 @@ enum NetTurn {
     Ready(Vec<FlightInput>, Vec<u8>),
 }
 
-/// `--host` / `--join`: which end of a netplay link this app is.
+/// `--host` / `--join` / `--serve`: which end of a netplay link this
+/// app is.
 #[derive(Debug, Clone)]
 enum NetArg {
+    /// A server on a thread of this app, joined as its admin.
     Host(String),
     Join(String),
+    /// The dedicated server alone (headless).
+    Serve(String),
 }
 
 /// The default netplay port.
@@ -10324,6 +10311,9 @@ struct Args {
     /// `--passphrase WORD`: the netplay session's passphrase — the host
     /// sets it, a joiner must match it (empty when not given).
     passphrase: String,
+    /// `--game mc1|mc1hw|mc2`: the netplay session's game — required by
+    /// `--serve`; a `--join` with it is refused by a server of another.
+    net_game: Option<lobby::NetGame>,
     /// `--replay <take.mgcr>`: play a recording as the session's only
     /// input source — SOURCE-AGNOSTIC (retail takes via inline input
     /// recovery, port recordings via the exact input channel);
@@ -10422,6 +10412,7 @@ fn parse_args() -> Result<Args, String> {
     let mut seat = 0u8;
     let mut net_arg = None;
     let mut passphrase = String::new();
+    let mut net_game = None;
     let mut pool_slots = None;
     let mut replay = None;
     let mut third_person = false;
@@ -10803,21 +10794,33 @@ fn parse_args() -> Result<Args, String> {
                 };
                 net_arg = Some(NetArg::Host(net_addr(&addr, "0.0.0.0")));
             }
+            "--serve" => {
+                let addr = match it.peek() {
+                    Some(a) if !a.starts_with("--") => it.next().unwrap_or_default(),
+                    _ => String::new(),
+                };
+                net_arg = Some(NetArg::Serve(net_addr(&addr, "0.0.0.0")));
+            }
             "--join" => {
-                let addr = it.next().ok_or("--join needs the host's address")?;
+                let addr = it.next().ok_or("--join needs the server's address")?;
                 net_arg = Some(NetArg::Join(net_addr(&addr, "127.0.0.1")));
             }
             "--passphrase" => {
                 passphrase = it.next().ok_or("--passphrase needs a word")?;
+            }
+            "--game" => {
+                let key = it.next().ok_or("--game needs mc1, mc1hw or mc2")?;
+                net_game = Some(lobby::NetGame::parse(&key).map_err(|e| format!("--game: {e}"))?);
             }
             "--help" | "-h" => {
                 return Err(format!(
                     "usage: mgcarpet [--level <game:index> | <baked/.../level-NNN.mgcl>] \
                      [--campaign mc1|mc1hw|mc2 [--slot N] [--new-game]] \
                      [--seat 1-8 (fly that wizard seat; --level only)] \
-                     [--host [ADDR] | --join ADDR (two-seat netplay; port {NET_PORT} \
-                     by default, the joiner adopts the host's level and options) \
-                     [--passphrase WORD]] \
+                     [--host [ADDR] | --join ADDR | --serve [ADDR] (netplay; port {NET_PORT} \
+                     by default; --host = a server in this app + its admin player, \
+                     --serve = the dedicated server alone, headless; needs \
+                     --game mc1|mc1hw|mc2) [--passphrase WORD]] \
                      (slot 0 = default: a fresh run, saved only from the in-game menu) \
                      [--tileset 0|1] [--config <path>] \
                      [--smooth-shading|--no-smooth-shading] \
@@ -10949,6 +10952,7 @@ fn parse_args() -> Result<Args, String> {
         seat,
         net: net_arg,
         passphrase,
+        net_game,
         replay,
         third_person,
         film,
@@ -11485,6 +11489,77 @@ fn mc2_sky_srgb(level: &LoadedLevel) -> Option<[f32; 3]> {
         rgb[1] as f32 / 255.0,
         rgb[2] as f32 / 255.0,
     ])
+}
+
+/// A loaded level's world made a running simulation — the ONE build
+/// every netplay peer and the server's referee share (`install_level`,
+/// `ServerWorld`): the instruments and patches, the campaign book, each
+/// seat's flight models (`models`, seat order; the config's for a seat
+/// without), the weightless cheat, the first seat's start marker.
+fn session_sim(
+    level: &mut LoadedLevel,
+    cfg: &config::Config,
+    models: &[config::ControlModels],
+    campaign: Option<&CampaignRun>,
+) -> Simulation {
+    let mut sim = match level.world.take() {
+        Some(mut w) => {
+            w.terrain_dirty = true;
+            w.entities_dirty = true;
+            apply_instruments(
+                &mut w,
+                cfg.gameplay.cheat.dev_spells,
+                &level.plausible_book_mc2,
+                cfg.gameplay.cheat.invincible,
+                cfg.gameplay.cheat.ghost,
+                cfg.gameplay.cheat.inert,
+                session_patches(cfg, models),
+            );
+            if let Some(run) = campaign {
+                apply_campaign_book(&mut w, run, &level.mc2_human_blocked);
+            }
+            Simulation::with_world(w)
+        }
+        None => Simulation::with_terrain(level.height.clone()),
+    };
+    // Each seat its player's models (netplay); else everyone the
+    // config's.
+    for hx in sim.seat_ixs() {
+        let m = models
+            .get(usize::from(hx.0))
+            .unwrap_or(&cfg.controls.models);
+        sim.thrust_model[hx] = sim_thrust(m.thrust);
+        sim.altitude_model[hx] = sim_altitude(m.altitude);
+    }
+    // Weightless cheat: unclamp the enhanced-altitude band to the
+    // global lift ceiling (highest terrain + the 4-tile margin).
+    sim.weightless = cfg.gameplay.cheat.weightless;
+    // `level.start` is the world's FIRST seat's marker (the other
+    // seats stand on their carpet records — `Simulation::with_world`).
+    if let Some(start) = level.start {
+        sim.flyer[mgc_sim::Hx::FIRST] = start;
+        sim.sync_carpet_from_flyer(mgc_sim::Hx::FIRST);
+    }
+    sim
+}
+
+/// The world patches in force: the config's — but in a netplay game
+/// (`models` per seat) the leviathan's lift counterweight
+/// (`mc2_leviathan_high_lunge`, keyed on the ENHANCED altitude model)
+/// follows the seats' models, on when any seat flies the enhanced
+/// lift, so every peer agrees.
+fn session_patches(
+    cfg: &config::Config,
+    models: &[config::ControlModels],
+) -> mgc_sim::WorldPatches {
+    let mut p = world_patches(cfg);
+    if !models.is_empty() {
+        let any = models
+            .iter()
+            .any(|m| m.altitude == config::AltitudeModel::Enhanced);
+        p.mc2_leviathan_high_lunge = p.mc2_leviathan_true_aim && any;
+    }
+    p
 }
 
 /// Apply the playtest instruments to a freshly built world — ONE place
@@ -12617,19 +12692,24 @@ pub fn game_main(event_loop: Option<EventLoop<()>>) -> std::process::ExitCode {
     }
     // Netplay: handshake BEFORE any world — the joiner learns the
     // level, the seats and the host's sim-affecting options from it.
-    let net_link = match &args.net {
+    // `--serve`: the dedicated server — no window, no world of its own
+    // until a game starts.
+    if let Some(NetArg::Serve(addr)) = &args.net {
+        return run_server(addr, &args);
+    }
+    let (net_link, net_server) = match &args.net {
         Some(net_arg) => match net_handshake(net_arg, &args, &mut cfg, &mut level_path) {
-            Ok(link) => Some(link),
+            Ok((link, server)) => (Some(link), server),
             Err(e) => {
                 eprintln!("error: {e}");
                 return std::process::ExitCode::FAILURE;
             }
         },
-        None => None,
+        None => (None, None),
     };
     let boot_seats = net_link
         .as_ref()
-        .map_or_else(|| vec![args.seat], |l| l.seats.clone());
+        .map_or_else(|| vec![args.seat], |l| l.game.seats.clone());
     // Re-derive the offline pool params after the replay pin — which
     // SET them from the take rather than clearing them, so the world is
     // built at the recorded size and the start snapshot applies (and
@@ -12688,7 +12768,9 @@ pub fn game_main(event_loop: Option<EventLoop<()>>) -> std::process::ExitCode {
     let mut boot_level = if (campaign_run.is_some() && !headless) || launcher {
         None
     } else {
-        match load_level(
+        // A netplay launch seats the session's AI count, as every peer
+        // and the server's world do (`net_level`).
+        match load_level_with(
             &level_path,
             args.tileset,
             args.terrain_features,
@@ -12698,6 +12780,7 @@ pub fn game_main(event_loop: Option<EventLoop<()>>) -> std::process::ExitCode {
             awake_range,
             false,
             &boot_seats,
+            net_link.as_ref().map(|l| l.game.ai),
         ) {
             Ok(l) => Some(l),
             Err(e) => {
@@ -12928,10 +13011,12 @@ pub fn game_main(event_loop: Option<EventLoop<()>>) -> std::process::ExitCode {
         film,
     );
     if let Some(link) = &net_link {
-        app.net_models = net_seat_models(&link.models, &app.cfg.controls.models);
+        app.net_models = net_seat_models(&link.game.models, &app.cfg.controls.models);
+        app.net_names = given_names(&link.game);
         app.apply_net_models();
     }
     app.net = net_link.map(net::Lockstep::start);
+    app.net_server = net_server;
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("error: event loop: {e}");
         return std::process::ExitCode::FAILURE;
@@ -12942,14 +13027,13 @@ pub fn game_main(event_loop: Option<EventLoop<()>>) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// The sim-affecting configuration a netplay host imposes on the
-/// joiner: both peers must build and step identical worlds.
 /// The netplay lobby between games: the session and its screen.
 struct NetLobby {
-    session: net::Session,
+    guest: net::Guest,
     screen: lobby_mc2::LobbyScreen,
-    /// The rules the scroll's rows were last read from.
-    rules_shown: Option<(serde_json::Value, u8)>,
+    /// The rules the scroll's rows were last read from (and the
+    /// admin's passphrase).
+    rules_shown: Option<(serde_json::Value, u8, Option<String>)>,
 }
 
 /// The lobby's rules scroll: (label, config path) — the session values
@@ -12999,10 +13083,7 @@ fn lobby_rule_rows(rules: &serde_json::Value, specs: &[settings::Spec]) -> Vec<l
 
 impl NetLobby {
     fn view(&self) -> lobby::LobbyView {
-        match &self.session {
-            net::Session::Host(h) => h.view(),
-            net::Session::Guest(g) => g.view().clone(),
-        }
+        self.guest.view().clone()
     }
 }
 
@@ -13095,20 +13176,9 @@ impl NetPrefs {
 /// The netplay lobby's flow (the MC2 Multiplayer button): entry, the
 /// lobby frame, a game's start, and the way back (ruling 10).
 impl App {
-    /// The world patches in force: the config's — but in a netplay game
-    /// the leviathan's lift counterweight (`mc2_leviathan_high_lunge`,
-    /// keyed on the ENHANCED altitude model) follows the seats' models,
-    /// on when any seat flies the enhanced lift, so every peer agrees.
+    /// The world patches in force (`session_patches`).
     fn world_patches_now(&self) -> mgc_sim::WorldPatches {
-        let mut p = world_patches(&self.cfg);
-        if !self.net_models.is_empty() {
-            let any = self
-                .net_models
-                .iter()
-                .any(|m| m.altitude == config::AltitudeModel::Enhanced);
-            p.mc2_leviathan_high_lunge = p.mc2_leviathan_true_aim && any;
-        }
-        p
+        session_patches(&self.cfg, &self.net_models)
     }
 
     /// A netplay game: each seat flies its own player's models, and the
@@ -13146,46 +13216,26 @@ impl App {
         }
     }
 
-    /// A seat's shown name: the player's given name, else the wizard's.
-    fn seat_name(&self, seat: u8) -> String {
-        self.net_names
-            .iter()
-            .find(|(s, _)| *s == seat)
-            .map(|(_, n)| n.clone())
-            .unwrap_or_else(|| {
-                let s = usize::from(seat.min(7));
-                if self.is_mc2() {
-                    mgc_sim::mc2::rivals::MC2_RIVAL_NAMES[s].into()
-                } else {
-                    mgc_sim::mc1::rivals::RIVAL_NAMES[s].into()
-                }
-            })
-    }
-
     /// A network game's standings, once a frame: a banished player is
-    /// told he waits for the end; when one wizard alone stands (or no
-    /// human does) the game is over — the winner is named and the
-    /// fade-out takes everyone back to the lobby (a won level's path).
+    /// told he waits for the end; the game is over when the SERVER says
+    /// so (its world's verdict, [`net_verdict`]) — the winner is named
+    /// and the fade-out takes everyone back to the lobby (a won level's
+    /// path). A session already lost judges its own world.
     fn net_standings(&mut self) {
         let Some(w) = self.session.as_deref().and_then(|s| s.sim.world.as_ref()) else {
             return;
         };
-        if w.seat_ixs().count() < 2 {
-            return;
-        }
         let banished = w.banished(local_hx());
-        let over = if self.won_handled {
-            None
-        } else {
-            let (humans, rivals) = w.contenders();
-            (humans.is_empty() || humans.len() + rivals.len() <= 1).then(|| {
-                match (humans.first(), rivals.first()) {
-                    (Some(&hx), _) => self.seat_name(w.human_wizard_seat(hx)),
-                    (None, Some(&slot)) => self.seat_name(slot),
-                    (None, None) => "Nobody".into(),
-                }
-            })
-        };
+        let lost = self.net.as_ref().is_some_and(|n| n.closed().is_some());
+        let local = (lost && !self.won_handled)
+            .then(|| net_verdict(w, &self.net_names))
+            .flatten();
+        let over = self
+            .net
+            .as_mut()
+            .and_then(net::Lockstep::take_verdict)
+            .or(local)
+            .filter(|_| !self.won_handled);
         let Some(w) = self
             .session
             .as_deref_mut()
@@ -13193,12 +13243,12 @@ impl App {
         else {
             return;
         };
-        if let Some(winner) = over {
-            println!("net: the game is over — {winner} is victorious");
-            w.notify_option(format!("{winner} is victorious!"));
+        if let Some(verdict) = over {
+            println!("net: the game is over — {verdict}");
+            w.notify_option(verdict);
             self.won_handled = true;
             self.quit_fade = Some(-1.0);
-        } else if banished && !self.won_handled {
+        } else if banished && !self.won_handled && w.seat_ixs().count() > 1 {
             w.notify_option("Banished - waiting for the game to end");
         }
     }
@@ -13244,11 +13294,11 @@ impl App {
         }
     }
 
-    fn open_lobby(&mut self, session: net::Session) {
+    fn open_lobby(&mut self, guest: net::Guest) {
         match lobby_mc2::LobbyScreen::load(&get_baked_directory().join("assets/mc2-ui")) {
             Ok(screen) => {
                 self.netlobby = Some(NetLobby {
-                    session,
+                    guest,
                     screen,
                     rules_shown: None,
                 });
@@ -13258,25 +13308,31 @@ impl App {
         }
     }
 
-    /// Host: open a lobby on `port`, the first arena up.
+    /// Host: start a server on `port` (a thread of this app, the first
+    /// arena up) and join it as its admin — the same server
+    /// `--serve` runs, so a friend's game and a dedicated one are one
+    /// thing (player 2026-10-17). It lives until the app closes or its
+    /// player leaves the lobby.
     fn host_lobby(&mut self, port: String, passphrase: String) {
         let mut prefs = NetPrefs::load();
         prefs.port = port.clone();
         prefs.passphrase = passphrase.clone();
         prefs.save();
         let addr = net_addr(&port, "0.0.0.0");
-        match net::Host::open(
-            &addr,
-            0,
-            self.campaign_player_name(),
-            mc2_arena_path(*MC2_ARENAS.start()),
-            rules::session(&self.cfg),
-            passphrase,
-            net::build_id(),
-        ) {
-            Ok(h) => {
-                println!("net: hosting a lobby on {}", h.addr());
-                self.open_lobby(net::Session::Host(h));
+        self.net_server = None;
+        let opts = net::ServerOpts {
+            game: self.net_game(),
+            passphrase: passphrase.clone(),
+            build: net::build_id(),
+            level: mc2_arena_path(*MC2_ARENAS.start()),
+            rules: rules::session(&self.cfg),
+            admin_key: None,
+        };
+        match net::ServerHandle::spawn(&addr, opts, ServerWorld::boxed) {
+            Ok(server) => {
+                let (local, key) = (server.local_addr(), server.admin_key().to_string());
+                self.net_server = Some(server);
+                self.connect_lobby(local, passphrase, key);
             }
             Err(e) => self.net_message(e),
         }
@@ -13298,15 +13354,34 @@ impl App {
         }
         prefs.passphrase = passphrase.clone();
         prefs.save();
-        let addr = net_addr(&addr, "127.0.0.1");
+        self.connect_lobby(net_addr(&addr, "127.0.0.1"), passphrase, String::new());
+    }
+
+    /// The game this app's lobby plays — the running campaign's (the
+    /// MC2 temple's Multiplayer button is the only way in so far).
+    fn net_game(&self) -> lobby::NetGame {
+        match self.campaign.as_ref().map(|c| c.id) {
+            Some(campaign::CampaignId::Mc1) => lobby::NetGame::Mc1,
+            Some(campaign::CampaignId::Mc1Hw) => lobby::NetGame::Mc1hw,
+            Some(campaign::CampaignId::Mc2) | None => lobby::NetGame::Mc2,
+        }
+    }
+
+    /// Connect to a server off the frame loop (one of this app's game —
+    /// a server of another refuses us); `admin_key` claims a hosted
+    /// server's admin role (our own).
+    fn connect_lobby(&mut self, addr: String, passphrase: String, admin_key: String) {
         let build = net::build_id();
         let name = self.campaign_player_name();
+        let game = Some(self.net_game());
         self.net_connecting = Some(std::thread::spawn(move || {
             net::Guest::connect(
                 &addr,
                 &passphrase,
                 &name,
+                game,
                 &build,
+                &admin_key,
                 std::time::Duration::from_secs(10),
             )
         }));
@@ -13332,9 +13407,26 @@ impl App {
             m.close_connecting();
         }
         match joined {
-            Some(Ok(g)) => self.open_lobby(net::Session::Guest(g)),
-            Some(Err(e)) => self.net_message(e),
+            Some(Ok(g)) => self.open_lobby(g),
+            Some(Err(e)) => {
+                // Our own server, unreachable: no use keeping it up.
+                self.net_server = None;
+                self.net_message(e);
+            }
             None => {}
+        }
+    }
+
+    /// Leave the lobby for the temple. A hosting player's server stops
+    /// with it — the session ends for everyone in it.
+    fn leave_lobby(&mut self, why: Option<String>) {
+        self.netlobby = None;
+        self.ui_atlas = UiAtlas::None;
+        if self.net_server.take().is_some() {
+            println!("net: the hosted server stopped");
+        }
+        if let Some(why) = why {
+            self.net_message(format!("Left the lobby: {why}"));
         }
     }
 
@@ -13343,38 +13435,20 @@ impl App {
         let models = serde_json::to_value(&self.cfg.controls.models).expect("models serialize");
         let (size, cursor) = (self.view_size(), self.cursor);
         let Some(nl) = &mut self.netlobby else { return };
-        let mut closed = None;
-        match &mut nl.session {
-            net::Session::Host(h) => {
-                h.set_models(models);
-                h.poll();
-                for n in h.take_notes() {
-                    println!("net: {n}");
-                }
-            }
-            net::Session::Guest(g) => {
-                g.set_models(models);
-                g.poll();
-                closed = g.closed().map(str::to_string);
-            }
+        nl.guest.set_models(models);
+        nl.guest.poll();
+        for n in nl.guest.take_notices() {
+            println!("net: {n}");
         }
-        if let Some(why) = closed {
-            self.netlobby = None;
-            self.ui_atlas = UiAtlas::None;
-            self.net_message(format!("Left the lobby: {why}"));
+        if let Some(why) = nl.guest.closed().map(str::to_string) {
+            self.leave_lobby(Some(why));
             return;
         }
-        if let net::Session::Guest(g) = &nl.session
-            && g.started()
-        {
-            let Some(NetLobby {
-                session: net::Session::Guest(g),
-                ..
-            }) = self.netlobby.take()
-            else {
+        if nl.guest.started() {
+            let Some(NetLobby { guest, .. }) = self.netlobby.take() else {
                 return;
             };
-            match g.into_link() {
+            match guest.into_link() {
                 Ok(link) => self.start_net_game(link),
                 Err(_) => unreachable!("started"),
             }
@@ -13382,7 +13456,7 @@ impl App {
         }
         let view = nl.view();
         nl.screen.update(&view);
-        let shown = (view.rules.clone(), view.ai);
+        let shown = (view.rules.clone(), view.ai, view.passphrase.clone());
         if nl.rules_shown.as_ref() != Some(&shown) {
             let mut rows = lobby_rule_rows(&view.rules, &self.specs);
             // The AI wizards: the scroll's last row (a lobby rule, not
@@ -13391,11 +13465,7 @@ impl App {
                 label: "AI wizards".into(),
                 value: view.ai.to_string(),
             });
-            let pass = match &nl.session {
-                net::Session::Host(h) => Some(h.passphrase().to_string()),
-                net::Session::Guest(_) => None,
-            };
-            nl.screen.set_rules(rows, pass);
+            nl.screen.set_rules(rows, view.passphrase.clone());
             nl.rules_shown = Some(shown);
         }
         nl.screen.tick(dt);
@@ -13430,151 +13500,104 @@ impl App {
 
     fn lobby_action(&mut self, action: lobby_mc2::LobbyAction, view: &lobby::LobbyView) {
         use lobby_mc2::LobbyAction as A;
+        if action == A::Exit {
+            println!("net: left the lobby");
+            self.leave_lobby(None);
+            return;
+        }
         let Some(nl) = &mut self.netlobby else { return };
+        let g = &mut nl.guest;
         let me = view.me().map_or(0, |m| m.wizard);
         let forward = matches!(action, A::NextLevel | A::NextWizard);
-        match (&mut nl.session, action) {
-            (_, A::Exit) => {
-                println!("net: left the lobby");
-                self.netlobby = None;
-                self.ui_atlas = UiAtlas::None;
-            }
-            (net::Session::Host(h), A::PrevLevel | A::NextLevel) => {
-                let up = forward;
-                let (lo, hi) = (*MC2_ARENAS.start(), *MC2_ARENAS.end());
-                let n = arena_of(&view.level).unwrap_or(lo);
-                let n = match (up, n) {
-                    (true, n) if n >= hi => lo,
-                    (true, n) => n + 1,
-                    (false, n) if n <= lo => hi,
-                    (false, n) => n - 1,
-                };
-                h.set_level(mc2_arena_path(n));
-            }
-            (net::Session::Host(_), A::Play) => {
-                let Some(NetLobby {
-                    session: net::Session::Host(h),
-                    screen,
-                    rules_shown,
-                }) = self.netlobby.take()
-                else {
-                    return;
-                };
-                match h.play() {
-                    Ok(link) => self.start_net_game(link),
-                    Err(h) => {
-                        self.netlobby = Some(NetLobby {
-                            session: net::Session::Host(*h),
-                            screen,
-                            rules_shown,
-                        });
-                    }
+        let admin = view.is_admin();
+        match action {
+            A::Exit => {}
+            A::PrevWizard | A::NextWizard => {
+                let dir = if forward { 1 } else { -1 };
+                if let Some(w) = view.next_free(me, dir) {
+                    g.pick_wizard(w);
                 }
             }
-            (net::Session::Guest(g), A::Play) => {
+            // Play: the admin's starts the game (the server checks the
+            // agreement); everyone else's toggles his agreement.
+            A::Play if admin => g.play(),
+            A::Play => {
                 if view.me().is_some_and(|m| m.agreed) {
                     g.withdraw();
                 } else {
                     g.agree();
                 }
             }
-            (session, A::PrevWizard | A::NextWizard) => {
-                let dir = if forward { 1 } else { -1 };
-                if let Some(w) = view.next_free(me, dir) {
-                    match session {
-                        net::Session::Host(h) => {
-                            h.pick_wizard(w);
-                        }
-                        net::Session::Guest(g) => g.pick_wizard(w),
-                    }
-                }
+            // The rest are the admin's.
+            _ if !admin => {}
+            A::PrevLevel | A::NextLevel => {
+                let (lo, hi) = (*MC2_ARENAS.start(), *MC2_ARENAS.end());
+                let n = arena_of(&view.level).unwrap_or(lo);
+                let n = match (forward, n) {
+                    (true, n) if n >= hi => lo,
+                    (true, n) => n + 1,
+                    (false, n) if n <= lo => hi,
+                    (false, n) => n - 1,
+                };
+                g.set_level(mc2_arena_path(n));
             }
-            (net::Session::Host(h), A::Kick(id)) => h.kick(id),
-            (net::Session::Host(h), A::CycleCapacity) => {
+            A::Kick(id) => g.kick(id),
+            A::CycleCapacity => {
                 let next = usize::from(view.capacity) + 1;
-                h.set_capacity(if next > net::MAX_PLAYERS { 2 } else { next });
+                g.set_capacity(if next > net::MAX_PLAYERS { 2 } else { next });
             }
-            (net::Session::Host(h), A::StepRule { row, forward }) if row == LOBBY_RULES.len() => {
-                h.set_ai(if forward {
+            A::StepRule { row, forward } if row == LOBBY_RULES.len() => {
+                g.set_ai(if forward {
                     view.ai.saturating_add(1)
                 } else {
                     view.ai.saturating_sub(1)
                 });
             }
-            (net::Session::Host(h), A::StepRule { row, forward }) => {
-                // The session's rules are the LOBBY's, not the host's
+            A::StepRule { row, forward } => {
+                // The session's rules are the LOBBY's, not the admin's
                 // own options: step a scratch copy, so a lobby choice
                 // never reaches his config, his screen or his
                 // `mgcarpet.json` (player-reported 2026-10-16: a lobby
                 // fog leaked into single-player).
                 if let Some(rules) = step_lobby_rule(&view.rules, row, forward, &self.specs) {
-                    h.set_rules(rules);
+                    g.set_rules(rules);
                 }
             }
-            (net::Session::Host(h), A::SetPassphrase(p)) => {
+            A::SetPassphrase(p) => {
                 println!("net: the passphrase changed");
-                h.set_passphrase(p.clone());
-                // The scroll's passphrase row reads it afresh.
-                nl.rules_shown = None;
+                g.set_passphrase(p.clone());
                 let mut prefs = NetPrefs::load();
                 prefs.passphrase = p;
                 prefs.save();
             }
-            (
-                net::Session::Guest(_),
-                A::PrevLevel
-                | A::NextLevel
-                | A::Kick(_)
-                | A::SetPassphrase(_)
-                | A::StepRule { .. }
-                | A::CycleCapacity,
-            ) => {}
         }
     }
 
-    /// Play: build the agreed world and run the lockstep. A client
-    /// plays by the host's rules (its own come back afterwards); the
+    /// Play: build the agreed world and run the lockstep. Everyone plays
+    /// by the session's rules (his own come back afterwards); the
     /// campaign steps aside — every seat gets the level's own book
     /// (retail: campaign spells are ignored), and nothing a lobby game
     /// does touches the campaign.
     fn start_net_game(&mut self, link: net::Link) {
-        // Everyone — the host too — plays by the session's rules.
         self.net_own_rules = Some(rules::collect(&self.cfg));
-        self.adopt_rules(&link.config);
-        self.net_models = net_seat_models(&link.models, &self.cfg.controls.models);
+        self.adopt_rules(&link.game.rules);
+        self.net_models = net_seat_models(&link.game.models, &self.cfg.controls.models);
         LOCAL_SEAT.store(link.local.0, std::sync::atomic::Ordering::Relaxed);
-        let seed = if self.cfg.dev.plausible_spellbook {
-            SpellbookSeed::Plausible
-        } else {
-            SpellbookSeed::Level
-        };
-        let level = load_level_with(
-            std::path::Path::new(&link.level),
+        let level = net_level(
+            &link.game,
+            &self.cfg,
             self.launch.tileset,
             self.launch.terrain_features,
-            &seed,
-            &[],
-            self.cfg.sim.parameters.entity_pool_size.map(|n| n as usize),
-            self.cfg.sim.parameters.awake_range,
-            false,
-            &link.seats,
-            Some(link.ai),
         );
         match level {
             Ok(level) => {
                 println!(
                     "net: the game begins — {} as seat {}",
-                    arena_label(&link.level),
-                    link.seats[usize::from(link.local.0)] + 1
+                    arena_label(&link.game.level),
+                    link.game.seats[usize::from(link.local.0)] + 1
                 );
                 self.lobby_game = true;
-                self.net_names = link
-                    .seats
-                    .iter()
-                    .zip(&link.names)
-                    .filter(|(_, n)| !n.is_empty())
-                    .map(|(&s, n)| (s, n.clone()))
-                    .collect();
+                self.net_names = given_names(&link.game);
                 self.net_campaign = self.campaign.take();
                 self.install_level(level);
                 self.apply_net_models();
@@ -13586,21 +13609,26 @@ impl App {
             Err(e) => {
                 // Nobody plays a world this peer cannot build: leave
                 // (the others see the departure).
-                drop(link);
-                self.end_lobby_game(None);
+                let session = net::Lockstep::start(link).finish();
+                self.end_lobby_game(session);
                 self.net_message(format!("the level would not load: {e}"));
             }
         }
     }
 
-    /// The lobby game is over (won, the host ended it, or we left):
-    /// back to the lobby when the session survives, else the temple.
+    /// The lobby game is over for us (the verdict's fade ran out, the
+    /// server reopened the lobby, or we left): back to the lobby —
+    /// waiting for the game to finish when it still runs — when the
+    /// session survives, else the temple.
     fn net_game_over(&mut self) {
-        let session = self.net.take().and_then(net::Lockstep::end);
+        let session = self.net.take().and_then(net::Lockstep::finish);
+        if session.is_none() {
+            self.net_server = None;
+        }
         self.end_lobby_game(session);
     }
 
-    fn end_lobby_game(&mut self, session: Option<net::Session>) {
+    fn end_lobby_game(&mut self, session: Option<net::Guest>) {
         if let Some(own) = self.net_own_rules.take() {
             self.adopt_rules(&own);
         }
@@ -13616,17 +13644,196 @@ impl App {
             self.open_lobby(s);
         }
     }
+
+    /// The other players a closing app would leave behind: members of
+    /// the server it hosts (itself not counted) — the close warning.
+    fn hosted_others(&self) -> usize {
+        self.net_server
+            .as_ref()
+            .map_or(0, |s| s.status().members.saturating_sub(1))
+    }
+
+    /// The window's close: an app hosting a server that others are on
+    /// warns first (player 2026-10-17 — closing it ends the session for
+    /// everyone); a second close within the warning's window goes
+    /// through.
+    fn request_close(&mut self, event_loop: &ActiveEventLoop) {
+        let others = self.hosted_others();
+        let warned = self
+            .close_warned
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(5));
+        if others == 0 || warned {
+            event_loop.exit();
+            return;
+        }
+        self.close_warned = Some(std::time::Instant::now());
+        let text = format!(
+            "{others} player{} still in this session - close again to end it for everyone",
+            if others == 1 { "" } else { "s" }
+        );
+        match &mut self.netlobby {
+            Some(nl) => {
+                println!("net: {text}");
+                nl.screen.alert(text);
+            }
+            None => self.mini_toast(text),
+        }
+    }
+}
+
+/// The given player names of a lobby game, by wizard seat.
+fn given_names(game: &net::Game) -> Vec<(u8, String)> {
+    game.seats
+        .iter()
+        .zip(&game.names)
+        .filter(|(_, n)| !n.is_empty())
+        .map(|(&s, n)| (s, n.clone()))
+        .collect()
+}
+
+/// A lobby game's level as every peer builds it — the players and the
+/// server's referee alike (`tileset` and `terrain_features` are the
+/// player's launch flags; the referee runs the defaults).
+fn net_level(
+    game: &net::Game,
+    cfg: &config::Config,
+    tileset: Option<u8>,
+    terrain_features: bool,
+) -> Result<LoadedLevel, String> {
+    let seed = if cfg.dev.plausible_spellbook {
+        SpellbookSeed::Plausible
+    } else {
+        SpellbookSeed::Level
+    };
+    load_level_with(
+        std::path::Path::new(&game.level),
+        tileset,
+        terrain_features,
+        &seed,
+        &[],
+        cfg.sim.parameters.entity_pool_size.map(|n| n as usize),
+        cfg.sim.parameters.awake_range,
+        false,
+        &game.seats,
+        Some(game.ai),
+    )
+}
+
+/// Drop a step's sound requests unheard — what the app's `audio_tick`
+/// does every tick with them, minus the mixer. The world's pending
+/// vec is HASHED: every peer (and the server's world) must drain it
+/// the same way, heard or not.
+fn drain_sounds(w: &mut mgc_sim::engine::world::World) {
+    let _ = w.take_audio(
+        mgc_sim::Hx::FIRST,
+        mgc_sim::engine::world::PlayerPose::from_tiles(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    );
+}
+
+/// A seat's shown name: the player's given name, else the wizard's.
+fn seat_display_name(names: &[(u8, String)], seat: u8, mc2: bool) -> String {
+    names
+        .iter()
+        .find(|(s, _)| *s == seat)
+        .map(|(_, n)| n.clone())
+        .unwrap_or_else(|| {
+            let s = usize::from(seat.min(7));
+            if mc2 {
+                mgc_sim::mc2::rivals::MC2_RIVAL_NAMES[s].into()
+            } else {
+                mgc_sim::mc1::rivals::RIVAL_NAMES[s].into()
+            }
+        })
+}
+
+/// A network game's verdict on `w`: when one wizard alone stands (or
+/// no human does), the winner's announcement. A one-human world (a
+/// solo test) is never decided.
+fn net_verdict(w: &mgc_sim::engine::world::World, names: &[(u8, String)]) -> Option<String> {
+    if w.seat_ixs().count() < 2 {
+        return None;
+    }
+    let (humans, rivals) = w.contenders();
+    if !humans.is_empty() && humans.len() + rivals.len() > 1 {
+        return None;
+    }
+    let mc2 = w.game() == mgc_sim::ids::GameId::Mc2;
+    let winner = match (humans.first(), rivals.first()) {
+        (Some(&hx), _) => seat_display_name(names, w.human_wizard_seat(hx), mc2),
+        (None, Some(&slot)) => seat_display_name(names, slot, mc2),
+        (None, None) => "Nobody".into(),
+    };
+    Some(format!("{winner} is victorious!"))
+}
+
+/// The server's own world (`net::Referee`): every lobby game built the
+/// way each player builds his (`net_level` + `session_sim`, the
+/// session's rules over the defaults), stepped headless with every
+/// turn — the hash the players are checked against, and the verdict.
+#[derive(Default)]
+struct ServerWorld {
+    sim: Option<Simulation>,
+    names: Vec<(u8, String)>,
+}
+
+impl ServerWorld {
+    fn boxed() -> Box<dyn net::Referee> {
+        Box::<Self>::default()
+    }
+}
+
+impl net::Referee for ServerWorld {
+    fn begin(&mut self, game: &net::Game) -> Result<(), String> {
+        let mut cfg = config::Config::default();
+        rules::adopt(&mut cfg, &game.rules)?;
+        let models = net_seat_models(&game.models, &cfg.controls.models);
+        let mut level = net_level(game, &cfg, None, true)?;
+        self.sim = Some(session_sim(&mut level, &cfg, &models, None));
+        self.names = given_names(game);
+        Ok(())
+    }
+
+    fn hash(&self) -> u64 {
+        self.sim.as_ref().map_or(0, Simulation::state_hash)
+    }
+
+    fn step(&mut self, inputs: &[mgc_formats::mgcr::PortInput], left: &[u8]) {
+        let Some(sim) = &mut self.sim else { return };
+        if let Some(w) = sim.world.as_mut() {
+            for &seat in left {
+                w.depart(mgc_sim::Hx(seat));
+            }
+        }
+        let inputs: Vec<FlightInput> = inputs.iter().map(replay::flight_input_from).collect();
+        sim.step_seats(&inputs);
+        // Every player's app drains the step's sound requests (its
+        // `audio_tick`); the pending vec is hashed — drain it here too.
+        if let Some(w) = sim.world.as_mut() {
+            drain_sounds(w);
+        }
+    }
+
+    fn verdict(&self) -> Option<String> {
+        let w = self.sim.as_ref()?.world.as_ref()?;
+        net_verdict(w, &self.names)
+    }
+
+    fn end(&mut self) {
+        self.sim = None;
+    }
 }
 
 /// `--host` / `--join`: refuse what netplay cannot carry, connect, and
 /// fold the agreed session into the launch (level, seat, options) and
-/// the app's seat globals.
+/// the app's seat globals. `--host` starts the server on a thread of
+/// this app (returned: it lives as long as the app) and joins it as
+/// the admin.
 fn net_handshake(
     net_arg: &NetArg,
     args: &Args,
     cfg: &mut config::Config,
     level_path: &mut PathBuf,
-) -> Result<net::Link, String> {
+) -> Result<(net::Link, Option<net::ServerHandle>), String> {
     if args.campaign.is_some()
         || args.replay.is_some()
         || args.replay_check.is_some()
@@ -13644,43 +13851,116 @@ fn net_handshake(
         );
     }
     let build = net::build_id();
-    let link = match net_arg {
+    let models = serde_json::to_value(&cfg.controls.models).expect("models serialize");
+    let (link, server) = match net_arg {
+        NetArg::Serve(_) => return Err("--serve runs no game of its own".into()),
         NetArg::Host(addr) => {
             if !args.level_explicit {
                 return Err("--host needs a --level".into());
             }
             let level = level_path.to_string_lossy().into_owned();
-            net::host(
+            let game = lobby::NetGame::of_level(&level)
+                .ok_or_else(|| format!("--host: {level} is no baked level of a game"))?;
+            if args.net_game.is_some_and(|g| g != game) {
+                return Err(format!(
+                    "--host: {level} is not a {} level",
+                    args.net_game.map_or("", |g| g.title())
+                ));
+            }
+            let server = net::ServerHandle::spawn(
                 addr,
-                args.seat,
-                &level,
-                rules::session(cfg),
-                serde_json::to_value(&cfg.controls.models).expect("models serialize"),
+                net::ServerOpts {
+                    game,
+                    passphrase: args.passphrase.clone(),
+                    build: build.clone(),
+                    level: level_path.to_string_lossy().into_owned(),
+                    rules: rules::session(cfg),
+                    admin_key: None,
+                },
+                ServerWorld::boxed,
+            )?;
+            println!(
+                "net: hosting on {} as seat {} — waiting for --join",
+                server.addr(),
+                args.seat + 1
+            );
+            let link = net::join(
+                &server.local_addr(),
+                Some(game),
+                Some(args.seat),
+                models,
                 &args.passphrase,
                 &build,
-            )?
+                server.admin_key(),
+            )?;
+            (link, Some(server))
         }
         NetArg::Join(addr) => {
-            // No `--seat` (seat 1, the default): the host assigns one.
+            // No `--seat` (seat 1, the default): the server assigns one.
             let link = net::join(
                 addr,
+                args.net_game,
                 (args.seat != 0).then_some(args.seat),
-                serde_json::to_value(&cfg.controls.models).expect("models serialize"),
+                models,
                 &args.passphrase,
                 &build,
+                "",
             )?;
-            *level_path = PathBuf::from(&link.level);
-            link
+            (link, None)
         }
     };
-    // Everyone — the host too — plays by the session's rules.
-    let changed = rules::overridden(cfg, &link.config);
+    *level_path = PathBuf::from(&link.game.level);
+    // Everyone plays by the session's rules.
+    let changed = rules::overridden(cfg, &link.game.rules);
     if !changed.is_empty() {
         println!("net: the session's rules override {}", changed.join(", "));
     }
-    rules::adopt(cfg, &link.config)?;
+    rules::adopt(cfg, &link.game.rules)?;
     LOCAL_SEAT.store(link.local.0, std::sync::atomic::Ordering::Relaxed);
-    Ok(link)
+    Ok((link, server))
+}
+
+/// `--serve [ADDR] --game G`: the DEDICATED server — headless, in the
+/// foreground until killed; every player joins it, the first one in
+/// is the admin. It plays ONE game, named on the command line (a player
+/// of another is refused). The lobby opens on `--level` (one of that
+/// game's; default: its first arena) under the default session rules.
+fn run_server(addr: &str, args: &Args) -> std::process::ExitCode {
+    let Some(game) = args.net_game else {
+        eprintln!("error: --serve needs --game mc1|mc1hw|mc2 (the one game its sessions play)");
+        return std::process::ExitCode::from(2);
+    };
+    let level = if args.level_explicit {
+        args.level.to_string_lossy().into_owned()
+    } else {
+        get_baked_directory()
+            .join(format!(
+                "{}/level-{:03}.mgcl",
+                game.key(),
+                game.arenas().start()
+            ))
+            .to_string_lossy()
+            .into_owned()
+    };
+    if lobby::NetGame::of_level(&level) != Some(game) {
+        eprintln!("error: --serve: {level} is not a {} level", game.title());
+        return std::process::ExitCode::from(2);
+    }
+    let opts = net::ServerOpts {
+        game,
+        passphrase: args.passphrase.clone(),
+        build: net::build_id(),
+        level,
+        rules: rules::session(&config::Config::default()),
+        admin_key: None,
+    };
+    match net::serve(addr, opts, ServerWorld::boxed()) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 /// Root of the baked data tree — the single seam every baked lookup
@@ -13976,175 +14256,139 @@ mod net_lockstep_tests {
         }
     }
 
-    fn two_peers_stay_identical(game: &str, candidates: std::ops::Range<u32>) {
-        // The first level that seats wizards 1 and 2 with start markers.
-        let Some((path, mut sims)) = candidates.map(|i| level(game, i)).find_map(|p| {
-            let a = peer_sim(&p, &[0, 1])?;
-            let b = peer_sim(&p, &[0, 1])?;
-            Some((p, [a, b]))
-        }) else {
-            eprintln!("skipping: no baked {game} level seats two humans");
-            return;
-        };
-        eprintln!("netplay lockstep on {}", path.display());
-        let addr = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().to_string()
-        };
-        let a = addr.clone();
-        let host = std::thread::spawn(move || {
-            net::host(
-                &a,
-                0,
-                "lvl",
-                serde_json::json!({}),
-                serde_json::Value::Null,
-                "",
-                "t",
-            )
-        });
-        let client = net::join(&addr, None, serde_json::Value::Null, "", "t").unwrap();
-        let mut peers = [
-            net::Lockstep::start(host.join().unwrap().unwrap()),
-            net::Lockstep::start(client),
-        ];
-        let start1 = sims[0].flyer[Hx(1)];
-        const TICKS: u64 = 2400;
-        let mut stepped = [0u64; 2];
-        let mut hashes: [Vec<u64>; 2] = [Vec::new(), Vec::new()];
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        while stepped.iter().any(|&n| n < TICKS) {
-            assert!(std::time::Instant::now() < deadline, "lockstep stalled");
-            for k in 0..2 {
-                let p = &mut peers[k];
-                p.poll();
-                assert!(p.closed().is_none(), "peer {k}: {:?}", p.closed());
-                while p.wants_input() {
-                    let t = stepped[k] + net::INPUT_DELAY;
-                    let input = if p.in_lead_in() {
-                        FlightInput::default()
-                    } else {
-                        script(k, t)
-                    };
-                    p.submit(replay::port_input_from(&input));
-                }
-                if stepped[k] < TICKS
-                    && let Some((t, inputs)) = p.take_turn()
-                {
-                    let sim = &mut sims[k];
-                    p.note_hash(t, || sim.state_hash());
-                    let inputs: Vec<FlightInput> =
-                        inputs.iter().map(replay::flight_input_from).collect();
-                    sim.step_seats(&inputs);
-                    hashes[k].push(sim.state_hash());
-                    stepped[k] += 1;
-                }
-            }
+    /// A player's world as the app builds it for a lobby game
+    /// (`net_level` + `session_sim`, the session's rules over the
+    /// defaults, every seat its player's models).
+    fn client_sim(game: &net::Game) -> Simulation {
+        let mut cfg = config::Config::default();
+        super::rules::adopt(&mut cfg, &game.rules).unwrap();
+        let models = super::net_seat_models(&game.models, &cfg.controls.models);
+        let mut level = super::net_level(game, &cfg, None, true).unwrap();
+        super::session_sim(&mut level, &cfg, &models, None)
+    }
+
+    /// Seat `k`'s flight models: alternating enhanced / classic.
+    fn models_of(k: usize) -> serde_json::Value {
+        let mut m = config::Config::default().controls.models;
+        if k % 2 == 0 {
+            m.thrust = config::ThrustModel::Enhanced;
+            m.altitude = config::AltitudeModel::Enhanced;
+        } else {
+            m.thrust = config::ThrustModel::Classic;
+            m.altitude = config::AltitudeModel::Classic;
         }
-        if let Some(t) = (0..TICKS as usize).find(|&t| hashes[0][t] != hashes[1][t]) {
-            panic!("the peers forked at tick {t}");
-        }
-        assert!(peers[1].take_desync().is_none());
-        let f = sims[1].flyer[Hx(1)];
-        assert!(
-            (f.x - start1.x).abs() + (f.z - start1.z).abs() > 1.0,
-            "the client's seat never flew ({start1:?} → {f:?})"
-        );
+        serde_json::to_value(m).unwrap()
     }
 
-    /// N peers through the REAL lobby (host, guests, agreement, Play)
-    /// and the lockstep: every world stays hash-identical and every
-    /// seat flies.
-    fn n_peers_stay_identical(game: &str, arena: u32, n: usize) {
-        n_peers(game, arena, n, None);
-    }
-
-    /// A CLIENT leaving mid-game ends nothing for the rest: the others
-    /// keep stepping, identical, and every one of them banishes the
-    /// leaver on the same tick — the wizard falls, never to respawn
-    /// (player 2026-10-17: a leaver's carpet idled on as a contender).
-    #[test]
-    fn a_leaving_client_is_banished_and_the_game_goes_on() {
-        n_peers("mc2", 50, 3, Some((1, 300)));
-        n_peers("mc1", 50, 3, Some((2, 300)));
-    }
-
-    /// `leave`: (peer k ≥ 1, tick) — that peer hangs up once it has
-    /// stepped the tick.
-    fn n_peers(game: &str, arena: u32, n: usize, leave: Option<(usize, u64)>) {
-        let seats: Vec<u8> = (0..n as u8).collect();
-        let path = level(game, arena);
-        let Some(mut sims) = (0..n)
-            .map(|_| peer_sim(&path, &seats))
-            .collect::<Option<Vec<_>>>()
-        else {
-            eprintln!("skipping: no baked {game} arena {arena}");
-            return;
-        };
-        let mut host = net::Host::open(
+    /// A HOSTED server (the app's own referee, `ServerWorld`) on `path`
+    /// and `n` players through the real lobby — the first claims the
+    /// admin role with the key, sets `ai` and presses Play once the
+    /// rest agreed. The links, member order.
+    fn session(path: &std::path::Path, n: usize, ai: u8) -> (net::ServerHandle, Vec<net::Link>) {
+        let server = net::ServerHandle::spawn(
             "127.0.0.1:0",
-            0,
-            "HOST".into(),
-            "lvl".into(),
-            serde_json::json!({}),
-            "pw".into(),
-            "t".into(),
+            net::ServerOpts {
+                game: super::lobby::NetGame::of_level(&path.to_string_lossy()).unwrap(),
+                passphrase: "pw".into(),
+                build: "t".into(),
+                level: path.to_string_lossy().into_owned(),
+                rules: super::rules::session(&config::Config::default()),
+                admin_key: None,
+            },
+            super::ServerWorld::boxed,
         )
         .unwrap();
-        let addr = host.addr();
-        let mut guests = Vec::new();
-        for k in 1..n {
-            let a = addr.clone();
-            let t = std::thread::spawn(move || {
-                net::Guest::connect(
-                    &a,
+        let addr = server.local_addr();
+        let mut gs: Vec<net::Guest> = (0..n)
+            .map(|k| {
+                let key = if k == 0 { server.admin_key() } else { "" };
+                let mut g = net::Guest::connect(
+                    &addr,
                     "pw",
                     &format!("P{k}"),
+                    None,
                     "t",
+                    key,
                     std::time::Duration::from_secs(5),
                 )
-            });
-            while !t.is_finished() {
-                host.poll();
-            }
-            let mut g = t.join().unwrap().unwrap();
-            g.agree();
-            guests.push(g);
-        }
+                .unwrap();
+                g.set_models(models_of(k));
+                g
+            })
+            .collect();
+        assert!(gs[0].view().is_admin());
+        gs[0].set_ai(ai);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !host.can_play() {
+        loop {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the lobby never agreed"
             );
-            host.poll();
-            guests.iter_mut().for_each(net::Guest::poll);
-        }
-        let mut peers = vec![Some(net::Lockstep::start(host.play().ok().unwrap()))];
-        for mut g in guests {
-            while !g.started() {
-                g.poll();
+            gs.iter_mut().for_each(net::Guest::poll);
+            let v = gs[0].view().clone();
+            if v.ai == ai && v.all_agreed() && v.members.iter().all(|m| !m.models.is_null()) {
+                break;
             }
-            let link = g.into_link().ok().unwrap();
-            assert_eq!(link.seats, seats);
-            peers.push(Some(net::Lockstep::start(link)));
-        }
-        // Mixed flight models — each seat its own player's (alternating
-        // classic / enhanced), the same on every peer.
-        for sim in &mut sims {
-            for k in 0..n {
-                let (t, a) = if k % 2 == 0 {
-                    (
-                        config::ThrustModel::Enhanced,
-                        config::AltitudeModel::Enhanced,
-                    )
-                } else {
-                    (config::ThrustModel::Classic, config::AltitudeModel::Classic)
-                };
-                sim.thrust_model[Hx(k as u8)] = super::sim_thrust(t);
-                sim.altitude_model[Hx(k as u8)] = super::sim_altitude(a);
+            for g in &mut gs[1..] {
+                let v = g.view();
+                if v.ai == ai && v.me().is_some_and(|m| !m.agreed) {
+                    g.agree();
+                }
             }
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
+        gs[0].play();
+        let links = gs
+            .into_iter()
+            .map(|mut g| {
+                while !g.started() {
+                    assert!(std::time::Instant::now() < deadline, "never started");
+                    g.poll();
+                }
+                g.into_link().ok().unwrap()
+            })
+            .collect();
+        (server, links)
+    }
+
+    /// N players through the REAL lobby and lockstep against a hosted
+    /// server running its own world: every player's world stays
+    /// hash-identical to the others' AND the server's (no desync
+    /// reported), and every seat flies.
+    fn n_peers_stay_identical(game: &str, arena: u32, n: usize, ai: u8) {
+        n_peers(game, arena, n, ai, None);
+    }
+
+    /// A player leaving mid-game ends nothing for the rest: the others
+    /// keep stepping, identical, and every one of them banishes the
+    /// leaver on the same tick — the wizard falls, never to respawn
+    /// (player 2026-10-17: a leaver's carpet idled on as a contender).
+    /// The hosting player (seat 0, the admin) leaves like anyone.
+    #[test]
+    fn a_leaving_player_is_banished_and_the_game_goes_on() {
+        n_peers("mc2", 50, 3, 0, Some((1, 300)));
+        n_peers("mc1", 50, 3, 0, Some((0, 300)));
+    }
+
+    /// `leave`: (peer k, tick) — that peer hangs up once it has stepped
+    /// the tick.
+    fn n_peers(game: &str, arena: u32, n: usize, ai: u8, leave: Option<(usize, u64)>) {
+        let path = level(game, arena);
+        if !path.exists() {
+            eprintln!("skipping: no baked {game} arena {arena}");
+            return;
+        }
+        let (_server, links) = session(&path, n, ai);
+        let seats: Vec<u8> = (0..n as u8).collect();
+        let mut sims: Vec<Simulation> = links.iter().map(|l| client_sim(&l.game)).collect();
+        let mut peers: Vec<Option<net::Lockstep>> = links
+            .into_iter()
+            .map(|link| {
+                assert_eq!(link.game.seats, seats);
+                assert_eq!(link.game.ai, ai);
+                Some(net::Lockstep::start(link))
+            })
+            .collect();
         let starts: Vec<_> = (0..n).map(|k| sims[0].flyer[Hx(k as u8)]).collect();
         const TICKS: u64 = 1200;
         let mut stepped = vec![0u64; n];
@@ -14182,30 +14426,41 @@ mod net_lockstep_tests {
                     let inputs: Vec<FlightInput> =
                         inputs.iter().map(replay::flight_input_from).collect();
                     sim.step_seats(&inputs);
+                    // The app's per-tick drain (`audio_tick`).
+                    super::drain_sounds(sim.world.as_mut().unwrap());
                     hashes[k].push(sim.state_hash());
                     stepped[k] += 1;
                 }
             }
         }
         let stayed: Vec<usize> = (0..n).filter(|&k| peers[k].is_some()).collect();
-        for &k in &stayed[1..] {
-            if let Some(t) = (0..TICKS as usize).find(|&t| hashes[0][t] != hashes[k][t]) {
+        for &k in &stayed {
+            if let Some(t) = (0..TICKS as usize).find(|&t| hashes[stayed[0]][t] != hashes[k][t]) {
                 panic!("{game}: peer {k} forked at tick {t}");
             }
-            assert!(peers[k].as_mut().unwrap().take_desync().is_none());
+            let p = peers[k].as_mut().unwrap();
+            assert!(
+                p.take_desync().is_none(),
+                "{game}: peer {k} forked from the server"
+            );
         }
         if let Some((gone, at)) = leave {
             let hx = Hx(gone as u8);
+            let watcher = stayed[0];
             for &k in &stayed {
                 let t = banished_at[k].expect("the leaver was never banished");
                 assert!(t > at, "{game}: banished at {t}, before it left at {at}");
-                assert_eq!(banished_at[k], banished_at[0], "{game}: one tick for all");
+                assert_eq!(
+                    banished_at[k], banished_at[watcher],
+                    "{game}: one tick for all"
+                );
                 let w = sims[k].world.as_ref().unwrap();
                 assert!(w.banished(hx), "{game}: peer {k}");
                 assert!(!w.contenders().0.contains(&hx));
                 // The others read the banishment; the leaver's own
                 // nameless "has died." is his alone.
-                let lines: Vec<&str> = w.notifications_for(Hx(0)).map(|(t, _)| t).collect();
+                let me = Hx(k as u8);
+                let lines: Vec<&str> = w.notifications_for(me).map(|(t, _)| t).collect();
                 assert!(
                     lines
                         .iter()
@@ -14215,7 +14470,7 @@ mod net_lockstep_tests {
                 assert!(!lines.contains(&"has died."), "{game}: {lines:?}");
                 // And the leaver is off the others' roster.
                 let row = w
-                    .human_views(Hx(0))
+                    .human_views(me)
                     .into_iter()
                     .find(|r| r.slot == w.human_wizard_seat(hx).min(7) as u8);
                 assert!(
@@ -14236,6 +14491,65 @@ mod net_lockstep_tests {
                 "{game}: seat {k} never flew"
             );
         }
+    }
+
+    /// The server names the winner: a two-player game where one human
+    /// is banished (he leaves) ends with the other's verdict on every
+    /// player still in it — on the turn after the server's world
+    /// decided, the same tick for all.
+    #[test]
+    fn the_servers_verdict_names_the_last_wizard_standing() {
+        let path = level("mc2", 50);
+        if !path.exists() {
+            eprintln!("skipping: no baked mc2 arena");
+            return;
+        }
+        let (_server, links) = session(&path, 3, 0);
+        let mut sims: Vec<Simulation> = links.iter().map(|l| client_sim(&l.game)).collect();
+        let mut peers: Vec<Option<net::Lockstep>> = links
+            .into_iter()
+            .map(|l| Some(net::Lockstep::start(l)))
+            .collect();
+        let mut verdicts: Vec<Option<(u64, String)>> = vec![None; 3];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut stepped = [0u64; 3];
+        while verdicts[0].is_none() {
+            assert!(std::time::Instant::now() < deadline, "no verdict");
+            for k in 0..3 {
+                // Seats 1 and 2 leave early: seat 0 stands alone.
+                if k > 0 && stepped[k] == 50 {
+                    peers[k] = None;
+                }
+                let Some(p) = &mut peers[k] else { continue };
+                p.poll();
+                while p.wants_input() {
+                    p.submit(replay::port_input_from(&FlightInput::default()));
+                }
+                if let Some((t, inputs)) = p.take_turn() {
+                    let sim = &mut sims[k];
+                    for seat in p.left_at(t) {
+                        sim.world.as_mut().unwrap().depart(Hx(seat));
+                    }
+                    let inputs: Vec<FlightInput> =
+                        inputs.iter().map(replay::flight_input_from).collect();
+                    sim.step_seats(&inputs);
+                    super::drain_sounds(sim.world.as_mut().unwrap());
+                    stepped[k] += 1;
+                    if let Some(v) = p.take_verdict() {
+                        verdicts[k] = Some((t, v));
+                    }
+                }
+            }
+        }
+        let (t, v) = verdicts[0].clone().unwrap();
+        assert_eq!(v, "P0 is victorious!");
+        // The server decided on the step of tick t - 1 — as did this
+        // player's own world (it has stepped t by now).
+        let w = sims[0].world.as_ref().unwrap();
+        assert!(
+            super::net_verdict(w, &[(0, "P0".into())]).is_some(),
+            "tick {t}"
+        );
     }
 
     /// A spell pick is its own player's news: the other human sees no
@@ -14381,12 +14695,12 @@ mod net_lockstep_tests {
 
     #[test]
     fn four_mc2_peers_stay_identical() {
-        n_peers_stay_identical("mc2", 50, 4);
+        n_peers_stay_identical("mc2", 50, 4, 0);
     }
 
     #[test]
     fn three_mc1_peers_stay_identical() {
-        n_peers_stay_identical("mc1", 50, 3);
+        n_peers_stay_identical("mc1", 50, 3, 0);
     }
 
     /// Each human carpet wears ITS seat's wizard art (`sub_44D30`),
@@ -14475,13 +14789,15 @@ mod net_lockstep_tests {
         }
     }
 
+    /// Two players and AI rivals (the rival brains in the lockstep),
+    /// against the server's world.
     #[test]
-    fn mc1_peers_stay_identical() {
-        two_peers_stay_identical("mc1", 0..25);
+    fn mc1_peers_and_rivals_stay_identical() {
+        n_peers_stay_identical("mc1", 50, 2, 3);
     }
 
     #[test]
-    fn mc2_peers_stay_identical() {
-        two_peers_stay_identical("mc2", 0..30);
+    fn mc2_peers_and_rivals_stay_identical() {
+        n_peers_stay_identical("mc2", 52, 2, 3);
     }
 }

@@ -1,97 +1,144 @@
-//! ⭐ NETWORK TRACK, MVP — two apps, one world, deterministic lockstep
-//! over TCP (rulings 10-14: TCP only; star topology, the host is the
-//! authority).
+//! ⭐ NETWORK TRACK — apps sharing one world by deterministic lockstep
+//! over TCP (rulings 10-14: TCP only, star topology).
+//!
+//! The star's centre is a SERVER (player 2026-10-17): a headless
+//! [`Server`] that holds the lobby, assembles every tick's turn and runs
+//! the world itself — the session's neutral authority ([`Referee`]: the
+//! hash every player is checked against, and the game's verdict). Every
+//! player is a client ([`Guest`]); one of them is the ADMIN, a player
+//! with the lobby's powers (level, rules, AI, limit, kick, passphrase,
+//! Play — sent as requests the server accepts from the admin only).
+//! The server runs two ways, one implementation:
+//! - dedicated: `mgcarpet --serve` in the foreground — every player
+//!   joins, the first one in is the admin;
+//! - hosted: the UI's Host (and `--host`) starts it on a thread of the
+//!   game ([`ServerHandle`]) and joins it over loopback as the admin
+//!   (claimed with a key only that app knows). Closing that app stops
+//!   the server; its player leaving a game only waits in the lobby.
 //!
 //! Only INPUTS cross the wire — retail's own model (NetBIOS lockstep,
 //! `ReceiveSendAll_7438A`): every peer simulates the whole world from
-//! the same per-tick input bundle. The star: the CLIENT sends its seat's
-//! input for tick `t` to the HOST; the host pairs it with its own and
-//! broadcasts the bundle as `Turn t`; nobody steps a tick before its
-//! bundle exists (the host steps from its own completed bundles). Each
-//! seat's input is scheduled [`INPUT_DELAY`] ticks ahead, which hides
-//! the round trip under that many ticks of control latency.
+//! the same per-tick input bundle. Each client sends its seat's input
+//! for tick `t` to the server; once every seat's is in, the server
+//! steps its own world and broadcasts the bundle as `Turn t`; nobody
+//! steps a tick before its bundle exists. Each seat's input is
+//! scheduled [`INPUT_DELAY`] ticks ahead, which hides the round trip
+//! under that many ticks of control latency.
 //!
-//! Unlike retail (no desync detection at all), the host stamps its
-//! pre-step `state_hash` every [`CHECK_EVERY`] ticks onto a turn and the
-//! client compares — DETECTION only for now; reconciliation (the host's
-//! state wins) and host handover are later stages.
+//! Unlike retail (no desync detection at all), the server stamps its
+//! pre-step `state_hash` every [`CHECK_EVERY`] ticks onto the turn and
+//! every client compares — DETECTION only for now.
 //!
-//! A CLIENT leaving mid-game (Bye, or its socket lost) does not end the
-//! game: the host drops that seat at the first turn not yet sent — the
-//! seat's input there is the suicide key, idle after — and the turn says
-//! so ([`Msg::Turn::left`], read by [`Lockstep::left_at`]). Every peer
-//! banishes the seat on that tick (retail: an abandon banishes the
-//! wizard), so the game goes on for the rest and ends as usual when one
-//! contender stands.
+//! A client leaving mid-game (Bye, its socket lost, or [`Msg::Leave`])
+//! does not end the game: the server drops that seat at the first turn
+//! not yet sent — the seat's input there is the suicide key, idle after
+//! — and the turn says so ([`Msg::Turn::left`]). Every peer banishes the
+//! seat on that tick (retail: an abandon banishes the wizard). A LEAVE
+//! keeps the member: his lobby WAITS for the game to finish
+//! ([`LobbyView::playing`]), and so does a newcomer admitted during it.
 //!
-//! A client that LEAVES the game on purpose ([`Msg::Leave`]) is banished
-//! the same way but stays a member: his lobby WAITS for the game to
-//! finish ([`LobbyView::playing`]), and so does a newcomer admitted
-//! during it; the host reopens the lobby for all of them at the end
-//! (player 2026-10-17 — a leaver used to land in the temple, the host
-//! alone in the lobby).
+//! The game ends when the server's world names a winner (one wizard
+//! standing, [`Referee::verdict`] — announced on the next turn): every
+//! client fades out and leaves, and the server reopens the lobby once
+//! they all have (or [`GAME_OVER_GRACE`] passed) — or when nobody is
+//! left playing.
 //!
 //! Wire: a little-endian `u32` length, then one JSON [`Msg`]. The input
 //! payload is the recorder's [`PortInput`] (idle ticks encode as `{}`).
 
-use crate::lobby::{LobbyCore, LobbyView};
+use crate::lobby::{LobbyCore, LobbyView, NetGame};
 use mgc_formats::mgcr::PortInput;
 use mgc_sim::Hx;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::mpsc;
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 /// Bumped whenever [`Msg`] changes shape.
-const PROTOCOL: u32 = 4;
+const PROTOCOL: u32 = 6;
 /// The most players a session holds — retail's 8 (one per wizard). The
-/// host lowers it in the lobby (`Host::set_capacity`).
+/// admin lowers it in the lobby (`Guest::set_capacity`).
 pub const MAX_PLAYERS: usize = 8;
 /// Ticks between sampling a seat's input and stepping it (24 Hz: 3
 /// ticks = 125 ms of control latency, ample on loopback/LAN/a tailnet).
 pub const INPUT_DELAY: u64 = 3;
-/// The host stamps its state hash on every this-many-th tick (1 s).
+/// The server stamps its state hash on every this-many-th tick (1 s).
 pub const CHECK_EVERY: u64 = 24;
+/// After the verdict, the longest the server waits for the players'
+/// fade-out before it reopens the lobby anyway.
+pub const GAME_OVER_GRACE: Duration = Duration::from_secs(10);
 /// A frame larger than this is a broken peer, not a message.
 const MAX_FRAME: usize = 1 << 20;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "msg", rename_all = "snake_case")]
 enum Msg {
-    /// Client → host: who I am (the campaign's player name, maybe
-    /// empty), and the session's passphrase.
+    /// Client → server: who I am (the campaign's player name, maybe
+    /// empty), the game I play (none: a CLI player adopting the
+    /// server's), the session's passphrase, and — the player a hosted
+    /// server was started for — the admin key.
     Hello {
         protocol: u32,
         build: String,
         passphrase: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        game: Option<NetGame>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        admin_key: String,
     },
     Refuse {
         why: String,
     },
-    /// Host → client: the lobby as that client sees it, on every
+    /// Server → client: the lobby as that client sees it, on every
     /// change (and after a game: the lobby reopened).
     Lobby {
         view: LobbyView,
     },
-    /// Client → host: take this wizard (first come, first served).
+    /// Server → client: something the lobby should hear (a Play the
+    /// server could not start).
+    Notice {
+        text: String,
+    },
+    /// Client → server: take this wizard (first come, first served).
     Wizard {
         want: u8,
     },
-    /// Client → host: I agree to rules revision `rev`.
+    /// Client → server: I agree to rules revision `rev`.
     Agree {
         rev: u32,
     },
-    /// Client → host: I take my agreement back.
+    /// Client → server: I take my agreement back.
     Withdraw,
-    /// Client → host: my flight models (on joining, and on a change).
+    /// Client → server: my flight models (on joining, and on a change).
     Models {
         models: serde_json::Value,
     },
-    /// Host → client: the game begins. `seats[k]` is human seat
-    /// `Hx(k)`'s wizard (the host is `Hx(0)`), `local` the receiver's.
+    /// Admin → server: the lobby's settings.
+    SetLevel {
+        level: String,
+    },
+    SetAi {
+        ai: u8,
+    },
+    SetRules {
+        rules: serde_json::Value,
+    },
+    SetCapacity {
+        capacity: u8,
+    },
+    SetPassphrase {
+        passphrase: String,
+    },
+    Kick {
+        id: u32,
+    },
+    Play,
+    /// Server → client: the game begins. `seats[k]` is human seat
+    /// `Hx(k)`'s wizard, `local` the receiver's.
     Start {
         seats: Vec<u8>,
         names: Vec<String>,
@@ -101,16 +148,17 @@ enum Msg {
         level: String,
         rules: serde_json::Value,
     },
-    /// Client → host: I leave this game, but stay in the lobby (and
-    /// wait for the game to finish).
+    /// Client → server: I leave this game, but stay in the lobby (and
+    /// wait for the game to finish). After the verdict: my fade-out is
+    /// over.
     Leave,
-    /// Client → host: the client seat's input for `tick`.
+    /// Client → server: the client seat's input for `tick`.
     Input {
         tick: u64,
         input: PortInput,
     },
-    /// Host → client: every seat's input for `tick`, in seat order,
-    /// plus (now and then) the host's pre-step hash of an earlier tick.
+    /// Server → client: every seat's input for `tick`, in seat order,
+    /// plus (now and then) the server's pre-step hash of a tick.
     Turn {
         tick: u64,
         inputs: Vec<PortInput>,
@@ -120,6 +168,9 @@ enum Msg {
         /// before it steps).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         left: Vec<u8>,
+        /// The game is decided: the winner's announcement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        over: Option<String>,
     },
     Bye {
         why: String,
@@ -146,7 +197,7 @@ fn read_msg(r: &mut impl Read) -> std::io::Result<Msg> {
     serde_json::from_slice(&body).map_err(std::io::Error::other)
 }
 
-/// `MGC_NET_TRACE=1`: print every hash check (both peers).
+/// `MGC_NET_TRACE=1`: print every hash check (server and clients).
 fn trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("MGC_NET_TRACE").is_some_and(|v| v != "0"))
@@ -165,10 +216,19 @@ pub fn build_id() -> String {
     format!("{}+{h:016x}", env!("CARGO_PKG_VERSION"))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    Host,
-    Client,
+/// A fresh admin key: unguessable enough to keep a stranger from
+/// claiming a hosted server's admin role (it never leaves the app).
+pub fn admin_key() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    let a = h.finish();
+    let b = std::collections::hash_map::RandomState::new().hash_one(a);
+    format!("{a:016x}{b:016x}")
 }
 
 /// What one non-blocking receive found.
@@ -247,71 +307,181 @@ impl Drop for Conn {
 /// How long a fresh connection may take to say hello.
 const HELLO_WITHIN: Duration = Duration::from_secs(10);
 
-/// The HOST's lobby: listens, admits clients that pass the handshake
-/// (protocol, build, passphrase), serves their requests against the
-/// [`LobbyCore`] and broadcasts every change. Non-blocking — poll it
-/// once per frame.
-pub struct Host {
+/// One game as the lobby agreed it — what every peer builds its world
+/// from (the server's [`Referee`] included).
+#[derive(Clone, Debug)]
+pub struct Game {
+    /// Wizard seat per human seat, in seat order (`Hx(k)`).
+    pub seats: Vec<u8>,
+    /// Each human's campaign name, seat order (empty: none given).
+    pub names: Vec<String>,
+    /// Each human's flight models (`controls.models`), seat order.
+    pub models: Vec<serde_json::Value>,
+    /// The AI wizards to seat (the admin's rule).
+    pub ai: u8,
+    pub level: String,
+    /// The session rules (`rules::collect` of a config).
+    pub rules: serde_json::Value,
+}
+
+/// The server's own world — the session's authority. The app builds
+/// it the way every player builds his (`load_level`), headless; the
+/// socket side never sees a world.
+pub trait Referee {
+    /// Build the world for `game` — refused, the game does not start.
+    fn begin(&mut self, game: &Game) -> Result<(), String>;
+    /// The pre-step state hash (asked on check ticks only).
+    fn hash(&self) -> u64;
+    /// Banish the seats in `left`, then step the turn.
+    fn step(&mut self, inputs: &[PortInput], left: &[u8]);
+    /// The game is decided: the winner's announcement.
+    fn verdict(&self) -> Option<String>;
+    /// The game is over: drop the world.
+    fn end(&mut self);
+}
+
+/// What a hosted server's app wants to know about it (its close
+/// warning).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ServerStatus {
+    /// Members in the session.
+    pub members: usize,
+    /// Seats still playing a running game.
+    pub playing: usize,
+}
+
+/// The server's settings at its start.
+pub struct ServerOpts {
+    /// The session's game, for the server's life: a player of another
+    /// is refused at the door.
+    pub game: NetGame,
+    pub passphrase: String,
+    pub build: String,
+    /// The first level up — one of `game`'s (the admin changes it,
+    /// within the game).
+    pub level: String,
+    /// The session's rules (the admin changes them).
+    pub rules: serde_json::Value,
+    /// A hosted server: the key its own player claims the admin role
+    /// with. `None` (dedicated): the first member in is the admin.
+    pub admin_key: Option<String>,
+}
+
+/// A running game on the server: turn assembly, departures, verdict.
+struct Match {
+    /// Member id per human seat (`Hx` order).
+    ids: Vec<u32>,
+    /// The next turn to complete, and partial turns by tick.
+    next_complete: u64,
+    pending: BTreeMap<u64, Vec<Option<PortInput>>>,
+    /// Per seat, the tick it left at, and whether it is banished there
+    /// (its input from then on is the server's: the suicide key at that
+    /// tick when banished, idle after).
+    departed: Vec<Option<(u64, bool)>>,
+    /// The seats banished at each tick (a turn's `left`).
+    departures: BTreeMap<u64, Vec<u8>>,
+    /// The verdict, once the world named a winner — and since when.
+    over: Option<(String, Instant)>,
+    /// The verdict still to ride a turn.
+    announce: Option<String>,
+    /// Hash checks stamped (the summary).
+    checks: u64,
+}
+
+impl Match {
+    fn seat_of(&self, id: u32) -> Option<usize> {
+        self.ids.iter().position(|&m| m == id)
+    }
+
+    /// Is seat `ix` still playing?
+    fn active(&self, ix: usize) -> bool {
+        self.departed.get(ix).is_some_and(Option::is_none)
+    }
+
+    fn playing(&self) -> usize {
+        self.departed.iter().filter(|d| d.is_none()).count()
+    }
+}
+
+/// The SERVER: listens, admits clients that pass the handshake
+/// (protocol, build, passphrase), serves their lobby requests against
+/// the [`LobbyCore`], runs the games. Non-blocking — [`Self::poll`] it
+/// in a loop ([`Self::run`]).
+pub struct Server {
     core: LobbyCore,
+    /// The session's game.
+    plays: NetGame,
     passphrase: String,
     build: String,
+    admin_key: Option<String>,
     listener: TcpListener,
     /// Connected, not yet said hello.
     pending: Vec<Conn>,
-    /// Admitted clients, in member (join) order.
+    /// Admitted members, in join order.
     clients: Vec<(u32, Conn)>,
-    notes: Vec<String>,
+    referee: Box<dyn Referee>,
+    game: Option<Match>,
     dirty: bool,
 }
 
-impl Host {
-    /// Open a lobby on `addr` with the host flying `wizard`.
-    pub fn open(
-        addr: &str,
-        wizard: u8,
-        name: String,
-        level: String,
-        rules: serde_json::Value,
-        passphrase: String,
-        build: String,
-    ) -> Result<Self, String> {
-        let listener = TcpListener::bind(addr).map_err(|e| format!("net: bind {addr}: {e}"))?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|e| format!("net: {addr}: {e}"))?;
-        Ok(Self {
-            core: LobbyCore::new(wizard, name, level, rules, MAX_PLAYERS),
-            passphrase,
-            build,
+impl Server {
+    /// Open a session on `listener` (a bound socket).
+    pub fn new(listener: TcpListener, opts: ServerOpts, referee: Box<dyn Referee>) -> Self {
+        let _ = listener.set_nonblocking(true);
+        Self {
+            core: LobbyCore::new(opts.game, opts.level, opts.rules, MAX_PLAYERS),
+            plays: opts.game,
+            passphrase: opts.passphrase,
+            build: opts.build,
+            admin_key: opts.admin_key.filter(|k| !k.is_empty()),
             listener,
             pending: Vec::new(),
             clients: Vec::new(),
-            notes: Vec::new(),
+            referee,
+            game: None,
             dirty: false,
-        })
+        }
     }
 
-    /// The address actually bound (a `:0` port resolved).
-    pub fn addr(&self) -> String {
-        self.listener
-            .local_addr()
-            .map_or_else(|_| "?".into(), |a| a.to_string())
+    /// Bind `addr` for a server.
+    pub fn bind(addr: &str) -> Result<TcpListener, String> {
+        TcpListener::bind(addr).map_err(|e| format!("net: bind {addr}: {e}"))
     }
 
-    pub fn view(&self) -> LobbyView {
-        self.core.view_for(0)
+    /// Poll until `stop`; then every member hears the server is gone.
+    pub fn run(mut self, stop: &AtomicBool, status: Option<&Mutex<ServerStatus>>) {
+        while !stop.load(Ordering::Relaxed) {
+            self.poll();
+            if let Some(s) = status
+                && let Ok(mut s) = s.lock()
+            {
+                *s = self.status();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for (_, c) in &mut self.clients {
+            c.close("the server stopped");
+        }
+        println!("server: stopped");
     }
 
-    /// What happened since the last call ("joined", "left", refusals).
-    pub fn take_notes(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.notes)
+    pub fn status(&self) -> ServerStatus {
+        ServerStatus {
+            members: self.clients.len(),
+            playing: self.game.as_ref().map_or(0, Match::playing),
+        }
     }
 
     pub fn poll(&mut self) {
         self.accept();
         self.handshake();
         self.serve();
+        self.referee_turns();
         self.flush();
+    }
+
+    fn note(&self, what: impl AsRef<str>) {
+        println!("server: {}", what.as_ref());
     }
 
     fn accept(&mut self) {
@@ -323,15 +493,15 @@ impl Host {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
                 Err(e) => {
-                    self.notes.push(format!("accept: {e}"));
+                    self.note(format!("accept: {e}"));
                     return;
                 }
             }
         }
     }
 
-    fn refuse(&mut self, mut conn: Conn, why: String) {
-        self.notes.push(format!("refused {}: {why}", conn.peer));
+    fn refuse(&self, mut conn: Conn, why: String) {
+        self.note(format!("refused {}: {why}", conn.peer));
         let _ = conn.send(&Msg::Refuse { why: why.clone() });
         conn.close(&why);
     }
@@ -344,11 +514,15 @@ impl Host {
                     build,
                     passphrase,
                     name,
+                    game,
+                    admin_key,
                 }) => {
                     let refusal = if protocol != PROTOCOL {
-                        Some(format!("protocol {protocol}, the host speaks {PROTOCOL}"))
+                        Some(format!("protocol {protocol}, the server speaks {PROTOCOL}"))
+                    } else if game.is_some_and(|g| g != self.plays) {
+                        Some(format!("this server runs {}", self.plays.title()))
                     } else if build != self.build {
-                        Some(format!("build {build}, the host runs {}", self.build))
+                        Some(format!("build {build}, the server runs {}", self.build))
                     } else if passphrase != self.passphrase {
                         Some("wrong passphrase".into())
                     } else {
@@ -356,9 +530,16 @@ impl Host {
                     };
                     match refusal.map_or_else(|| self.core.join(name), Err) {
                         Ok(id) => {
+                            if self.admin_key.as_deref() == Some(admin_key.as_str()) {
+                                self.core.claim_admin(id);
+                            }
                             let w = self.core.view_for(id).me().map_or(0, |m| m.wizard);
-                            self.notes
-                                .push(format!("{} joined as wizard {}", conn.peer, w + 1));
+                            let admin = if self.core.is_admin(id) {
+                                " (admin)"
+                            } else {
+                                ""
+                            };
+                            self.note(format!("{} joined as wizard {}{admin}", conn.peer, w + 1));
                             self.clients.push((id, conn));
                             self.dirty = true;
                         }
@@ -374,182 +555,406 @@ impl Host {
     }
 
     fn serve(&mut self) {
-        let mut gone: Vec<(u32, String)> = Vec::new();
+        let mut events: Vec<(u32, Result<Msg, String>)> = Vec::new();
         for (id, conn) in &self.clients {
             loop {
                 match conn.recv() {
-                    Recv::Msg(Msg::Wizard { want }) => {
-                        self.dirty |= self.core.pick_wizard(*id, want);
-                    }
-                    Recv::Msg(Msg::Agree { rev }) => self.dirty |= self.core.agree(*id, rev),
-                    Recv::Msg(Msg::Withdraw) => self.dirty |= self.core.withdraw(*id),
-                    Recv::Msg(Msg::Models { models }) => {
-                        self.dirty |= self.core.set_models(*id, models);
-                    }
-                    // A game's tail (inputs sent before its end landed,
-                    // a leave that crossed it).
-                    Recv::Msg(Msg::Input { .. } | Msg::Leave) => {}
-                    Recv::Msg(Msg::Bye { why }) => {
-                        gone.push((*id, why));
-                        break;
-                    }
-                    Recv::Msg(other) => {
-                        gone.push((*id, format!("sent {other:?}")));
-                        break;
-                    }
+                    Recv::Msg(m) => events.push((*id, Ok(m))),
                     Recv::Lost(e) => {
-                        gone.push((*id, e));
+                        events.push((*id, Err(e)));
                         break;
                     }
                     Recv::Empty => break,
                 }
             }
         }
-        for (id, why) in gone {
-            self.drop_client(id, &why);
-            self.notes.push(format!("member {id} left ({why})"));
+        for (id, ev) in events {
+            if self.clients.iter().any(|(c, _)| *c == id) {
+                self.handle(id, ev);
+            }
         }
     }
 
+    fn handle(&mut self, id: u32, ev: Result<Msg, String>) {
+        let admin = self.core.is_admin(id);
+        match ev {
+            Err(e) => self.drop_client(id, &e),
+            Ok(Msg::Bye { why }) => self.drop_client(id, &why),
+            Ok(Msg::Input { tick, input }) => self.input(id, tick, input),
+            Ok(Msg::Leave) => self.leave_game(id),
+            Ok(Msg::Wizard { want }) => self.dirty |= self.core.pick_wizard(id, want),
+            Ok(Msg::Agree { rev }) => self.dirty |= self.core.agree(id, rev),
+            Ok(Msg::Withdraw) => self.dirty |= self.core.withdraw(id),
+            Ok(Msg::Models { models }) => self.dirty |= self.core.set_models(id, models),
+            // The admin's powers; anyone else's request is ignored.
+            Ok(
+                Msg::SetLevel { .. }
+                | Msg::SetAi { .. }
+                | Msg::SetRules { .. }
+                | Msg::SetCapacity { .. }
+                | Msg::SetPassphrase { .. }
+                | Msg::Kick { .. }
+                | Msg::Play,
+            ) if !admin => {}
+            Ok(Msg::SetLevel { level }) => {
+                if NetGame::of_level(&level) != Some(self.plays) {
+                    self.note(format!("refused level {level}: not {}", self.plays.title()));
+                }
+                self.dirty |= self.core.set_level(level);
+            }
+            Ok(Msg::SetAi { ai }) => self.dirty |= self.core.set_ai(ai),
+            Ok(Msg::SetRules { rules }) => self.dirty |= self.core.set_rules(rules),
+            Ok(Msg::SetCapacity { capacity }) => {
+                self.dirty |= self.core.set_capacity(usize::from(capacity));
+            }
+            Ok(Msg::SetPassphrase { passphrase }) => {
+                // Later joiners need the new one (a kicked player can't
+                // come back); members already in stay.
+                self.note("the passphrase changed");
+                self.passphrase = passphrase;
+                self.dirty = true;
+            }
+            Ok(Msg::Kick { id: who }) if who != id => {
+                self.note(format!("member {who} kicked"));
+                self.drop_client(who, "kicked by the admin");
+            }
+            Ok(Msg::Kick { .. }) => {}
+            Ok(Msg::Play) => self.play(),
+            Ok(other) => self.drop_client(id, &format!("sent {other:?}")),
+        }
+    }
+
+    /// Member `id` is gone (hung up, lost, kicked): out of the lobby,
+    /// and — in a game — banished like any departure.
     fn drop_client(&mut self, id: u32, why: &str) {
+        if let Some(ix) = self.game.as_ref().and_then(|g| g.seat_of(id)) {
+            self.depart(ix, why);
+        }
         if let Some(i) = self.clients.iter().position(|(c, _)| *c == id) {
             let (_, mut conn) = self.clients.remove(i);
             conn.close(why);
+            self.note(format!("member {id} left ({why})"));
         }
         self.dirty |= self.core.leave(id);
     }
 
+    /// Member `id` leaves the game, not the session: he waits in the
+    /// lobby for it to finish.
+    fn leave_game(&mut self, id: u32) {
+        if let Some(ix) = self.game.as_ref().and_then(|g| g.seat_of(id)) {
+            self.depart(ix, "left the game");
+            // He waits — he hears the lobby from now on.
+            self.dirty = true;
+        }
+    }
+
+    /// Seat `ix` left the game: it is out at the first turn not yet
+    /// sent — whatever it had scheduled from there on is dropped, and
+    /// its input becomes the server's. Before the verdict it is
+    /// banished; after it, it only stops playing (his fade is over).
+    fn depart(&mut self, ix: usize, why: &str) {
+        let Some(g) = &mut self.game else { return };
+        if !g.active(ix) {
+            return;
+        }
+        let tick = g.next_complete;
+        let banish = g.over.is_none();
+        g.departed[ix] = Some((tick, banish));
+        if banish {
+            g.departures.entry(tick).or_default().push(ix as u8);
+        }
+        for turn in g.pending.range_mut(tick..).map(|(_, t)| t) {
+            turn[ix] = None;
+        }
+        if banish {
+            self.note(format!("seat {ix} left ({why}) — banished at tick {tick}"));
+        }
+        self.complete();
+    }
+
+    fn input(&mut self, id: u32, tick: u64, input: PortInput) {
+        let Some(g) = &mut self.game else { return };
+        let Some(ix) = g.seat_of(id).filter(|&ix| g.active(ix)) else {
+            // A game's tail (inputs sent before he left it).
+            return;
+        };
+        if tick < g.next_complete {
+            let why = format!("input for tick {tick} arrived after its turn");
+            self.drop_client(id, &why);
+            return;
+        }
+        let n = g.ids.len();
+        g.pending.entry(tick).or_insert_with(|| vec![None; n])[ix] = Some(input);
+        self.complete();
+    }
+
+    /// Every turn whose seats have all reported, in tick order: the
+    /// server's world steps it, and it goes out to the players.
+    fn complete(&mut self) {
+        let Some(g) = &mut self.game else { return };
+        while let Some(turn) = g.pending.get_mut(&g.next_complete) {
+            let tick = g.next_complete;
+            // A departed seat's input is the server's to write.
+            for (ix, d) in g.departed.iter().enumerate() {
+                if let Some((at, banish)) = *d
+                    && tick >= at
+                    && turn[ix].is_none()
+                {
+                    turn[ix] = Some(PortInput {
+                        suicide: banish && tick == at,
+                        ..PortInput::default()
+                    });
+                }
+            }
+            if turn.iter().any(Option::is_none) {
+                break;
+            }
+            let inputs: Vec<PortInput> = g
+                .pending
+                .remove(&tick)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .collect();
+            g.next_complete += 1;
+            let check = (tick % CHECK_EVERY == 0).then(|| (tick, self.referee.hash()));
+            if let Some((t, h)) = check {
+                g.checks += 1;
+                if trace() {
+                    println!("server: tick {t} hash {h:016x}");
+                }
+            }
+            let left = g.departures.remove(&tick).unwrap_or_default();
+            let over = g.announce.take();
+            self.referee.step(&inputs, &left);
+            if g.over.is_none()
+                && let Some(v) = self.referee.verdict()
+            {
+                println!("server: the game is over — {v}");
+                g.over = Some((v.clone(), Instant::now()));
+                g.announce = Some(v);
+            }
+            let turn = Msg::Turn {
+                tick,
+                inputs,
+                check,
+                left,
+                over,
+            };
+            for (id, c) in &mut self.clients {
+                if g.seat_of(*id).is_some_and(|ix| g.active(ix))
+                    && let Err(e) = c.send(&turn)
+                {
+                    // He leaves at the next poll (a Lost follows).
+                    eprintln!("server: send to {}: {e}", c.peer);
+                    let _ = c.tx.shutdown(Shutdown::Both);
+                }
+            }
+        }
+    }
+
+    /// The running game's end: nobody plays any more, or the verdict's
+    /// grace ran out — the lobby reopens for everyone.
+    fn referee_turns(&mut self) {
+        let Some(g) = &self.game else { return };
+        let done = g.playing() == 0
+            || g.over
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() > GAME_OVER_GRACE);
+        if !done {
+            return;
+        }
+        let g = self.game.take().expect("a game");
+        self.note(format!(
+            "game over after {} ticks, {} hash checks stamped",
+            g.next_complete, g.checks
+        ));
+        self.referee.end();
+        self.core.reopen();
+        self.dirty = true;
+    }
+
+    /// Play (the admin's): the server builds the world, every member
+    /// gets his seat and the agreed session, and the lobby waits.
+    fn play(&mut self) {
+        if self.game.is_some() || !self.core.can_play() {
+            return;
+        }
+        let view = self.core.view_for(0);
+        let game = Game {
+            seats: view.seats(),
+            names: view.names(),
+            models: view.models(),
+            ai: view.ai,
+            level: view.level.clone(),
+            rules: view.rules.clone(),
+        };
+        if let Err(e) = self.referee.begin(&game) {
+            let text = format!("the server could not start the game: {e}");
+            self.note(&text);
+            for (_, c) in &mut self.clients {
+                let _ = c.send(&Msg::Notice { text: text.clone() });
+            }
+            return;
+        }
+        let ids: Vec<u32> = view.members.iter().map(|m| m.id).collect();
+        let mut lost = Vec::new();
+        for (id, conn) in &mut self.clients {
+            let Some(local) = ids.iter().position(|m| m == id) else {
+                continue;
+            };
+            let start = Msg::Start {
+                seats: game.seats.clone(),
+                names: game.names.clone(),
+                models: game.models.clone(),
+                ai: game.ai,
+                local: local as u8,
+                level: game.level.clone(),
+                rules: game.rules.clone(),
+            };
+            if let Err(e) = conn.send(&start) {
+                lost.push((*id, format!("{}: {e}", conn.peer)));
+            }
+        }
+        self.note(format!(
+            "the game begins — {} players, level {}",
+            ids.len(),
+            game.level
+        ));
+        let n = ids.len();
+        self.game = Some(Match {
+            ids,
+            next_complete: 0,
+            pending: BTreeMap::new(),
+            departed: vec![None; n],
+            departures: BTreeMap::new(),
+            over: None,
+            announce: None,
+            checks: 0,
+        });
+        self.core.begin();
+        // A player lost while the game starts leaves at its first tick,
+        // like any departure; the rest play on.
+        for (id, why) in lost {
+            self.drop_client(id, &why);
+        }
+    }
+
+    /// Send every member who is not in the running game the lobby (a
+    /// lobby view ends a player's game).
     fn flush(&mut self) {
         if !std::mem::take(&mut self.dirty) {
             return;
         }
         let mut lost = Vec::new();
         for (id, conn) in &mut self.clients {
-            let view = self.core.view_for(*id);
+            if self
+                .game
+                .as_ref()
+                .is_some_and(|g| g.seat_of(*id).is_some_and(|ix| g.active(ix)))
+            {
+                continue;
+            }
+            let mut view = self.core.view_for(*id);
+            if view.is_admin() {
+                view.passphrase = Some(self.passphrase.clone());
+            }
             if let Err(e) = conn.send(&Msg::Lobby { view }) {
                 lost.push((*id, e.to_string()));
             }
         }
         for (id, why) in lost {
             self.drop_client(id, &why);
-            self.notes.push(format!("member {id} lost ({why})"));
         }
         if self.dirty {
             self.flush();
         }
     }
+}
 
-    /// The host's own wizard (first come, first served applies to him
-    /// too).
-    pub fn pick_wizard(&mut self, wizard: u8) -> bool {
-        let ok = self.core.pick_wizard(0, wizard);
-        self.dirty |= ok;
-        self.flush();
-        ok
-    }
-
-    /// Change the level — voids every agreement.
-    pub fn set_level(&mut self, level: String) {
-        self.dirty |= self.core.set_level(level);
-        self.flush();
-    }
-
-    /// Change the AI wizard count — a rule: voids every agreement.
-    pub fn set_ai(&mut self, ai: u8) {
-        self.dirty |= self.core.set_ai(ai);
-        self.flush();
-    }
-
-    /// Change the rules — voids every agreement.
-    pub fn set_rules(&mut self, rules: serde_json::Value) {
-        self.dirty |= self.core.set_rules(rules);
-        self.flush();
-    }
-
-    /// Change the passphrase: later joiners need the new one (a kicked
-    /// player can't come back); members already in stay.
-    pub fn set_passphrase(&mut self, passphrase: String) {
-        self.passphrase = passphrase;
-    }
-
-    /// The host's own flight models.
-    pub fn set_models(&mut self, models: serde_json::Value) {
-        self.dirty |= self.core.set_models(0, models);
-        self.flush();
-    }
-
-    pub fn passphrase(&self) -> &str {
-        &self.passphrase
-    }
-
-    /// The player limit (2 up to [`MAX_PLAYERS`], never below the
-    /// members in).
-    pub fn set_capacity(&mut self, capacity: usize) {
-        self.dirty |= self.core.set_capacity(capacity);
-        self.flush();
-    }
-
-    /// Show member `id` the door.
-    pub fn kick(&mut self, id: u32) {
-        if id != 0 {
-            self.drop_client(id, "kicked by the host");
-            self.notes.push(format!("member {id} kicked"));
-            self.flush();
+impl Drop for Server {
+    fn drop(&mut self) {
+        for (_, c) in &mut self.clients {
+            c.close("the server stopped");
         }
-    }
-
-    pub fn can_play(&self) -> bool {
-        self.core.can_play()
-    }
-
-    /// Play: every client gets its seat and the agreed session, and the
-    /// lobby becomes a game. Refused (the lobby handed back) unless
-    /// every client agreed.
-    pub fn play(mut self) -> Result<Link, Box<Self>> {
-        self.poll();
-        if !self.can_play() {
-            return Err(Box::new(self));
-        }
-        let view = self.view();
-        let seats = view.seats();
-        let mut lost = Vec::new();
-        for (id, conn) in &mut self.clients {
-            let local = view.members.iter().position(|m| m.id == *id);
-            let start = Msg::Start {
-                seats: seats.clone(),
-                names: view.names(),
-                models: view.models(),
-                ai: view.ai,
-                local: local.unwrap_or(0) as u8,
-                level: view.level.clone(),
-                rules: view.rules.clone(),
-            };
-            if let Err(e) = conn.send(&start)
-                && let Some(ix) = local
-            {
-                lost.push((ix, format!("{}: {e}", conn.peer)));
-            }
-        }
-        self.core.begin();
-        Ok(Link {
-            session: Session::Host(self),
-            role: Role::Host,
-            names: view.names(),
-            models: view.models(),
-            ai: view.ai,
-            seats,
-            local: Hx::FIRST,
-            level: view.level,
-            config: view.rules,
-            lost,
-        })
     }
 }
 
-impl Drop for Host {
+/// A server on a thread of this app (the UI's Host, `--host`): it runs
+/// as long as the handle lives — dropping it stops the server, and
+/// every member hears so.
+pub struct ServerHandle {
+    addr: SocketAddr,
+    admin_key: String,
+    stop: Arc<AtomicBool>,
+    status: Arc<Mutex<ServerStatus>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ServerHandle {
+    /// Bind `addr` and start the server, its world built by the
+    /// referee `make` returns (on the server's thread). `opts.admin_key`
+    /// is set here: the handle's own player claims the admin role.
+    pub fn spawn(
+        addr: &str,
+        mut opts: ServerOpts,
+        make: impl FnOnce() -> Box<dyn Referee> + Send + 'static,
+    ) -> Result<Self, String> {
+        let listener = Server::bind(addr)?;
+        let bound = listener
+            .local_addr()
+            .map_err(|e| format!("net: {addr}: {e}"))?;
+        let key = opts.admin_key.get_or_insert_with(admin_key).clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let status = Arc::new(Mutex::new(ServerStatus::default()));
+        let (s, st) = (stop.clone(), status.clone());
+        let thread = std::thread::Builder::new()
+            .name("net-server".into())
+            .spawn(move || Server::new(listener, opts, make()).run(&s, Some(&st)))
+            .map_err(|e| format!("net: server thread: {e}"))?;
+        println!("server: listening on {bound}");
+        Ok(Self {
+            addr: bound,
+            admin_key: key,
+            stop,
+            status,
+            thread: Some(thread),
+        })
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// The address this app's own player joins by (loopback when the
+    /// server listens everywhere).
+    pub fn local_addr(&self) -> String {
+        let ip = match self.addr.ip() {
+            std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            }
+            std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            }
+            ip => ip,
+        };
+        SocketAddr::new(ip, self.addr.port()).to_string()
+    }
+
+    pub fn admin_key(&self) -> &str {
+        &self.admin_key
+    }
+
+    pub fn status(&self) -> ServerStatus {
+        self.status.lock().map(|s| *s).unwrap_or_default()
+    }
+}
+
+impl Drop for ServerHandle {
     fn drop(&mut self) {
-        for (_, c) in &mut self.clients {
-            c.close("the host closed the lobby");
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
         }
     }
 }
@@ -565,26 +970,33 @@ type Start = (
     serde_json::Value,
 );
 
-/// A CLIENT's lobby: the host's latest view, our requests, and the
-/// Start that turns it into a game.
+/// A player's end of the session: the server's latest lobby view, our
+/// requests (the admin's too), and the Start that turns it into a game.
 pub struct Guest {
     conn: Conn,
     view: LobbyView,
     start: Option<Start>,
     /// The flight models last sent.
     models_sent: Option<serde_json::Value>,
+    notices: Vec<String>,
     closed: Option<String>,
 }
 
 impl Guest {
-    /// Connect to `addr` (retrying for up to `wait` while the host
+    /// Connect to `addr` (retrying for up to `wait` while the server
     /// comes up) and pass the handshake — the first lobby view, or the
-    /// host's refusal.
+    /// server's refusal. `game`: the game this player plays — a server
+    /// of another refuses him (`None`: adopt the server's, the CLI's
+    /// way). `admin_key`: a hosted server's key (its own player); empty
+    /// for everyone else.
+    #[allow(clippy::too_many_arguments)]
     pub fn connect(
         addr: &str,
         passphrase: &str,
         name: &str,
+        game: Option<NetGame>,
         build: &str,
+        admin_key: &str,
         wait: Duration,
     ) -> Result<Self, String> {
         let deadline = Instant::now() + wait;
@@ -594,7 +1006,7 @@ impl Guest {
                 Ok(s) => break s,
                 Err(e) if Instant::now() < deadline => {
                     if !said {
-                        println!("net: waiting for a host at {addr} ({e})");
+                        println!("net: waiting for a server at {addr} ({e})");
                         said = true;
                     }
                     std::thread::sleep(Duration::from_millis(250));
@@ -608,6 +1020,8 @@ impl Guest {
             build: build.to_string(),
             passphrase: passphrase.to_string(),
             name: name.to_string(),
+            game,
+            admin_key: admin_key.to_string(),
         })
         .map_err(|e| format!("net: {addr}: {e}"))?;
         let deadline = Instant::now() + HELLO_WITHIN;
@@ -619,19 +1033,20 @@ impl Guest {
                         view,
                         start: None,
                         models_sent: None,
+                        notices: Vec::new(),
                         closed: None,
                     });
                 }
                 Recv::Msg(Msg::Refuse { why }) => {
                     conn.open = false;
-                    return Err(format!("net: the host refused: {why}"));
+                    return Err(format!("net: the server refused: {why}"));
                 }
                 Recv::Msg(other) => return Err(format!("net: expected the lobby, got {other:?}")),
                 Recv::Lost(e) => return Err(format!("net: {addr}: {e}")),
                 Recv::Empty if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                Recv::Empty => return Err(format!("net: {addr}: no answer from the host")),
+                Recv::Empty => return Err(format!("net: {addr}: no answer from the server")),
             }
         }
     }
@@ -640,7 +1055,7 @@ impl Guest {
         &self.view
     }
 
-    /// Why the lobby ended for us (kicked, the host closed it, lost).
+    /// Why the lobby ended for us (kicked, the server stopped, lost).
     pub fn closed(&self) -> Option<&str> {
         self.closed.as_deref()
     }
@@ -649,10 +1064,16 @@ impl Guest {
         self.start.is_some()
     }
 
+    /// What the server told the lobby since the last call.
+    pub fn take_notices(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notices)
+    }
+
     pub fn poll(&mut self) {
         while self.closed.is_none() && self.start.is_none() {
             match self.conn.recv() {
                 Recv::Msg(Msg::Lobby { view }) => self.view = view,
+                Recv::Msg(Msg::Notice { text }) => self.notices.push(text),
                 Recv::Msg(Msg::Start {
                     seats,
                     names,
@@ -662,14 +1083,14 @@ impl Guest {
                     level,
                     rules,
                 }) => self.start = Some((seats, names, models, ai, local, level, rules)),
-                // A game's tail (turns sent before its end landed).
+                // A game's tail (turns sent before we left it).
                 Recv::Msg(Msg::Turn { .. }) => {}
                 Recv::Msg(Msg::Bye { why }) => {
                     self.conn.open = false;
                     self.closed = Some(why);
                 }
                 Recv::Msg(other) => {
-                    let why = format!("the host sent {other:?}");
+                    let why = format!("the server sent {other:?}");
                     self.conn.close(&why);
                     self.closed = Some(why);
                 }
@@ -687,7 +1108,7 @@ impl Guest {
         }
     }
 
-    /// Ask for `wizard` (the host decides; the next view tells).
+    /// Ask for `wizard` (the server decides; the next view tells).
     pub fn pick_wizard(&mut self, wizard: u8) {
         self.send(&Msg::Wizard { want: wizard });
     }
@@ -702,7 +1123,7 @@ impl Guest {
         self.send(&Msg::Withdraw);
     }
 
-    /// Tell the host our flight models (only when they changed).
+    /// Tell the server our flight models (only when they changed).
     pub fn set_models(&mut self, models: serde_json::Value) {
         if self.models_sent.as_ref() != Some(&models) {
             self.send(&Msg::Models {
@@ -712,7 +1133,45 @@ impl Guest {
         }
     }
 
-    /// The game the host started (the guest handed back before
+    /// Admin: change the level — voids every agreement.
+    pub fn set_level(&mut self, level: String) {
+        self.send(&Msg::SetLevel { level });
+    }
+
+    /// Admin: change the AI wizard count — a rule.
+    pub fn set_ai(&mut self, ai: u8) {
+        self.send(&Msg::SetAi { ai });
+    }
+
+    /// Admin: change the rules — voids every agreement.
+    pub fn set_rules(&mut self, rules: serde_json::Value) {
+        self.send(&Msg::SetRules { rules });
+    }
+
+    /// Admin: the player limit (2 up to [`MAX_PLAYERS`], never below
+    /// the members in).
+    pub fn set_capacity(&mut self, capacity: usize) {
+        let capacity = capacity.min(MAX_PLAYERS) as u8;
+        self.send(&Msg::SetCapacity { capacity });
+    }
+
+    /// Admin: a new passphrase for later joiners.
+    pub fn set_passphrase(&mut self, passphrase: String) {
+        self.send(&Msg::SetPassphrase { passphrase });
+    }
+
+    /// Admin: show member `id` the door.
+    pub fn kick(&mut self, id: u32) {
+        self.send(&Msg::Kick { id });
+    }
+
+    /// Admin: start the game (the server refuses unless everyone
+    /// agreed).
+    pub fn play(&mut self) {
+        self.send(&Msg::Play);
+    }
+
+    /// The game the server started (the guest handed back before
     /// [`Self::started`]).
     pub fn into_link(self) -> Result<Link, Box<Self>> {
         let Some((seats, names, models, ai, local, level, rules)) = self.start.clone() else {
@@ -721,99 +1180,66 @@ impl Guest {
         let mut guest = self;
         guest.start = None;
         Ok(Link {
-            session: Session::Guest(guest),
-            role: Role::Client,
-            seats,
-            names,
-            models,
-            ai,
+            guest,
+            game: Game {
+                seats,
+                names,
+                models,
+                ai,
+                level,
+                rules,
+            },
             local: Hx(local),
-            level,
-            config: rules,
-            lost: Vec::new(),
         })
     }
 }
 
-/// Either end of a session, between games.
-pub enum Session {
-    Host(Host),
-    Guest(Guest),
-}
-
 /// A started game: the agreed session, before any world.
 pub struct Link {
-    session: Session,
-    pub role: Role,
-    /// Wizard seat per human seat, in seat order (`Hx(k)`).
-    pub seats: Vec<u8>,
-    /// Each human's campaign name, seat order (empty: none given).
-    pub names: Vec<String>,
-    /// Each human's flight models (`controls.models`), seat order.
-    pub models: Vec<serde_json::Value>,
-    /// The AI wizards to seat (the host's rule).
-    pub ai: u8,
+    guest: Guest,
+    pub game: Game,
     /// This app's human seat.
     pub local: Hx,
-    pub level: String,
-    /// The session rules (`rules::collect` of the host's config).
-    pub config: serde_json::Value,
-    /// Host: the seats lost while starting (seat, why) — they leave the
-    /// game at its first tick, like any departure; the rest play on.
-    lost: Vec<(usize, String)>,
 }
 
-/// CLI host (`--host`): open the lobby, wait for the clients to agree
-/// (`--join` agrees by itself) and start.
-pub fn host(
-    addr: &str,
-    wizard: u8,
-    level: &str,
-    rules: serde_json::Value,
-    models: serde_json::Value,
-    passphrase: &str,
-    build: &str,
-) -> Result<Link, String> {
-    let mut h = Host::open(
-        addr,
-        wizard,
-        String::new(),
-        level.to_string(),
-        rules,
-        passphrase.to_string(),
-        build.to_string(),
-    )?;
-    h.set_models(models);
+/// CLI server (`--serve`): run in the foreground until killed.
+pub fn serve(addr: &str, opts: ServerOpts, referee: Box<dyn Referee>) -> Result<(), String> {
+    let listener = Server::bind(addr)?;
+    let bound = listener
+        .local_addr()
+        .map_or_else(|_| addr.to_string(), |a| a.to_string());
     println!(
-        "net: hosting on {} as seat {} — waiting for --join",
-        h.addr(),
-        wizard + 1
+        "server: {} on {bound} — the first player in is the admin",
+        opts.game.title()
     );
-    loop {
-        h.poll();
-        for n in h.take_notes() {
-            println!("net: {n}");
-        }
-        if h.can_play() {
-            match h.play() {
-                Ok(link) => return Ok(link),
-                Err(back) => h = *back,
-            }
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let stop = AtomicBool::new(false);
+    Server::new(listener, opts, referee).run(&stop, None);
+    Ok(())
 }
 
-/// CLI client (`--join`): connect, take `wizard` if asked (else the
-/// host's pick), agree to whatever the host sets, wait for the start.
+/// CLI player (`--join`, and `--host`'s own player): connect, take
+/// `wizard` if asked (else the server's pick), agree to whatever the
+/// admin sets — or, as the admin, press Play once everyone agreed —
+/// and wait for the start.
+#[allow(clippy::too_many_arguments)]
 pub fn join(
     addr: &str,
+    game: Option<NetGame>,
     wizard: Option<u8>,
     models: serde_json::Value,
     passphrase: &str,
     build: &str,
+    admin_key: &str,
 ) -> Result<Link, String> {
-    let mut g = Guest::connect(addr, passphrase, "", build, Duration::from_secs(60))?;
+    let mut g = Guest::connect(
+        addr,
+        passphrase,
+        "",
+        game,
+        build,
+        admin_key,
+        Duration::from_secs(60),
+    )?;
     g.set_models(models);
     if let Some(w) = wizard {
         if !g.view().is_free(w) && g.view().me().is_none_or(|m| m.wizard != w) {
@@ -822,8 +1248,12 @@ pub fn join(
         g.pick_wizard(w);
     }
     let mut agreed = None;
+    let mut pressed = None;
     loop {
         g.poll();
+        for n in g.take_notices() {
+            println!("net: {n}");
+        }
         if let Some(why) = g.closed() {
             return Err(format!("net: the lobby closed: {why}"));
         }
@@ -831,78 +1261,71 @@ pub fn join(
             let link = g.into_link().unwrap_or_else(|_| unreachable!("started"));
             println!(
                 "net: joined {addr} as seat {} — level {}",
-                link.seats[usize::from(link.local.0)] + 1,
-                link.level
+                link.game.seats[usize::from(link.local.0)] + 1,
+                link.game.level
             );
             return Ok(link);
         }
-        let mine = g.view().me().map(|m| m.wizard);
-        if wizard.is_none_or(|w| mine == Some(w)) && agreed != Some(g.view().rev) {
-            agreed = Some(g.view().rev);
+        let v = g.view();
+        let mine = v.me().map(|m| m.wizard);
+        let ready = wizard.is_none_or(|w| mine == Some(w));
+        let agreement = (v.rev, v.agreement());
+        if v.is_admin() {
+            if ready && v.all_agreed() && pressed != Some(agreement) {
+                pressed = Some(agreement);
+                g.play();
+            }
+        } else if ready && agreed != Some(v.rev) {
+            agreed = Some(v.rev);
             g.agree();
         }
         std::thread::sleep(Duration::from_millis(5));
     }
 }
 
-/// The running lockstep: turn assembly (host), turn intake (client),
-/// the hash check. Non-blocking — the app polls it once per sim tick.
-/// Runs on the session's connections and hands them back at the end
-/// ([`Self::end`]): the lobby reopens with the same players.
+/// A player's running lockstep: input out, turns in, the hash check
+/// against the server. Non-blocking — the app polls it once per sim
+/// tick. Runs on the session's connection and hands it back at the
+/// end ([`Self::finish`]): the lobby comes back with the same players.
 pub struct Lockstep {
-    role: Role,
-    local: Hx,
     seats: usize,
-    /// The agreed session rules (`Link::config`).
+    /// The agreed session rules.
     config: serde_json::Value,
-    /// `None` once handed back by [`Self::end`].
-    session: Option<Session>,
+    /// `None` once handed back by [`Self::finish`].
+    guest: Option<Guest>,
     /// The next tick to step.
     next_tick: u64,
     /// The next tick this seat's input is scheduled for.
     next_send: u64,
-    /// Host: the next turn to complete, and partial turns by tick.
-    next_complete: u64,
-    pending: BTreeMap<u64, Vec<Option<PortInput>>>,
-    /// Complete turns not yet stepped.
+    /// Turns not yet stepped.
     ready: BTreeMap<u64, Vec<PortInput>>,
-    /// Host: the hash stamp riding the next turn sent.
-    stamp: Option<(u64, u64)>,
-    /// Client: hashes awaiting their counterpart.
+    /// Hashes awaiting their counterpart.
     ours: BTreeMap<u64, u64>,
     theirs: BTreeMap<u64, u64>,
     desync: Option<String>,
     desync_seen: bool,
-    /// Client: hash checks that agreed (the session summary).
+    /// Hash checks that agreed (the session summary).
     agreed: u64,
     closed: Option<String>,
-    /// Client: the host reopened the lobby (the game is over).
+    /// The server reopened the lobby (the game is over).
     ended: bool,
-    /// Host: member ids of the clients that left mid-game.
-    gone: Vec<u32>,
-    /// Host: per seat, the tick it left at (its input from then on is
-    /// the host's: the suicide key at that tick, idle after).
-    departed: Vec<Option<u64>>,
-    /// Host: clients a send failed to — they leave at the next poll.
-    failed: Vec<(usize, String)>,
     /// The seats leaving at each tick (see [`Self::left_at`]).
     departures: BTreeMap<u64, Vec<u8>>,
+    /// The verdict, by the tick whose turn carried it …
+    overs: BTreeMap<u64, String>,
+    /// … once stepped.
+    verdict: Option<String>,
 }
 
 impl Lockstep {
     pub fn start(link: Link) -> Self {
         Self {
-            role: link.role,
-            local: link.local,
-            seats: link.seats.len(),
-            config: link.config,
-            session: Some(link.session),
+            seats: link.game.seats.len(),
+            config: link.game.rules,
+            guest: Some(link.guest),
             next_tick: 0,
             next_send: 0,
-            next_complete: 0,
-            pending: BTreeMap::new(),
             ready: BTreeMap::new(),
-            stamp: None,
             ours: BTreeMap::new(),
             theirs: BTreeMap::new(),
             desync: None,
@@ -910,10 +1333,9 @@ impl Lockstep {
             agreed: 0,
             closed: None,
             ended: false,
-            gone: Vec::new(),
-            departed: vec![None; link.seats.len()],
-            failed: link.lost,
             departures: BTreeMap::new(),
+            overs: BTreeMap::new(),
+            verdict: None,
         }
     }
 
@@ -926,16 +1348,12 @@ impl Lockstep {
         &self.config
     }
 
-    /// Why the session ended, once it has (peer left, socket error).
+    /// Why the session ended, once it has (the server stopped, lost).
     pub fn closed(&self) -> Option<&str> {
         self.closed.as_deref()
     }
 
-    pub fn is_host(&self) -> bool {
-        self.role == Role::Host
-    }
-
-    /// Client: the host ended the game and reopened the lobby.
+    /// The server ended the game and reopened the lobby.
     pub fn ended(&self) -> bool {
         self.ended
     }
@@ -956,128 +1374,18 @@ impl Lockstep {
     pub fn submit(&mut self, input: PortInput) {
         let tick = self.next_send;
         self.next_send += 1;
-        match self.role {
-            Role::Host => {
-                let ix = self.local.0 as usize;
-                self.slot(tick)[ix] = Some(input);
-                self.complete();
-            }
-            Role::Client => self.send(&Msg::Input { tick, input }),
-        }
+        self.send(&Msg::Input { tick, input });
     }
 
-    fn slot(&mut self, tick: u64) -> &mut Vec<Option<PortInput>> {
-        let n = self.seats;
-        self.pending.entry(tick).or_insert_with(|| vec![None; n])
-    }
-
-    /// Host: every turn whose seats have all reported, in tick order,
-    /// goes out to the clients and onto the local ready queue.
-    fn complete(&mut self) {
-        while let Some(turn) = self.pending.get_mut(&self.next_complete) {
-            let tick = self.next_complete;
-            // A departed seat's input is the host's to write.
-            for (ix, d) in self.departed.iter().enumerate() {
-                if let Some(d) = *d
-                    && tick >= d
-                    && turn[ix].is_none()
-                {
-                    turn[ix] = Some(PortInput {
-                        suicide: tick == d,
-                        ..PortInput::default()
-                    });
-                }
-            }
-            if turn.iter().any(Option::is_none) {
-                break;
-            }
-            let inputs: Vec<PortInput> = self
-                .pending
-                .remove(&tick)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .collect();
-            self.next_complete += 1;
-            let check = self.stamp.take();
-            let left = self.departures.get(&tick).cloned().unwrap_or_default();
-            self.send(&Msg::Turn {
-                tick,
-                inputs: inputs.clone(),
-                check,
-                left,
-            });
-            self.ready.insert(tick, inputs);
-        }
-    }
-
-    /// Host: to every client; client: to the host.
     fn send(&mut self, m: &Msg) {
         if self.closed.is_some() {
             return;
         }
-        let err = match &mut self.session {
-            // A client that cannot be reached leaves (at the next poll);
-            // the game goes on for the rest.
-            Some(Session::Host(h)) => {
-                for (k, (_, c)) in h.clients.iter_mut().enumerate() {
-                    // In the game only: not departed, not a newcomer
-                    // waiting in the lobby.
-                    if self.departed.get(k + 1).is_none_or(Option::is_some) {
-                        continue;
-                    }
-                    if let Err(e) = c.send(m) {
-                        self.failed.push((k + 1, format!("{}: {e}", c.peer)));
-                    }
-                }
-                None
-            }
-            Some(Session::Guest(g)) => g.conn.send(m).err().map(|e| e.to_string()),
-            None => None,
-        };
-        if let Some(e) = err {
+        if let Some(g) = &mut self.guest
+            && let Err(e) = g.conn.send(m)
+        {
             self.closed = Some(format!("send: {e}"));
         }
-    }
-
-    /// Host: seat `ix` (a client) left the game: it is banished at the
-    /// first turn not yet sent — whatever it had scheduled from there
-    /// on is dropped, and its input becomes the host's (`complete`).
-    /// `waits`: he left on purpose and stays a member, waiting in the
-    /// lobby for the game to finish (the connection stays open).
-    fn depart(&mut self, ix: usize, why: &str, waits: bool) {
-        if ix == 0 || self.departed.get(ix).is_none_or(Option::is_some) {
-            return;
-        }
-        let tick = self.next_complete;
-        self.departed[ix] = Some(tick);
-        self.departures.entry(tick).or_default().push(ix as u8);
-        for turn in self.pending.range_mut(tick..).map(|(_, t)| t) {
-            turn[ix] = None;
-        }
-        if !waits {
-            self.hang_up(ix, why);
-        }
-        println!("net: seat {ix} left ({why}) — banished at tick {tick}");
-        self.complete();
-    }
-
-    /// Host: close client `ix`'s connection; he leaves the lobby when
-    /// the game ends (the client list keeps its seat order until then).
-    fn hang_up(&mut self, ix: usize, why: &str) {
-        if let Some(Session::Host(h)) = &mut self.session
-            && let Some((id, conn)) = h.clients.get_mut(ix - 1)
-            && conn.open
-        {
-            conn.close(why);
-            self.gone.push(*id);
-        }
-    }
-
-    /// Host: is client `ix` out of the game but in the lobby — he left
-    /// it on purpose, or joined during it?
-    fn waiting(&self, ix: usize) -> bool {
-        self.departed.get(ix).is_none_or(Option::is_some)
     }
 
     /// The human seats that leave the game at `tick` — banish them
@@ -1086,154 +1394,67 @@ impl Lockstep {
         self.departures.remove(&tick).unwrap_or_default()
     }
 
-    /// Drain everything the peers have sent.
+    /// Drain everything the server has sent.
     pub fn poll(&mut self) {
         if self.closed.is_some() || self.ended {
             return;
         }
-        for (ix, why) in std::mem::take(&mut self.failed) {
-            self.depart(ix, &why, false);
-        }
-        let mut got: Vec<(usize, Recv)> = Vec::new();
-        let mut ids: Vec<u32> = Vec::new();
-        match &mut self.session {
-            Some(Session::Host(h)) => {
-                // A newcomer joins the LOBBY and waits for the game to
-                // finish; he (and every waiting member) hears of the
-                // lobby's changes — the players in the game do not (a
-                // lobby view ends a client's game).
-                h.accept();
-                h.handshake();
-                for n in h.take_notes() {
-                    println!("net: {n}");
-                }
-                if std::mem::take(&mut h.dirty) {
-                    for (k, (id, conn)) in h.clients.iter_mut().enumerate() {
-                        if self.departed.get(k + 1).is_none_or(Option::is_some) && conn.open {
-                            let _ = conn.send(&Msg::Lobby {
-                                view: h.core.view_for(*id),
-                            });
-                        }
-                    }
-                }
-                // Client k is human seat Hx(k + 1) (member order).
-                ids = h.clients.iter().map(|(id, _)| *id).collect();
-                for (k, (_, conn)) in h.clients.iter().enumerate() {
-                    if !conn.open {
-                        continue;
-                    }
-                    loop {
-                        let r = conn.recv();
-                        let stop = !matches!(r, Recv::Msg(Msg::Input { .. }));
-                        got.push((k + 1, r));
-                        if stop {
-                            break;
-                        }
-                    }
-                }
-            }
-            Some(Session::Guest(g)) => loop {
-                let r = g.conn.recv();
-                let stop = matches!(r, Recv::Empty | Recv::Lost(_));
-                got.push((0, r));
-                if stop {
+        let Some(g) = &mut self.guest else { return };
+        let mut checked = false;
+        loop {
+            match g.conn.recv() {
+                Recv::Empty => break,
+                Recv::Lost(e) => {
+                    self.closed = Some(format!("connection lost: {e}"));
                     break;
                 }
-            },
-            None => return,
-        }
-        for (ix, r) in got {
-            // A waiting member: only his hanging up matters now.
-            if self.role == Role::Host && self.waiting(ix) {
-                match r {
-                    Recv::Lost(e) => self.hang_up(ix, &e),
-                    Recv::Msg(Msg::Bye { why }) => self.hang_up(ix, &why),
-                    // His models count for the next game.
-                    Recv::Msg(Msg::Models { models }) => {
-                        if let (Some(Session::Host(h)), Some(&id)) =
-                            (&mut self.session, ids.get(ix - 1))
-                        {
-                            h.core.set_models(id, models);
-                        }
-                    }
-                    _ => {}
+                Recv::Msg(Msg::Bye { why }) => {
+                    g.conn.open = false;
+                    self.closed = Some(format!("the server left ({why})"));
+                    break;
                 }
-                continue;
-            }
-            match (self.role, r) {
-                (_, Recv::Empty) => {}
-                // A client leaving: the game goes on without it.
-                (Role::Host, Recv::Lost(e)) => {
-                    self.depart(ix, &format!("connection lost: {e}"), false);
-                }
-                (Role::Host, Recv::Msg(Msg::Bye { why })) => self.depart(ix, &why, false),
-                (Role::Host, Recv::Msg(Msg::Leave)) => self.depart(ix, "left the game", true),
-                (_, Recv::Lost(e)) => {
-                    self.gone.extend(ix.checked_sub(1).and_then(|k| ids.get(k)));
-                    self.closed
-                        .get_or_insert_with(|| format!("connection lost: {e}"));
-                    return;
-                }
-                (_, Recv::Msg(Msg::Bye { why })) => {
-                    self.gone.extend(ix.checked_sub(1).and_then(|k| ids.get(k)));
-                    self.closed
-                        .get_or_insert_with(|| format!("peer left ({why})"));
-                    return;
-                }
-                (Role::Host, Recv::Msg(Msg::Input { tick, input })) => {
-                    if tick < self.next_complete {
-                        self.fail(format!(
-                            "client input for tick {tick} arrived after its turn"
-                        ));
-                        return;
-                    }
-                    self.slot(tick)[ix] = Some(input);
-                    self.complete();
-                }
-                (
-                    Role::Client,
-                    Recv::Msg(Msg::Turn {
-                        tick,
-                        inputs,
-                        check,
-                        left,
-                    }),
-                ) => {
+                Recv::Msg(Msg::Turn {
+                    tick,
+                    inputs,
+                    check,
+                    left,
+                    over,
+                }) => {
                     if inputs.len() != self.seats {
-                        self.fail(format!("turn {tick} carries {} seats", inputs.len()));
-                        return;
+                        let why = format!("turn {tick} carries {} seats", inputs.len());
+                        g.conn.close(&why);
+                        self.closed = Some(why);
+                        break;
                     }
                     if !left.is_empty() {
                         self.departures.insert(tick, left);
                     }
+                    if let Some(v) = over {
+                        self.overs.insert(tick, v);
+                    }
                     self.ready.insert(tick, inputs);
                     if let Some((t, h)) = check {
                         self.theirs.insert(t, h);
-                        self.compare();
+                        checked = true;
                     }
                 }
-                (Role::Client, Recv::Msg(Msg::Lobby { view })) => {
-                    if let Some(Session::Guest(g)) = &mut self.session {
-                        g.view = view;
-                    }
+                Recv::Msg(Msg::Lobby { view }) => {
+                    g.view = view;
                     self.ended = true;
-                    return;
+                    break;
                 }
-                (_, Recv::Msg(other)) => {
-                    self.fail(format!("unexpected {other:?}"));
-                    return;
+                Recv::Msg(Msg::Notice { text }) => g.notices.push(text),
+                Recv::Msg(other) => {
+                    let why = format!("unexpected {other:?}");
+                    g.conn.close(&why);
+                    self.closed = Some(why);
+                    break;
                 }
             }
         }
-    }
-
-    fn fail(&mut self, why: String) {
-        match &mut self.session {
-            Some(Session::Host(h)) => h.clients.iter_mut().for_each(|(_, c)| c.close(&why)),
-            Some(Session::Guest(g)) => g.conn.close(&why),
-            None => {}
+        if checked {
+            self.compare();
         }
-        self.closed.get_or_insert(why);
     }
 
     /// The next tick's bundle (every seat's input, seat order), once
@@ -1242,7 +1463,16 @@ impl Lockstep {
         let inputs = self.ready.remove(&self.next_tick)?;
         let tick = self.next_tick;
         self.next_tick += 1;
+        if let Some(v) = self.overs.remove(&tick) {
+            self.verdict = Some(v);
+        }
         Some((tick, inputs))
+    }
+
+    /// The server's verdict (the winner's announcement), once, when the
+    /// turn that carried it has been taken.
+    pub fn take_verdict(&mut self) -> Option<String> {
+        self.verdict.take()
     }
 
     /// The pre-step state of lockstep tick `tick` — hashed (lazily)
@@ -1255,13 +1485,8 @@ impl Lockstep {
         if trace() {
             println!("net: tick {tick} hash {h:016x}");
         }
-        match self.role {
-            Role::Host => self.stamp = Some((tick, h)),
-            Role::Client => {
-                self.ours.insert(tick, h);
-                self.compare();
-            }
-        }
+        self.ours.insert(tick, h);
+        self.compare();
     }
 
     fn compare(&mut self) {
@@ -1277,7 +1502,7 @@ impl Lockstep {
                 self.agreed += 1;
             } else if !self.desync_seen {
                 self.desync_seen = true;
-                let msg = format!("DESYNC at tick {t}: host {theirs:016x}, here {ours:016x}");
+                let msg = format!("DESYNC at tick {t}: server {theirs:016x}, here {ours:016x}");
                 eprintln!("net: {msg}");
                 self.desync = Some(msg);
             }
@@ -1293,68 +1518,41 @@ impl Lockstep {
     }
 
     fn summary(&self) {
-        let checks = match self.role {
-            Role::Host => String::new(),
-            Role::Client => format!(", {} hash checks agreed", self.agreed),
-        };
         let fate = match (&self.desync_seen, &self.closed) {
             (true, _) => " — DESYNCED".to_string(),
             (false, Some(why)) => format!(" — ended: {why}"),
             (false, None) => String::new(),
         };
-        println!("net: {} ticks stepped{checks}{fate}", self.next_tick);
+        println!(
+            "net: {} ticks stepped, {} hash checks agreed{fate}",
+            self.next_tick, self.agreed
+        );
     }
 
-    /// Client: leave the game but not the session — the host banishes
-    /// this seat, and the lobby comes back WAITING for the game to
-    /// finish. `None` when the session is already lost.
-    pub fn leave(mut self) -> Option<Session> {
-        if self.role == Role::Host {
-            return self.end();
-        }
+    /// Leave the game but not the session: the server banishes this
+    /// seat (after the verdict: only stops waiting for it), and the
+    /// lobby comes back WAITING for the game to finish — unless the
+    /// server already reopened it. `None` when the session is lost.
+    pub fn finish(mut self) -> Option<Guest> {
         self.summary();
         if self.closed.is_some() {
-            self.session = None;
+            self.guest = None;
             return None;
         }
-        self.send(&Msg::Leave);
-        let mut session = self.session.take()?;
-        if let Session::Guest(g) = &mut session
-            && !self.ended
-        {
-            g.view.playing = true;
+        if !self.ended {
+            self.send(&Msg::Leave);
         }
-        Some(session)
-    }
-
-    /// The game is over: hand the session back. The host reopens the
-    /// lobby — same players and settings, every client approves Play
-    /// again (ruling 10) — and tells the clients; a client waits for
-    /// that in its lobby. The host keeps his lobby when a client left
-    /// mid-game (without him); a client whose session closed gets
-    /// `None`.
-    pub fn end(mut self) -> Option<Session> {
-        self.summary();
-        let mut session = self.session.take()?;
-        match &mut session {
-            Session::Host(h) => {
-                for id in std::mem::take(&mut self.gone) {
-                    h.drop_client(id, "left");
-                }
-                h.core.reopen();
-                h.dirty = true;
-                h.flush();
-            }
-            Session::Guest(_) if self.closed.is_some() => return None,
-            Session::Guest(_) => {}
+        let mut guest = self.guest.take()?;
+        if !self.ended {
+            guest.view.playing = true;
         }
-        Some(session)
+        Some(guest)
     }
 }
 
 impl Drop for Lockstep {
     fn drop(&mut self) {
-        if self.session.is_some() {
+        if self.guest.is_some() {
             self.summary();
         }
     }
@@ -1364,37 +1562,118 @@ impl Drop for Lockstep {
 mod tests {
     use super::*;
 
-    fn pair() -> (Lockstep, Lockstep) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        drop(listener);
-        let build = "test".to_string();
-        let a = addr.clone();
-        let b = build.clone();
-        let host = std::thread::spawn(move || {
-            host(
-                &a,
-                0,
-                "lvl",
-                serde_json::json!({"k": 1}),
-                serde_json::json!({"t": 0}),
-                "pw",
-                &b,
-            )
-            .unwrap()
-        });
-        let client = join(&addr, Some(2), serde_json::json!({"t": 1}), "pw", &build).unwrap();
-        let host = host.join().unwrap();
-        assert_eq!(client.seats, vec![0, 2]);
-        assert_eq!(client.local, Hx(1));
-        assert_eq!(client.level, "lvl");
-        assert_eq!(client.config, serde_json::json!({"k": 1}));
-        assert_eq!(
-            client.models,
-            vec![serde_json::json!({"t": 0}), serde_json::json!({"t": 1})],
-            "each seat's models travel"
-        );
-        (Lockstep::start(host), Lockstep::start(client))
+    /// A referee whose world is the tick counter: hash `t * 7` — what
+    /// the tests' peers hash too — and a verdict once a seat has left
+    /// and `verdict_after` more ticks stepped (or never).
+    struct Counter {
+        tick: u64,
+        verdict_at: Option<u64>,
+        begun: Arc<Mutex<Vec<Game>>>,
+    }
+
+    impl Referee for Counter {
+        fn begin(&mut self, game: &Game) -> Result<(), String> {
+            if game.level.ends_with("broken.mgcl") {
+                return Err("no such level".into());
+            }
+            self.tick = 0;
+            self.begun.lock().unwrap().push(game.clone());
+            Ok(())
+        }
+        fn hash(&self) -> u64 {
+            self.tick * 7
+        }
+        fn step(&mut self, _: &[PortInput], _: &[u8]) {
+            self.tick += 1;
+        }
+        fn verdict(&self) -> Option<String> {
+            self.verdict_at
+                .filter(|&t| self.tick >= t)
+                .map(|_| "P0 is victorious!".into())
+        }
+        fn end(&mut self) {}
+    }
+
+    struct Rig {
+        server: ServerHandle,
+        begun: Arc<Mutex<Vec<Game>>>,
+    }
+
+    /// A hosted-style server on a free loopback port (no admin key: the
+    /// first member in is the admin, like a dedicated one).
+    fn server(pass: &str, verdict_at: Option<u64>) -> Rig {
+        let begun = Arc::new(Mutex::new(Vec::new()));
+        let b = begun.clone();
+        let server = ServerHandle::spawn(
+            "127.0.0.1:0",
+            ServerOpts {
+                game: NetGame::Mc2,
+                passphrase: pass.into(),
+                build: "test".into(),
+                level: "baked/mc2/level-050.mgcl".into(),
+                rules: serde_json::json!({"fog": 40}),
+                admin_key: Some(String::new()),
+            },
+            move || {
+                Box::new(Counter {
+                    tick: 0,
+                    verdict_at,
+                    begun: b,
+                })
+            },
+        )
+        .unwrap();
+        Rig { server, begun }
+    }
+
+    fn guest(r: &Rig, name: &str) -> Guest {
+        connect(r, name, "pw", "test").unwrap()
+    }
+
+    fn connect(r: &Rig, name: &str, pass: &str, build: &str) -> Result<Guest, String> {
+        Guest::connect(
+            &r.server.local_addr(),
+            pass,
+            name,
+            Some(NetGame::Mc2),
+            build,
+            "",
+            Duration::from_secs(5),
+        )
+    }
+
+    /// Poll `guests` until `done` holds.
+    fn settle(guests: &mut [&mut Guest], done: impl Fn(&[&mut Guest]) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done(guests) {
+            assert!(Instant::now() < deadline, "the lobby never settled");
+            guests.iter_mut().for_each(|g| g.poll());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The admin (`gs[0]`) starts a game everyone agrees to: the links,
+    /// in member order.
+    fn start(gs: Vec<Guest>) -> Vec<Link> {
+        let mut gs = gs;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !gs[0].view().all_agreed() {
+            assert!(Instant::now() < deadline, "never agreed");
+            for g in &mut gs[1..] {
+                g.poll();
+                if g.view().me().is_some_and(|m| !m.agreed) {
+                    g.agree();
+                }
+            }
+            gs[0].poll();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        gs[0].play();
+        let mut refs: Vec<&mut Guest> = gs.iter_mut().collect();
+        settle(&mut refs, |gs| gs.iter().all(|g| g.started()));
+        gs.into_iter()
+            .map(|g| g.into_link().ok().unwrap())
+            .collect()
     }
 
     fn input(stick_x: i16) -> PortInput {
@@ -1404,344 +1683,403 @@ mod tests {
         }
     }
 
-    /// Pump both peers until each has stepped `ticks` turns; seat k's
-    /// input at tick t is `stick_x = 100*k + t` (lead-in idle).
-    fn run(h: &mut Lockstep, c: &mut Lockstep, ticks: u64) -> Vec<Vec<Vec<i16>>> {
-        let mut got = vec![Vec::new(), Vec::new()];
+    /// Pump `peers` until each has stepped `ticks` more turns (seat k's
+    /// input `stick_x = k`); returns per peer the turns' stick_x rows
+    /// and the seats seen leaving. A `None` peer sits out.
+    fn pump(peers: &mut [Option<&mut Lockstep>], ticks: u64) -> Vec<(Vec<Vec<i16>>, Vec<u8>)> {
+        let mut out = vec![(Vec::new(), Vec::new()); peers.len()];
         let deadline = Instant::now() + Duration::from_secs(10);
-        while got[0].len() < ticks as usize || got[1].len() < ticks as usize {
+        while peers
+            .iter()
+            .zip(&out)
+            .any(|(p, o)| p.is_some() && (o.0.len() as u64) < ticks)
+        {
             assert!(Instant::now() < deadline, "lockstep stalled");
-            for (k, p) in [&mut *h, &mut *c].into_iter().enumerate() {
+            for (k, p) in peers.iter_mut().enumerate() {
+                let Some(p) = p else { continue };
                 p.poll();
                 assert!(p.closed().is_none(), "{:?}", p.closed());
                 while p.wants_input() {
-                    let t = p.next_send;
-                    let x = if p.in_lead_in() {
-                        0
-                    } else {
-                        (100 * k as u64 + t) as i16
-                    };
+                    let x = if p.in_lead_in() { 0 } else { k as i16 + 1 };
                     p.submit(input(x));
                 }
-                if got[k].len() < ticks as usize
+                if (out[k].0.len() as u64) < ticks
                     && let Some((t, inputs)) = p.take_turn()
                 {
-                    assert_eq!(t, got[k].len() as u64);
                     p.note_hash(t, || t * 7);
-                    got[k].push(inputs.iter().map(|i| i.stick_x).collect());
+                    out[k].1.extend(p.left_at(t));
+                    out[k].0.push(inputs.iter().map(|i| i.stick_x).collect());
                 }
             }
             std::thread::yield_now();
         }
-        got
+        out
     }
 
     #[test]
-    fn both_peers_step_the_same_bundles() {
-        let (mut h, mut c) = pair();
-        let got = run(&mut h, &mut c, 100);
-        assert_eq!(got[0], got[1]);
-        for (t, turn) in got[0].iter().enumerate() {
-            let t = t as i16;
+    fn every_player_steps_the_servers_bundles() {
+        let r = server("pw", None);
+        let links = start(vec![guest(&r, "A"), guest(&r, "B")]);
+        assert_eq!(links[1].local, Hx(1));
+        assert_eq!(links[1].game.level, "baked/mc2/level-050.mgcl");
+        assert_eq!(links[1].game.rules, serde_json::json!({"fog": 40}));
+        assert_eq!(
+            r.begun.lock().unwrap()[0].seats,
+            vec![0, 1],
+            "the server built it too"
+        );
+        let mut ls: Vec<Lockstep> = links.into_iter().map(Lockstep::start).collect();
+        let (a, b) = ls.split_at_mut(1);
+        let out = pump(&mut [Some(&mut a[0]), Some(&mut b[0])], 100);
+        assert_eq!(out[0].0, out[1].0);
+        for (t, turn) in out[0].0.iter().enumerate() {
             if (t as u64) < INPUT_DELAY {
                 assert_eq!(turn, &vec![0, 0]);
             } else {
-                assert_eq!(turn, &vec![t, 100 + t], "tick {t}");
+                assert_eq!(turn, &vec![1, 2], "tick {t}");
             }
         }
-        assert!(c.take_desync().is_none());
+        for l in &mut ls {
+            assert!(l.take_desync().is_none());
+            assert!(l.agreed >= 4, "checked against the server");
+        }
     }
 
+    /// A player whose world forks from the SERVER's is told — each
+    /// player is checked, the hosting one too.
     #[test]
-    fn a_hash_mismatch_is_reported_once() {
-        let (mut h, mut c) = pair();
-        run(&mut h, &mut c, 30);
-        assert!(c.take_desync().is_none());
-        c.ours.insert(48, 1);
-        c.theirs.insert(48, 2);
-        c.compare();
-        assert!(c.take_desync().unwrap().contains("tick 48"));
-        c.ours.insert(72, 1);
-        c.theirs.insert(72, 2);
-        c.compare();
-        assert!(c.take_desync().is_none());
-    }
-
-    /// A lobby host on a free loopback port.
-    fn open_lobby(pass: &str) -> Host {
-        Host::open(
-            "127.0.0.1:0",
-            0,
-            "HOST".into(),
-            "lvl".into(),
-            serde_json::json!({"fog": 40}),
-            pass.into(),
-            "test".into(),
-        )
-        .unwrap()
-    }
-
-    /// Connect a guest while pumping the host (the host is polled, so
-    /// the handshake needs both sides turning).
-    fn guest(h: &mut Host, pass: &str, build: &str) -> Result<Guest, String> {
-        let addr = h.addr();
-        let (pass, build) = (pass.to_string(), build.to_string());
-        let t = std::thread::spawn(move || {
-            Guest::connect(&addr, &pass, "GUEST", &build, Duration::from_secs(5))
-        });
-        while !t.is_finished() {
-            h.poll();
-            std::thread::sleep(Duration::from_millis(2));
+    fn a_fork_from_the_server_is_reported_once() {
+        let r = server("pw", None);
+        let links = start(vec![guest(&r, "A"), guest(&r, "B")]);
+        let mut ls: Vec<Lockstep> = links.into_iter().map(Lockstep::start).collect();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut stepped = [0u64; 2];
+        while stepped.iter().any(|&n| n < 60) {
+            assert!(Instant::now() < deadline, "stalled");
+            for (k, p) in ls.iter_mut().enumerate() {
+                p.poll();
+                while p.wants_input() {
+                    p.submit(input(0));
+                }
+                if let Some((t, _)) = p.take_turn() {
+                    // Player 0's world forks at tick 30.
+                    p.note_hash(t, || if k == 0 && t >= 30 { 1 } else { t * 7 });
+                    stepped[k] += 1;
+                }
+            }
         }
-        t.join().unwrap()
-    }
-
-    /// Pump both ends until `done` holds.
-    fn settle(h: &mut Host, g: &mut Guest, done: impl Fn(&Host, &Guest) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !done(h, g) {
-            assert!(Instant::now() < deadline, "lobby never settled");
-            h.poll();
-            g.poll();
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        let d = ls[0].take_desync().expect("the fork");
+        assert!(d.contains("tick 48"), "{d}");
+        assert!(ls[0].take_desync().is_none(), "once");
+        assert!(ls[1].take_desync().is_none());
     }
 
     #[test]
     fn the_handshake_checks_passphrase_and_build() {
-        let mut h = open_lobby("secret");
-        let e = guest(&mut h, "wrong", "test").err().unwrap();
+        let r = server("secret", None);
+        let e = connect(&r, "A", "wrong", "test").err().unwrap();
         assert!(e.contains("wrong passphrase"), "{e}");
-        let e = guest(&mut h, "secret", "other").err().unwrap();
+        let e = connect(&r, "A", "secret", "other").err().unwrap();
         assert!(e.contains("build other"), "{e}");
-        let g = guest(&mut h, "secret", "test").unwrap();
-        assert_eq!(g.view().members.len(), 2);
-        assert_eq!(g.view().me().unwrap().wizard, 1, "the first free wizard");
-        assert!(!g.view().is_host());
+        let a = connect(&r, "A", "secret", "test").unwrap();
+        assert!(a.view().is_admin(), "the first one in");
+        assert_eq!(
+            a.view().passphrase.as_deref(),
+            Some("secret"),
+            "the admin's view"
+        );
+        let b = connect(&r, "B", "secret", "test").unwrap();
+        assert_eq!(b.view().members.len(), 2);
+        assert_eq!(b.view().me().unwrap().wizard, 1, "the first free wizard");
+        assert!(!b.view().is_admin());
+        assert_eq!(b.view().passphrase, None, "the admin's only");
     }
 
-    /// Rulings 2, 3, 7: Play waits for the agreement; a host change
-    /// voids it.
+    /// A session plays ONE game, the server's: a player of another is
+    /// refused at the door, and the admin can't switch the level to
+    /// another game's (player 2026-10-17).
+    #[test]
+    fn the_session_plays_the_servers_game_only() {
+        let r = server("pw", None);
+        let addr = r.server.local_addr();
+        let wait = Duration::from_secs(5);
+        let e = Guest::connect(&addr, "pw", "M1", Some(NetGame::Mc1), "test", "", wait)
+            .err()
+            .unwrap();
+        assert!(e.contains("this server runs Magic Carpet 2"), "{e}");
+        let mut a = guest(&r, "A");
+        assert_eq!(a.view().game, NetGame::Mc2);
+        let mut cli = Guest::connect(&addr, "pw", "CLI", None, "test", "", wait).unwrap();
+        a.set_level("baked/mc1/level-051.mgcl".into());
+        a.set_level("baked/mc2/level-052.mgcl".into());
+        settle(&mut [&mut a, &mut cli], |g| {
+            g[1].view().level == "baked/mc2/level-052.mgcl"
+        });
+        assert_eq!(a.view().rev, 1, "the MC1 level never landed");
+    }
+
+    /// The hosted server's own player claims the admin role with its
+    /// key, whoever came first; a dedicated server's goes to the first.
+    #[test]
+    fn the_admin_key_claims_the_role() {
+        let begun = Arc::new(Mutex::new(Vec::new()));
+        let h = ServerHandle::spawn(
+            "127.0.0.1:0",
+            ServerOpts {
+                game: NetGame::Mc2,
+                passphrase: "pw".into(),
+                build: "test".into(),
+                level: "baked/mc2/level-050.mgcl".into(),
+                rules: serde_json::json!({}),
+                admin_key: None,
+            },
+            move || {
+                Box::new(Counter {
+                    tick: 0,
+                    verdict_at: None,
+                    begun,
+                })
+            },
+        )
+        .unwrap();
+        let addr = h.local_addr();
+        let mut early = Guest::connect(
+            &addr,
+            "pw",
+            "EARLY",
+            None,
+            "test",
+            "",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let fake = Guest::connect(
+            &addr,
+            "pw",
+            "FAKE",
+            None,
+            "test",
+            "nope",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let host = Guest::connect(
+            &addr,
+            "pw",
+            "HOST",
+            None,
+            "test",
+            h.admin_key(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(host.view().is_admin());
+        assert!(!fake.view().is_admin());
+        settle(&mut [&mut early], |g| !g[0].view().is_admin());
+    }
+
+    /// Rulings 2, 3, 7: Play waits for the agreement; an admin change
+    /// voids it; a non-admin's settings are ignored.
     #[test]
     fn play_waits_for_agreement_and_a_change_voids_it() {
-        let mut h = open_lobby("pw");
-        let mut g = guest(&mut h, "pw", "test").unwrap();
-        assert!(!h.can_play());
-        g.agree();
-        settle(&mut h, &mut g, |h, _| h.can_play());
-        h.set_rules(serde_json::json!({"fog": 90}));
-        settle(&mut h, &mut g, |_, g| g.view().rev == 1);
-        assert!(!h.can_play() && !g.view().all_agreed());
-        assert_eq!(g.view().rules, serde_json::json!({"fog": 90}));
-        g.agree();
-        settle(&mut h, &mut g, |h, _| h.can_play());
+        let r = server("pw", None);
+        let (mut a, mut b) = (guest(&r, "A"), guest(&r, "B"));
+        b.set_rules(serde_json::json!({"fog": 10}));
+        b.play();
+        b.agree();
+        settle(&mut [&mut a, &mut b], |g| g[0].view().all_agreed());
+        assert_eq!(
+            a.view().rules,
+            serde_json::json!({"fog": 40}),
+            "not B's to set"
+        );
+        a.set_rules(serde_json::json!({"fog": 90}));
+        settle(&mut [&mut a, &mut b], |g| g[1].view().rev == 1);
+        assert!(!a.view().all_agreed() && !b.view().all_agreed());
+        assert_eq!(b.view().rules, serde_json::json!({"fog": 90}));
+        a.play();
+        b.agree();
+        settle(&mut [&mut a, &mut b], |g| g[0].view().all_agreed());
+        assert!(!b.started(), "the refused Play never started");
+        assert!(r.begun.lock().unwrap().is_empty());
+    }
+
+    /// A level the server cannot build: no game, the lobby is told.
+    #[test]
+    fn a_game_the_server_cannot_build_never_starts() {
+        let r = server("pw", None);
+        let (mut a, mut b) = (guest(&r, "A"), guest(&r, "B"));
+        a.set_level("baked/mc2/broken.mgcl".into());
+        settle(&mut [&mut a, &mut b], |g| {
+            g[1].view().level == "baked/mc2/broken.mgcl"
+        });
+        b.agree();
+        settle(&mut [&mut a, &mut b], |g| g[0].view().all_agreed());
+        a.play();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut told = Vec::new();
+        while told.is_empty() {
+            assert!(Instant::now() < deadline);
+            b.poll();
+            told = b.take_notices();
+        }
+        assert!(told[0].contains("no such level"), "{told:?}");
+        assert!(!a.started() && !b.started());
     }
 
     /// Rulings 4 and 6: a kicked member is out, and a new passphrase
     /// keeps him out.
     #[test]
     fn a_kicked_member_cannot_return_after_a_passphrase_change() {
-        let mut h = open_lobby("pw");
-        let mut g = guest(&mut h, "pw", "test").unwrap();
-        let id = g.view().you;
-        h.kick(id);
-        settle(&mut h, &mut g, |_, g| g.closed().is_some());
-        assert!(g.closed().unwrap().contains("kicked"));
-        assert_eq!(h.view().members.len(), 1);
-        h.set_passphrase("new".into());
-        assert!(guest(&mut h, "pw", "test").is_err());
-        assert!(guest(&mut h, "new", "test").is_ok());
+        let r = server("pw", None);
+        let (mut a, mut b) = (guest(&r, "A"), guest(&r, "B"));
+        let id = b.view().you;
+        a.kick(id);
+        settle(&mut [&mut a, &mut b], |g| g[1].closed().is_some());
+        assert!(b.closed().unwrap().contains("kicked"));
+        settle(&mut [&mut a], |g| g[0].view().members.len() == 1);
+        a.set_passphrase("new".into());
+        settle(&mut [&mut a], |g| {
+            g[0].view().passphrase.as_deref() == Some("new")
+        });
+        assert!(connect(&r, "B", "pw", "test").is_err());
+        assert!(connect(&r, "B", "new", "test").is_ok());
     }
 
     #[test]
     fn a_wizard_request_is_first_come_first_served() {
-        let mut h = open_lobby("pw");
-        let mut g = guest(&mut h, "pw", "test").unwrap();
-        g.pick_wizard(0);
-        g.pick_wizard(5);
-        settle(&mut h, &mut g, |_, g| g.view().me().unwrap().wizard == 5);
-        assert_eq!(h.view().seats(), vec![0, 5], "the host's 0 was refused");
-        assert!(!h.pick_wizard(5));
-    }
-
-    /// Ruling 10: a game ends back in the lobby with the same players;
-    /// Play needs a fresh agreement, and the second game runs; nobody
-    /// joins while one is on.
-    #[test]
-    fn after_a_game_the_lobby_reopens_for_the_next() {
-        let mut h = open_lobby("pw");
-        let mut g = guest(&mut h, "pw", "test").unwrap();
-        for round in 0..2 {
-            g.agree();
-            settle(&mut h, &mut g, |h, _| h.can_play());
-            let hl = h.play().ok().unwrap();
-            settle_start(&mut g);
-            let gl = g.into_link().ok().unwrap();
-            assert_eq!((hl.seats.clone(), gl.local), (vec![0, 1], Hx(1)));
-            assert_eq!(gl.names, vec!["HOST", "GUEST"], "names travel");
-            let (mut hs, mut cs) = (Lockstep::start(hl), Lockstep::start(gl));
-            let got = run(&mut hs, &mut cs, 30);
-            assert_eq!(got[0], got[1], "round {round}");
-            if round == 0 {
-                let addr = match &hs.session {
-                    Some(Session::Host(h)) => h.addr(),
-                    _ => unreachable!(),
-                };
-                let late = std::thread::spawn(move || {
-                    Guest::connect(&addr, "pw", "LATE", "test", Duration::from_secs(5))
-                });
-                while !late.is_finished() {
-                    hs.poll();
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-                // A newcomer waits in the lobby for the game to finish;
-                // this one gives up and hangs up before it does.
-                let late = late.join().unwrap().unwrap();
-                assert!(late.view().playing, "the newcomer waits");
-                drop(late);
-                let left = pump(&mut [&mut hs, &mut cs], 60);
-                assert!(left.iter().all(Vec::is_empty), "he was in no seat");
-            }
-            let Some(Session::Host(back)) = hs.end() else {
-                panic!("the host's lobby")
-            };
-            h = back;
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !cs.ended() {
-                assert!(Instant::now() < deadline);
-                cs.poll();
-            }
-            let Some(Session::Guest(back)) = cs.end() else {
-                panic!("the guest's lobby")
-            };
-            g = back;
-            assert_eq!(h.view().members.len(), 2, "same players");
-            assert!(!h.can_play(), "everyone approves again");
-        }
-    }
-
-    fn named(h: &mut Host, name: &str) -> Guest {
-        let (addr, name) = (h.addr(), name.to_string());
-        let t = std::thread::spawn(move || {
-            Guest::connect(&addr, "pw", &name, "test", Duration::from_secs(5))
+        let r = server("pw", None);
+        let (mut a, mut b) = (guest(&r, "A"), guest(&r, "B"));
+        b.pick_wizard(0);
+        b.pick_wizard(5);
+        settle(&mut [&mut a, &mut b], |g| {
+            g[1].view().me().unwrap().wizard == 5 && g[0].view().seats() == vec![0, 5]
         });
-        while !t.is_finished() {
-            h.poll();
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        t.join().unwrap().unwrap()
+        a.pick_wizard(5);
+        std::thread::sleep(Duration::from_millis(50));
+        a.poll();
+        assert_eq!(a.view().seats(), vec![0, 5], "A can't take B's 5");
     }
 
-    /// Pump `peers` until each has stepped `ticks` more turns; returns
-    /// the seats each saw leave.
-    fn pump(peers: &mut [&mut Lockstep], ticks: u64) -> Vec<Vec<u8>> {
-        let mut left = vec![Vec::new(); peers.len()];
-        let mut n = vec![0; peers.len()];
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while n.iter().any(|&k| k < ticks) {
-            assert!(Instant::now() < deadline, "lockstep stalled");
-            for (k, p) in peers.iter_mut().enumerate() {
-                p.poll();
-                assert!(p.closed().is_none(), "{:?}", p.closed());
-                while p.wants_input() {
-                    p.submit(input(k as i16));
-                }
-                if n[k] < ticks
-                    && let Some((t, _)) = p.take_turn()
-                {
-                    left[k].extend(p.left_at(t));
-                    n[k] += 1;
-                }
+    /// The admin's leaving the session hands the role on.
+    #[test]
+    fn the_admin_role_passes_on() {
+        let r = server("pw", None);
+        let (a, mut b) = (guest(&r, "A"), guest(&r, "B"));
+        drop(a);
+        settle(&mut [&mut b], |g| g[0].view().is_admin());
+    }
+
+    /// Ruling 10: a won game ends back in the lobby with the same
+    /// players; Play needs a fresh agreement; a newcomer during the
+    /// game waits for its end.
+    #[test]
+    fn after_the_verdict_the_lobby_reopens_for_the_next_game() {
+        let r = server("pw", Some(40));
+        let (mut a, mut b) = (guest(&r, "A"), guest(&r, "B"));
+        for round in 0..2 {
+            let links = start(vec![a, b]);
+            assert_eq!(links[0].game.names, vec!["A", "B"], "names travel");
+            let mut ls: Vec<Lockstep> = links.into_iter().map(Lockstep::start).collect();
+            let late = (round == 0).then(|| guest(&r, "LATE"));
+            assert!(late.as_ref().is_none_or(|l| l.view().playing), "he waits");
+            {
+                let (x, y) = ls.split_at_mut(1);
+                pump(&mut [Some(&mut x[0]), Some(&mut y[0])], 45);
             }
-            std::thread::yield_now();
+            for l in &mut ls {
+                assert_eq!(l.take_verdict().as_deref(), Some("P0 is victorious!"));
+            }
+            // Each fades out and leaves; the lobby reopens once both
+            // have.
+            let mut back: Vec<Guest> = ls.into_iter().filter_map(Lockstep::finish).collect();
+            assert!(back.iter().all(|g| g.view().playing));
+            {
+                let mut refs: Vec<&mut Guest> = back.iter_mut().collect();
+                settle(&mut refs, |gs| gs.iter().all(|g| !g.view().playing));
+            }
+            let members = if round == 0 { 3 } else { 2 };
+            assert_eq!(back[0].view().members.len(), members, "same players");
+            assert!(!back[0].view().all_agreed(), "everyone approves again");
+            drop(late);
+            b = back.pop().unwrap();
+            a = back.pop().unwrap();
+            settle(&mut [&mut a], |g| g[0].view().members.len() == 2);
         }
-        left
+        assert_eq!(r.begun.lock().unwrap().len(), 2);
     }
 
-    /// A client LEAVING the game (player 2026-10-17) stays a member: the
+    /// A player LEAVING the game (player 2026-10-17) stays a member: the
     /// game goes on for the rest (his seat banished on one tick for
     /// all), his lobby waits for it to finish, and it reopens with him
-    /// in it.
+    /// in it — the admin (the UI's host) alike.
     #[test]
     fn a_leaver_waits_in_the_lobby_for_the_game_to_finish() {
-        let mut h = open_lobby("pw");
-        let mut g1 = named(&mut h, "ONE");
-        let mut g2 = named(&mut h, "TWO");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !h.can_play() {
-            assert!(Instant::now() < deadline, "never agreed");
-            g1.poll();
-            g2.poll();
-            g1.agree();
-            g2.agree();
-            h.poll();
-            std::thread::sleep(Duration::from_millis(2));
+        let r = server("pw", None);
+        let links = start(vec![guest(&r, "ONE"), guest(&r, "TWO"), guest(&r, "THREE")]);
+        let mut ls: Vec<Option<Lockstep>> = links
+            .into_iter()
+            .map(|l| Some(Lockstep::start(l)))
+            .collect();
+        {
+            let mut refs: Vec<Option<&mut Lockstep>> = ls.iter_mut().map(Option::as_mut).collect();
+            pump(&mut refs, 20);
         }
-        let hl = h.play().ok().unwrap();
-        settle_start(&mut g1);
-        settle_start(&mut g2);
-        let mut hs = Lockstep::start(hl);
-        let mut c1 = Lockstep::start(g1.into_link().ok().unwrap());
-        let mut c2 = Lockstep::start(g2.into_link().ok().unwrap());
-        pump(&mut [&mut hs, &mut c1, &mut c2], 20);
-        let Some(Session::Guest(mut waiting)) = c1.leave() else {
-            panic!("the leaver keeps his session")
-        };
+        // The admin leaves.
+        let mut waiting = ls[0].take().unwrap().finish().expect("his session");
         assert!(waiting.view().playing, "his lobby waits");
-        let left = pump(&mut [&mut hs, &mut c2], 40);
-        assert_eq!(left, vec![vec![1], vec![1]], "seat 1 banished for both");
+        let out = {
+            let mut refs: Vec<Option<&mut Lockstep>> = ls.iter_mut().map(Option::as_mut).collect();
+            pump(&mut refs, 40)
+        };
+        assert_eq!(
+            (&out[1].1, &out[2].1),
+            (&vec![0], &vec![0]),
+            "seat 0 banished for both"
+        );
         waiting.poll();
         assert!(waiting.closed().is_none() && waiting.view().playing);
-        let Some(Session::Host(h)) = hs.end() else {
-            panic!("the host's lobby")
-        };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while waiting.view().playing {
-            assert!(
-                Instant::now() < deadline,
-                "the lobby never reopened for him"
-            );
-            waiting.poll();
-        }
-        assert_eq!(h.view().members.len(), 3, "he is still a member");
-        assert!(waiting.closed().is_none());
+        assert!(waiting.view().is_admin(), "still the admin");
+        assert_eq!(r.server.status().playing, 2);
+        // The other two leave too: nobody plays, the lobby reopens.
+        let mut back: Vec<Guest> = ls
+            .into_iter()
+            .flatten()
+            .filter_map(Lockstep::finish)
+            .collect();
+        back.push(waiting);
+        let mut refs: Vec<&mut Guest> = back.iter_mut().collect();
+        settle(&mut refs, |gs| gs.iter().all(|g| !g.view().playing));
+        assert_eq!(back[0].view().members.len(), 3, "everyone still a member");
     }
 
-    /// A client lost while the game starts (its Start could not be
-    /// sent) leaves at the first tick like any departure — the game
-    /// goes on for the rest (it used to close the host's lockstep).
+    /// A player hanging up mid-game is banished; the rest play on.
     #[test]
-    fn a_client_lost_at_the_start_is_banished_not_fatal() {
-        let mut h = open_lobby("pw");
-        let mut g = named(&mut h, "ONE");
-        g.agree();
-        settle(&mut h, &mut g, |h, _| h.can_play());
-        let mut hl = h.play().ok().unwrap();
-        hl.lost.push((1, "a broken pipe".into()));
-        let mut hs = Lockstep::start(hl);
-        let left = pump(&mut [&mut hs], 30);
-        assert_eq!(left, vec![vec![1]], "seat 1 leaves at once");
-        assert!(hs.closed().is_none());
+    fn a_lost_player_is_banished_not_fatal() {
+        let r = server("pw", None);
+        let links = start(vec![guest(&r, "ONE"), guest(&r, "TWO")]);
+        let mut ls: Vec<Lockstep> = links.into_iter().map(Lockstep::start).collect();
+        let two = ls.pop().unwrap();
+        drop(two);
+        let out = pump(&mut [Some(&mut ls[0])], 40);
+        assert_eq!(out[0].1, vec![1], "seat 1 leaves");
+        assert!(ls[0].closed().is_none());
     }
 
-    fn settle_start(g: &mut Guest) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !g.started() {
-            assert!(Instant::now() < deadline);
-            g.poll();
-        }
-    }
-
+    /// The server stopping (the hosting app closed) ends the session for
+    /// every player.
     #[test]
-    fn a_departing_peer_closes_the_session() {
-        let (h, mut c) = pair();
-        drop(h);
+    fn a_stopped_server_closes_the_session() {
+        let r = server("pw", None);
+        let links = start(vec![guest(&r, "A"), guest(&r, "B")]);
+        let mut ls: Vec<Lockstep> = links.into_iter().map(Lockstep::start).collect();
+        drop(r);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while c.closed().is_none() {
+        while ls.iter().any(|l| l.closed().is_none()) {
             assert!(Instant::now() < deadline);
-            c.poll();
+            ls.iter_mut().for_each(Lockstep::poll);
             std::thread::yield_now();
         }
-        assert!(c.closed().unwrap().contains("peer left"));
+        assert!(ls[0].closed().unwrap().contains("server stopped"));
     }
 }
