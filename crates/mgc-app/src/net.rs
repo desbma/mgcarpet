@@ -24,6 +24,13 @@
 //! wizard), so the game goes on for the rest and ends as usual when one
 //! contender stands.
 //!
+//! A client that LEAVES the game on purpose ([`Msg::Leave`]) is banished
+//! the same way but stays a member: his lobby WAITS for the game to
+//! finish ([`LobbyView::playing`]), and so does a newcomer admitted
+//! during it; the host reopens the lobby for all of them at the end
+//! (player 2026-10-17 — a leaver used to land in the temple, the host
+//! alone in the lobby).
+//!
 //! Wire: a little-endian `u32` length, then one JSON [`Msg`]. The input
 //! payload is the recorder's [`PortInput`] (idle ticks encode as `{}`).
 
@@ -94,6 +101,9 @@ enum Msg {
         level: String,
         rules: serde_json::Value,
     },
+    /// Client → host: I leave this game, but stay in the lobby (and
+    /// wait for the game to finish).
+    Leave,
     /// Client → host: the client seat's input for `tick`.
     Input {
         tick: u64,
@@ -376,8 +386,9 @@ impl Host {
                     Recv::Msg(Msg::Models { models }) => {
                         self.dirty |= self.core.set_models(*id, models);
                     }
-                    // A game's tail (inputs sent before its end landed).
-                    Recv::Msg(Msg::Input { .. }) => {}
+                    // A game's tail (inputs sent before its end landed,
+                    // a leave that crossed it).
+                    Recv::Msg(Msg::Input { .. } | Msg::Leave) => {}
                     Recv::Msg(Msg::Bye { why }) => {
                         gone.push((*id, why));
                         break;
@@ -517,6 +528,7 @@ impl Host {
                 lost.get_or_insert(format!("{}: {e}", conn.peer));
             }
         }
+        self.core.begin();
         Ok(Link {
             session: Session::Host(self),
             role: Role::Host,
@@ -1006,7 +1018,9 @@ impl Lockstep {
             // the game goes on for the rest.
             Some(Session::Host(h)) => {
                 for (k, (_, c)) in h.clients.iter_mut().enumerate() {
-                    if self.departed.get(k + 1).is_some_and(Option::is_some) {
+                    // In the game only: not departed, not a newcomer
+                    // waiting in the lobby.
+                    if self.departed.get(k + 1).is_none_or(Option::is_some) {
                         continue;
                     }
                     if let Err(e) = c.send(m) {
@@ -1026,7 +1040,9 @@ impl Lockstep {
     /// Host: seat `ix` (a client) left the game: it is banished at the
     /// first turn not yet sent — whatever it had scheduled from there
     /// on is dropped, and its input becomes the host's (`complete`).
-    fn depart(&mut self, ix: usize, why: &str) {
+    /// `waits`: he left on purpose and stays a member, waiting in the
+    /// lobby for the game to finish (the connection stays open).
+    fn depart(&mut self, ix: usize, why: &str, waits: bool) {
         if ix == 0 || self.departed.get(ix).is_none_or(Option::is_some) {
             return;
         }
@@ -1036,14 +1052,29 @@ impl Lockstep {
         for turn in self.pending.range_mut(tick..).map(|(_, t)| t) {
             turn[ix] = None;
         }
+        if !waits {
+            self.hang_up(ix, why);
+        }
+        println!("net: seat {ix} left ({why}) — banished at tick {tick}");
+        self.complete();
+    }
+
+    /// Host: close client `ix`'s connection; he leaves the lobby when
+    /// the game ends (the client list keeps its seat order until then).
+    fn hang_up(&mut self, ix: usize, why: &str) {
         if let Some(Session::Host(h)) = &mut self.session
             && let Some((id, conn)) = h.clients.get_mut(ix - 1)
+            && conn.open
         {
             conn.close(why);
             self.gone.push(*id);
         }
-        println!("net: seat {ix} left ({why}) — banished at tick {tick}");
-        self.complete();
+    }
+
+    /// Host: is client `ix` out of the game but in the lobby — he left
+    /// it on purpose, or joined during it?
+    fn waiting(&self, ix: usize) -> bool {
+        self.departed.get(ix).is_none_or(Option::is_some)
     }
 
     /// The human seats that leave the game at `tick` — banish them
@@ -1058,23 +1089,34 @@ impl Lockstep {
             return;
         }
         for (ix, why) in std::mem::take(&mut self.failed) {
-            self.depart(ix, &why);
+            self.depart(ix, &why, false);
         }
         let mut got: Vec<(usize, Recv)> = Vec::new();
         let mut ids: Vec<u32> = Vec::new();
         match &mut self.session {
             Some(Session::Host(h)) => {
-                // Nobody joins a game in progress.
+                // A newcomer joins the LOBBY and waits for the game to
+                // finish; he (and every waiting member) hears of the
+                // lobby's changes — the players in the game do not (a
+                // lobby view ends a client's game).
                 h.accept();
-                for mut conn in std::mem::take(&mut h.pending) {
-                    let why = "a game is in progress";
-                    let _ = conn.send(&Msg::Refuse { why: why.into() });
-                    conn.close(why);
+                h.handshake();
+                for n in h.take_notes() {
+                    println!("net: {n}");
+                }
+                if std::mem::take(&mut h.dirty) {
+                    for (k, (id, conn)) in h.clients.iter_mut().enumerate() {
+                        if self.departed.get(k + 1).is_none_or(Option::is_some) && conn.open {
+                            let _ = conn.send(&Msg::Lobby {
+                                view: h.core.view_for(*id),
+                            });
+                        }
+                    }
                 }
                 // Client k is human seat Hx(k + 1) (member order).
                 ids = h.clients.iter().map(|(id, _)| *id).collect();
                 for (k, (_, conn)) in h.clients.iter().enumerate() {
-                    if self.departed.get(k + 1).is_some_and(Option::is_some) {
+                    if !conn.open {
                         continue;
                     }
                     loop {
@@ -1098,14 +1140,31 @@ impl Lockstep {
             None => return,
         }
         for (ix, r) in got {
-            if self.departed.get(ix).is_some_and(Option::is_some) {
+            // A waiting member: only his hanging up matters now.
+            if self.role == Role::Host && self.waiting(ix) {
+                match r {
+                    Recv::Lost(e) => self.hang_up(ix, &e),
+                    Recv::Msg(Msg::Bye { why }) => self.hang_up(ix, &why),
+                    // His models count for the next game.
+                    Recv::Msg(Msg::Models { models }) => {
+                        if let (Some(Session::Host(h)), Some(&id)) =
+                            (&mut self.session, ids.get(ix - 1))
+                        {
+                            h.core.set_models(id, models);
+                        }
+                    }
+                    _ => {}
+                }
                 continue;
             }
             match (self.role, r) {
                 (_, Recv::Empty) => {}
                 // A client leaving: the game goes on without it.
-                (Role::Host, Recv::Lost(e)) => self.depart(ix, &format!("connection lost: {e}")),
-                (Role::Host, Recv::Msg(Msg::Bye { why })) => self.depart(ix, &why),
+                (Role::Host, Recv::Lost(e)) => {
+                    self.depart(ix, &format!("connection lost: {e}"), false);
+                }
+                (Role::Host, Recv::Msg(Msg::Bye { why })) => self.depart(ix, &why, false),
+                (Role::Host, Recv::Msg(Msg::Leave)) => self.depart(ix, "left the game", true),
                 (_, Recv::Lost(e)) => {
                     self.gone.extend(ix.checked_sub(1).and_then(|k| ids.get(k)));
                     self.closed
@@ -1241,6 +1300,28 @@ impl Lockstep {
             (false, None) => String::new(),
         };
         println!("net: {} ticks stepped{checks}{fate}", self.next_tick);
+    }
+
+    /// Client: leave the game but not the session — the host banishes
+    /// this seat, and the lobby comes back WAITING for the game to
+    /// finish. `None` when the session is already lost.
+    pub fn leave(mut self) -> Option<Session> {
+        if self.role == Role::Host {
+            return self.end();
+        }
+        self.summary();
+        if self.closed.is_some() {
+            self.session = None;
+            return None;
+        }
+        self.send(&Msg::Leave);
+        let mut session = self.session.take()?;
+        if let Session::Guest(g) = &mut session
+            && !self.ended
+        {
+            g.view.playing = true;
+        }
+        Some(session)
     }
 
     /// The game is over: hand the session back. The host reopens the
@@ -1504,14 +1585,19 @@ mod tests {
                     _ => unreachable!(),
                 };
                 let late = std::thread::spawn(move || {
-                    Guest::connect(&addr, "pw", "", "test", Duration::from_secs(5))
+                    Guest::connect(&addr, "pw", "LATE", "test", Duration::from_secs(5))
                 });
                 while !late.is_finished() {
                     hs.poll();
                     std::thread::sleep(Duration::from_millis(2));
                 }
-                let e = late.join().unwrap().err().unwrap();
-                assert!(e.contains("in progress"), "{e}");
+                // A newcomer waits in the lobby for the game to finish;
+                // this one gives up and hangs up before it does.
+                let late = late.join().unwrap().unwrap();
+                assert!(late.view().playing, "the newcomer waits");
+                drop(late);
+                let left = pump(&mut [&mut hs, &mut cs], 60);
+                assert!(left.iter().all(Vec::is_empty), "he was in no seat");
             }
             let Some(Session::Host(back)) = hs.end() else {
                 panic!("the host's lobby")
@@ -1529,6 +1615,90 @@ mod tests {
             assert_eq!(h.view().members.len(), 2, "same players");
             assert!(!h.can_play(), "everyone approves again");
         }
+    }
+
+    fn named(h: &mut Host, name: &str) -> Guest {
+        let (addr, name) = (h.addr(), name.to_string());
+        let t = std::thread::spawn(move || {
+            Guest::connect(&addr, "pw", &name, "test", Duration::from_secs(5))
+        });
+        while !t.is_finished() {
+            h.poll();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        t.join().unwrap().unwrap()
+    }
+
+    /// Pump `peers` until each has stepped `ticks` more turns; returns
+    /// the seats each saw leave.
+    fn pump(peers: &mut [&mut Lockstep], ticks: u64) -> Vec<Vec<u8>> {
+        let mut left = vec![Vec::new(); peers.len()];
+        let mut n = vec![0; peers.len()];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while n.iter().any(|&k| k < ticks) {
+            assert!(Instant::now() < deadline, "lockstep stalled");
+            for (k, p) in peers.iter_mut().enumerate() {
+                p.poll();
+                assert!(p.closed().is_none(), "{:?}", p.closed());
+                while p.wants_input() {
+                    p.submit(input(k as i16));
+                }
+                if n[k] < ticks
+                    && let Some((t, _)) = p.take_turn()
+                {
+                    left[k].extend(p.left_at(t));
+                    n[k] += 1;
+                }
+            }
+            std::thread::yield_now();
+        }
+        left
+    }
+
+    /// A client LEAVING the game (player 2026-10-17) stays a member: the
+    /// game goes on for the rest (his seat banished on one tick for
+    /// all), his lobby waits for it to finish, and it reopens with him
+    /// in it.
+    #[test]
+    fn a_leaver_waits_in_the_lobby_for_the_game_to_finish() {
+        let mut h = open_lobby("pw");
+        let mut g1 = named(&mut h, "ONE");
+        let mut g2 = named(&mut h, "TWO");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !h.can_play() {
+            assert!(Instant::now() < deadline, "never agreed");
+            g1.poll();
+            g2.poll();
+            g1.agree();
+            g2.agree();
+            h.poll();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let hl = h.play().ok().unwrap();
+        settle_start(&mut g1);
+        settle_start(&mut g2);
+        let mut hs = Lockstep::start(hl);
+        let mut c1 = Lockstep::start(g1.into_link().ok().unwrap());
+        let mut c2 = Lockstep::start(g2.into_link().ok().unwrap());
+        pump(&mut [&mut hs, &mut c1, &mut c2], 20);
+        let Some(Session::Guest(mut waiting)) = c1.leave() else {
+            panic!("the leaver keeps his session")
+        };
+        assert!(waiting.view().playing, "his lobby waits");
+        let left = pump(&mut [&mut hs, &mut c2], 40);
+        assert_eq!(left, vec![vec![1], vec![1]], "seat 1 banished for both");
+        waiting.poll();
+        assert!(waiting.closed().is_none() && waiting.view().playing);
+        let Some(Session::Host(h)) = hs.end() else {
+            panic!("the host's lobby")
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while waiting.view().playing {
+            assert!(Instant::now() < deadline, "the lobby never reopened for him");
+            waiting.poll();
+        }
+        assert_eq!(h.view().members.len(), 3, "he is still a member");
+        assert!(waiting.closed().is_none());
     }
 
     fn settle_start(g: &mut Guest) {

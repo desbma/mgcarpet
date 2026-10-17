@@ -572,6 +572,10 @@ impl LobbyScreen {
             return;
         }
         if let Some(b) = self.button_at(mx, my) {
+            // Waiting for a game to finish: only Exit is live.
+            if self.waiting() && b != Btn::Exit {
+                return;
+            }
             self.sounds.push(SND_CLICK);
             self.actions.push(match b {
                 Btn::PrevLevel => LobbyAction::PrevLevel,
@@ -637,11 +641,20 @@ impl LobbyScreen {
         self.sounds.push(SND_CLICK);
     }
 
+    /// A game is in progress without us: we left it, or joined during
+    /// it — the lobby waits for it to finish (only Exit is live).
+    fn waiting(&self) -> bool {
+        self.view.as_ref().is_some_and(|v| v.playing)
+    }
+
     /// The status line under the doorway.
     fn status(&self) -> String {
         let Some(v) = &self.view else {
             return String::new();
         };
+        if v.playing {
+            return "Waiting for the current game to finish".into();
+        }
         let clients = v.members.len().saturating_sub(1);
         let agreed = v.members.iter().skip(1).filter(|m| m.agreed).count();
         if v.is_host() {
@@ -1008,6 +1021,7 @@ mod tests {
             ],
             capacity: 2,
             ai: 0,
+            playing: false,
         }
     }
 

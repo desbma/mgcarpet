@@ -65,6 +65,11 @@ pub struct LobbyView {
     /// when the game starts.
     #[serde(default)]
     pub ai: u8,
+    /// A game is in progress: a member who sees this WAITS for it to
+    /// finish (he left it, or joined during it); the lobby reopens
+    /// when it ends.
+    #[serde(default)]
+    pub playing: bool,
 }
 
 impl LobbyView {
@@ -122,6 +127,8 @@ pub struct LobbyCore {
     /// The most the host may set ([`Self::set_capacity`]).
     max: usize,
     ai: u8,
+    /// A game is in progress ([`LobbyView::playing`]).
+    playing: bool,
 }
 
 impl LobbyCore {
@@ -150,6 +157,7 @@ impl LobbyCore {
             capacity: max,
             max,
             ai: 0,
+            playing: false,
         }
     }
 
@@ -162,7 +170,13 @@ impl LobbyCore {
             members: self.members.clone(),
             capacity: self.capacity as u8,
             ai: self.ai,
+            playing: self.playing,
         }
+    }
+
+    /// The game begins: members from now on wait for it.
+    pub fn begin(&mut self) {
+        self.playing = true;
     }
 
     #[cfg(test)]
@@ -296,6 +310,7 @@ impl LobbyCore {
     /// After a game: same players and settings, every client approves
     /// Play again.
     pub fn reopen(&mut self) {
+        self.playing = false;
         self.clear_agreements();
     }
 

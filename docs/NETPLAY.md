@@ -375,3 +375,20 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
   (`temporary_sphere_mana`) had the same any-human read and is scoped too.
   Test `each_seat_sees_only_its_own_balloons` (kill-switch proved); 1,625
   tests, 633/633 fixtures, clippy clean.
+- 2026-10-17 #17: **THE WAITING LOBBY** (player: a client leaving landed in
+  the temple and had to rejoin; the host sat alone in the lobby). A
+  client's in-game Leave now sends `Msg::Leave` (protocol 4) instead of
+  hanging up: the host banishes the seat as before (#15) but keeps the
+  member and his connection; `Lockstep::leave` hands the client his
+  lobby with `LobbyView::playing` set — status "Waiting for the current
+  game to finish", only Exit live (Exit = hang up, back to the temple).
+  A NEWCOMER connecting during a game is admitted into the same waiting
+  lobby (it used to be refused "a game is in progress"). `LobbyCore::
+  begin`/`reopen` set/clear `playing`; the in-game host lockstep runs the
+  handshake, sends lobby views ONLY to waiting members (a view ends an
+  in-game client's game), drops a waiting member who hangs up at the end,
+  and keeps his flight-model changes. At the game's end the reopened lobby
+  holds everyone. Tests `a_leaver_waits_in_the_lobby_for_the_game_to_finish`
+  (3 peers; kill-switch proved: a hang-up instead of Leave fails it) and
+  the reworked newcomer half of `after_a_game_the_lobby_reopens_for_the_next`.
+  Xvfb: B leaves → B's waiting lobby → A wins → both in the reopened lobby.

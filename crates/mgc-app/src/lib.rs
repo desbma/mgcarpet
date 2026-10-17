@@ -6960,14 +6960,16 @@ impl App {
         self.exit_confirm = false;
         if self.lobby_game {
             // The host ends the game for everyone (the lobby reopens);
-            // a client leaves the session (the host plays on).
+            // a client leaves the GAME, not the session: the host plays
+            // on, and his lobby waits for the game to finish
+            // (`Lockstep::leave`; its Exit goes elsewhere).
             if self.net.as_ref().is_some_and(|n| n.is_host()) {
                 println!("net: ending the game — back to the lobby");
                 self.net_game_over();
             } else {
                 println!("net: left the game");
-                self.net = None;
-                self.end_lobby_game(None);
+                let session = self.net.take().and_then(net::Lockstep::leave);
+                self.end_lobby_game(session);
             }
             return;
         }
