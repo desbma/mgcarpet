@@ -119,8 +119,16 @@ peer plays by them.
   the worlds).
 - A castle-less death's level restart ends the tick burst on its tick, so
   both peers rebuild before the same next tick.
-- The peer leaving ends netplay: the game goes on locally, the other
-  carpet idles.
+- A CLIENT leaving mid-game (Leave, or its connection lost) is BANISHED
+  and the game goes on for the rest (player 2026-10-17; retail: an abandon
+  banishes the wizard). The host drops the seat at the first turn not yet
+  sent — its input there is the suicide key, idle after — and that turn
+  carries `left` (protocol 4); every peer calls `World::depart` before
+  stepping it. A send failure to one client departs that client only. The
+  usual game over follows (one contender left → "<name> is victorious!",
+  back to the lobby). The HOST leaving still ends netplay: a client whose
+  host is gone goes on locally, the other carpets idle (host handover is
+  a later stage).
 
 ## Evidence
 
@@ -346,3 +354,16 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
   (14 checks agreed). Noted: when a CLIENT leaves, the host's game goes on
   with the leaver's carpet idling (no game over — it still counts as a
   contender).
+- 2026-10-17 #15: **A LEAVER IS BANISHED** (player-confirmed next fix): a
+  client leaving no longer closes the host's lockstep (which also starved
+  every OTHER client in a 3+ game — the host stopped sending). See "Pinned
+  for the session" for the mechanism. Also: MC2's human "has died." (lang
+  374, verbatim, no name — retail writes it into the dying wizard's OWN
+  slot) is now seat-scoped; the others saw a nameless "has died.". Test
+  `a_leaving_client_is_banished_and_the_game_goes_on` (3 peers, MC2 + MC1:
+  the stayers stay identical, banish on one tick, the wizard is down, the
+  stayers' lines hold the banishment and not "has died."); kill-switch
+  proved three ways (no suicide input / the old close-on-Bye / the
+  broadcast death line). 1,624 workspace tests, 633/633 fixtures, clippy
+  clean. Xvfb: B leaves → host "BRAN has been banished from the realm.",
+  "ARIEL is victorious!", fade to the lobby (Ariel alone, rules kept).

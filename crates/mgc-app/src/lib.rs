@@ -4412,7 +4412,7 @@ impl App {
             }
             let mut inputs = vec![FlightInput::default(); seats];
             inputs[usize::from(local_hx().0)] = self.tick_input();
-            return NetTurn::Ready(inputs);
+            return NetTurn::Ready(inputs, Vec::new());
         }
         // Lead-in ticks carry an idle input; every later one samples
         // the controls now, to step INPUT_DELAY ticks from now.
@@ -4448,11 +4448,12 @@ impl App {
             ls.note_hash(tick, || sess.sim.state_hash());
         }
         let desync = ls.take_desync();
+        let left = ls.left_at(tick);
         let inputs = inputs.iter().map(replay::flight_input_from).collect();
         if let Some(msg) = desync {
             self.mini_toast(format!("netplay: {msg}"));
         }
-        NetTurn::Ready(inputs)
+        NetTurn::Ready(inputs, left)
     }
 
     fn mini_toast(&mut self, msg: impl Into<String>) {
@@ -7428,7 +7429,16 @@ impl App {
                     self.accumulator = self.accumulator.min(TICK_DT * max_ticks as f32);
                     break;
                 }
-                NetTurn::Ready(inputs) => Some(inputs),
+                NetTurn::Ready(inputs, left) => {
+                    // A player who left is banished on this tick, on
+                    // every peer alike (`Lockstep::left_at`).
+                    if let Some(w) = sess!(self).sim.world.as_mut() {
+                        for seat in left {
+                            w.depart(mgc_sim::Hx(seat));
+                        }
+                    }
+                    Some(inputs)
+                }
             };
             self.accumulator -= TICK_DT;
             {
@@ -10126,8 +10136,9 @@ enum NetTurn {
     Local,
     /// The tick's bundle has not arrived: step nothing yet.
     Starved,
-    /// Every seat's input for the tick, in seat order.
-    Ready(Vec<FlightInput>),
+    /// Every seat's input for the tick, in seat order, and the human
+    /// seats that left the game at it (banished before the step).
+    Ready(Vec<FlightInput>, Vec<u8>),
 }
 
 /// `--host` / `--join`: which end of a netplay link this app is.
@@ -13995,6 +14006,22 @@ mod net_lockstep_tests {
     /// and the lockstep: every world stays hash-identical and every
     /// seat flies.
     fn n_peers_stay_identical(game: &str, arena: u32, n: usize) {
+        n_peers(game, arena, n, None);
+    }
+
+    /// A CLIENT leaving mid-game ends nothing for the rest: the others
+    /// keep stepping, identical, and every one of them banishes the
+    /// leaver on the same tick — the wizard falls, never to respawn
+    /// (player 2026-10-17: a leaver's carpet idled on as a contender).
+    #[test]
+    fn a_leaving_client_is_banished_and_the_game_goes_on() {
+        n_peers("mc2", 50, 3, Some((1, 300)));
+        n_peers("mc1", 50, 3, Some((2, 300)));
+    }
+
+    /// `leave`: (peer k ≥ 1, tick) — that peer hangs up once it has
+    /// stepped the tick.
+    fn n_peers(game: &str, arena: u32, n: usize, leave: Option<(usize, u64)>) {
         let seats: Vec<u8> = (0..n as u8).collect();
         let path = level(game, arena);
         let Some(mut sims) = (0..n)
@@ -14043,14 +14070,14 @@ mod net_lockstep_tests {
             host.poll();
             guests.iter_mut().for_each(net::Guest::poll);
         }
-        let mut peers = vec![net::Lockstep::start(host.play().ok().unwrap())];
+        let mut peers = vec![Some(net::Lockstep::start(host.play().ok().unwrap()))];
         for mut g in guests {
             while !g.started() {
                 g.poll();
             }
             let link = g.into_link().ok().unwrap();
             assert_eq!(link.seats, seats);
-            peers.push(net::Lockstep::start(link));
+            peers.push(Some(net::Lockstep::start(link)));
         }
         // Mixed flight models — each seat its own player's (alternating
         // classic / enhanced), the same on every peer.
@@ -14073,10 +14100,14 @@ mod net_lockstep_tests {
         let mut stepped = vec![0u64; n];
         let mut hashes = vec![Vec::new(); n];
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        while stepped.iter().any(|&s| s < TICKS) {
+        let mut banished_at = vec![None; n];
+        while (0..n).any(|k| peers[k].is_some() && stepped[k] < TICKS) {
             assert!(std::time::Instant::now() < deadline, "lockstep stalled");
             for k in 0..n {
-                let p = &mut peers[k];
+                if leave == Some((k, stepped[k])) {
+                    peers[k] = None;
+                }
+                let Some(p) = &mut peers[k] else { continue };
                 p.poll();
                 assert!(p.closed().is_none(), "peer {k}: {:?}", p.closed());
                 while p.wants_input() {
@@ -14093,6 +14124,11 @@ mod net_lockstep_tests {
                 {
                     let sim = &mut sims[k];
                     p.note_hash(t, || sim.state_hash());
+                    let left = p.left_at(t);
+                    for &seat in &left {
+                        sim.world.as_mut().unwrap().depart(Hx(seat));
+                        banished_at[k] = Some(t);
+                    }
                     let inputs: Vec<FlightInput> =
                         inputs.iter().map(replay::flight_input_from).collect();
                     sim.step_seats(&inputs);
@@ -14101,11 +14137,36 @@ mod net_lockstep_tests {
                 }
             }
         }
-        for k in 1..n {
+        let stayed: Vec<usize> = (0..n).filter(|&k| peers[k].is_some()).collect();
+        for &k in &stayed[1..] {
             if let Some(t) = (0..TICKS as usize).find(|&t| hashes[0][t] != hashes[k][t]) {
                 panic!("{game}: peer {k} forked at tick {t}");
             }
-            assert!(peers[k].take_desync().is_none());
+            assert!(peers[k].as_mut().unwrap().take_desync().is_none());
+        }
+        if let Some((gone, at)) = leave {
+            let hx = Hx(gone as u8);
+            for &k in &stayed {
+                let t = banished_at[k].expect("the leaver was never banished");
+                assert!(t > at, "{game}: banished at {t}, before it left at {at}");
+                assert_eq!(banished_at[k], banished_at[0], "{game}: one tick for all");
+                let w = sims[k].world.as_ref().unwrap();
+                assert!(w.banished(hx), "{game}: peer {k}");
+                assert!(!w.contenders().0.contains(&hx));
+                // The others read the banishment; the leaver's own
+                // nameless "has died." is his alone.
+                let lines: Vec<&str> = w.notifications_for(Hx(0)).map(|(t, _)| t).collect();
+                assert!(
+                    lines.iter().any(|t| t.ends_with("banished from the realm.")),
+                    "{game}: {lines:?}"
+                );
+                assert!(!lines.contains(&"has died."), "{game}: {lines:?}");
+                assert!(
+                    w.vitals(hx).state != mgc_sim::engine::world::LifeState::Alive,
+                    "{game}: the leaver's wizard still flies on peer {k}"
+                );
+            }
+            return;
         }
         for (k, s) in starts.iter().enumerate() {
             let f = sims[0].flyer[Hx(k as u8)];

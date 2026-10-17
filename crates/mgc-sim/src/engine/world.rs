@@ -14345,8 +14345,10 @@ impl World {
         self.set_human_respawn_timer(hx, 1200);
         // Retail writes lang 374 VERBATIM into the dying wizard's own
         // notification slot with countdown 100 (EF:60129-36) — no name
-        // substitution on this path, unlike the rival broadcast.
-        self.set_notification("has died.", 100, [0xFF, 0, 0]);
+        // substitution on this path, unlike the rival broadcast. Its
+        // OWN slot: in a network game only the dying player reads it
+        // (the others saw a nameless "has died." — player 2026-10-17).
+        self.set_seat_notification(hx, "has died.", 100, [0xFF, 0, 0]);
         // The 26-token scatter — the book keeps its BOOLEAN marker so
         // the respawn re-mints exactly the spells that were owned.
         // The scatter zeroes every window counter, so the player-side
@@ -14478,6 +14480,23 @@ impl World {
         if self.players.len() < 2 || has_castle {
             return false;
         }
+        self.banish(hx);
+        true
+    }
+
+    /// A NETWORK game's player LEFT (the lockstep says so, on the same
+    /// tick everywhere): his seat is banished whatever his castle —
+    /// retail's abandon (Esc → confirm) banishes the wizard alike
+    /// (SMold:51387-95). The leaver's input that tick is the suicide
+    /// key, so the wizard falls, and a banished seat never respawns.
+    pub fn depart(&mut self, hx: Hx) {
+        if self.players.len() < 2 || hx.0 as usize >= self.players.len() || self.players[hx].banished {
+            return;
+        }
+        self.banish(hx);
+    }
+
+    fn banish(&mut self, hx: Hx) {
         self.players[hx].banished = true;
         let seat = usize::from(self.g.human_seat(hx).min(7));
         let name = if self.game == GameId::Mc2 {
@@ -14490,7 +14509,6 @@ impl World {
             100,
             [0xFF, 0, 0],
         );
-        true
     }
 
     /// Has a network game banished seat `hx`? (see `banish_instead`)

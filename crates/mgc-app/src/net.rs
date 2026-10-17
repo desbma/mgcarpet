@@ -16,6 +16,14 @@
 //! client compares — DETECTION only for now; reconciliation (the host's
 //! state wins) and host handover are later stages.
 //!
+//! A CLIENT leaving mid-game (Bye, or its socket lost) does not end the
+//! game: the host drops that seat at the first turn not yet sent — the
+//! seat's input there is the suicide key, idle after — and the turn says
+//! so ([`Msg::Turn::left`], read by [`Lockstep::left_at`]). Every peer
+//! banishes the seat on that tick (retail: an abandon banishes the
+//! wizard), so the game goes on for the rest and ends as usual when one
+//! contender stands.
+//!
 //! Wire: a little-endian `u32` length, then one JSON [`Msg`]. The input
 //! payload is the recorder's [`PortInput`] (idle ticks encode as `{}`).
 
@@ -30,7 +38,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Bumped whenever [`Msg`] changes shape.
-const PROTOCOL: u32 = 3;
+const PROTOCOL: u32 = 4;
 /// The most players a session holds — retail's 8 (one per wizard). The
 /// host lowers it in the lobby (`Host::set_capacity`).
 pub const MAX_PLAYERS: usize = 8;
@@ -98,6 +106,10 @@ enum Msg {
         inputs: Vec<PortInput>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         check: Option<(u64, u64)>,
+        /// The human seats that left the game AT this tick (banished
+        /// before it steps).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        left: Vec<u8>,
     },
     Bye {
         why: String,
@@ -853,6 +865,13 @@ pub struct Lockstep {
     ended: bool,
     /// Host: member ids of the clients that left mid-game.
     gone: Vec<u32>,
+    /// Host: per seat, the tick it left at (its input from then on is
+    /// the host's: the suicide key at that tick, idle after).
+    departed: Vec<Option<u64>>,
+    /// Host: clients a send failed to — they leave at the next poll.
+    failed: Vec<(usize, String)>,
+    /// The seats leaving at each tick (see [`Self::left_at`]).
+    departures: BTreeMap<u64, Vec<u8>>,
 }
 
 impl Lockstep {
@@ -877,6 +896,9 @@ impl Lockstep {
             closed: link.lost,
             ended: false,
             gone: Vec::new(),
+            departed: vec![None; link.seats.len()],
+            failed: Vec::new(),
+            departures: BTreeMap::new(),
         }
     }
 
@@ -937,11 +959,23 @@ impl Lockstep {
     /// Host: every turn whose seats have all reported, in tick order,
     /// goes out to the clients and onto the local ready queue.
     fn complete(&mut self) {
-        while let Some(turn) = self.pending.get(&self.next_complete) {
+        while let Some(turn) = self.pending.get_mut(&self.next_complete) {
+            let tick = self.next_complete;
+            // A departed seat's input is the host's to write.
+            for (ix, d) in self.departed.iter().enumerate() {
+                if let Some(d) = *d
+                    && tick >= d
+                    && turn[ix].is_none()
+                {
+                    turn[ix] = Some(PortInput {
+                        suicide: tick == d,
+                        ..PortInput::default()
+                    });
+                }
+            }
             if turn.iter().any(Option::is_none) {
                 break;
             }
-            let tick = self.next_complete;
             let inputs: Vec<PortInput> = self
                 .pending
                 .remove(&tick)
@@ -951,10 +985,12 @@ impl Lockstep {
                 .collect();
             self.next_complete += 1;
             let check = self.stamp.take();
+            let left = self.departures.get(&tick).cloned().unwrap_or_default();
             self.send(&Msg::Turn {
                 tick,
                 inputs: inputs.clone(),
                 check,
+                left,
             });
             self.ready.insert(tick, inputs);
         }
@@ -966,10 +1002,19 @@ impl Lockstep {
             return;
         }
         let err = match &mut self.session {
-            Some(Session::Host(h)) => h
-                .clients
-                .iter_mut()
-                .find_map(|(_, c)| c.send(m).err().map(|e| format!("{}: {e}", c.peer))),
+            // A client that cannot be reached leaves (at the next poll);
+            // the game goes on for the rest.
+            Some(Session::Host(h)) => {
+                for (k, (_, c)) in h.clients.iter_mut().enumerate() {
+                    if self.departed.get(k + 1).is_some_and(Option::is_some) {
+                        continue;
+                    }
+                    if let Err(e) = c.send(m) {
+                        self.failed.push((k + 1, format!("{}: {e}", c.peer)));
+                    }
+                }
+                None
+            }
             Some(Session::Guest(g)) => g.conn.send(m).err().map(|e| e.to_string()),
             None => None,
         };
@@ -978,10 +1023,42 @@ impl Lockstep {
         }
     }
 
+    /// Host: seat `ix` (a client) left the game: it is banished at the
+    /// first turn not yet sent — whatever it had scheduled from there
+    /// on is dropped, and its input becomes the host's (`complete`).
+    fn depart(&mut self, ix: usize, why: &str) {
+        if ix == 0 || self.departed.get(ix).is_none_or(Option::is_some) {
+            return;
+        }
+        let tick = self.next_complete;
+        self.departed[ix] = Some(tick);
+        self.departures.entry(tick).or_default().push(ix as u8);
+        for turn in self.pending.range_mut(tick..).map(|(_, t)| t) {
+            turn[ix] = None;
+        }
+        if let Some(Session::Host(h)) = &mut self.session
+            && let Some((id, conn)) = h.clients.get_mut(ix - 1)
+        {
+            conn.close(why);
+            self.gone.push(*id);
+        }
+        println!("net: seat {ix} left ({why}) — banished at tick {tick}");
+        self.complete();
+    }
+
+    /// The human seats that leave the game at `tick` — banish them
+    /// before stepping it. Call once per stepped tick.
+    pub fn left_at(&mut self, tick: u64) -> Vec<u8> {
+        self.departures.remove(&tick).unwrap_or_default()
+    }
+
     /// Drain everything the peers have sent.
     pub fn poll(&mut self) {
         if self.closed.is_some() || self.ended {
             return;
+        }
+        for (ix, why) in std::mem::take(&mut self.failed) {
+            self.depart(ix, &why);
         }
         let mut got: Vec<(usize, Recv)> = Vec::new();
         let mut ids: Vec<u32> = Vec::new();
@@ -997,6 +1074,9 @@ impl Lockstep {
                 // Client k is human seat Hx(k + 1) (member order).
                 ids = h.clients.iter().map(|(id, _)| *id).collect();
                 for (k, (_, conn)) in h.clients.iter().enumerate() {
+                    if self.departed.get(k + 1).is_some_and(Option::is_some) {
+                        continue;
+                    }
                     loop {
                         let r = conn.recv();
                         let stop = !matches!(r, Recv::Msg(Msg::Input { .. }));
@@ -1018,8 +1098,14 @@ impl Lockstep {
             None => return,
         }
         for (ix, r) in got {
+            if self.departed.get(ix).is_some_and(Option::is_some) {
+                continue;
+            }
             match (self.role, r) {
                 (_, Recv::Empty) => {}
+                // A client leaving: the game goes on without it.
+                (Role::Host, Recv::Lost(e)) => self.depart(ix, &format!("connection lost: {e}")),
+                (Role::Host, Recv::Msg(Msg::Bye { why })) => self.depart(ix, &why),
                 (_, Recv::Lost(e)) => {
                     self.gone.extend(ix.checked_sub(1).and_then(|k| ids.get(k)));
                     self.closed
@@ -1048,11 +1134,15 @@ impl Lockstep {
                         tick,
                         inputs,
                         check,
+                        left,
                     }),
                 ) => {
                     if inputs.len() != self.seats {
                         self.fail(format!("turn {tick} carries {} seats", inputs.len()));
                         return;
+                    }
+                    if !left.is_empty() {
+                        self.departures.insert(tick, left);
                     }
                     self.ready.insert(tick, inputs);
                     if let Some((t, h)) = check {
