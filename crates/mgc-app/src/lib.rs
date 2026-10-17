@@ -14788,6 +14788,29 @@ mod net_lockstep_tests {
                 t += 1;
                 assert!(t < 3000, "{game}: seat 2 never came to rest dead");
             }
+            // Down with no castle, Space never pressed: already out —
+            // the last wizard standing has won (player 2026-10-17: the
+            // game waited for every corpse to rise first).
+            let w = sim.world.as_ref().unwrap();
+            assert!(!w.banished(Hx(1)), "{game}: not banished yet");
+            assert_eq!(w.contenders(), (vec![Hx::FIRST], vec![]), "{game}");
+            assert!(
+                super::net_verdict(w, &[]).is_some(),
+                "{game}: the verdict waits for the corpse's Space"
+            );
+            // …while a corpse WITH a castle still contends (his Space
+            // respawns him): the game goes on.
+            let mut castled = net_sim(game, 50, &[0, 1], 0).unwrap();
+            let cw = castled.world.as_mut().unwrap();
+            cw.debug_plant_castle(Hx(1));
+            cw.debug_kill_player(Hx(1));
+            for _ in 0..t + 2 {
+                castled.step_seats(&idle);
+            }
+            let cw = castled.world.as_ref().unwrap();
+            assert_ne!(cw.vitals(Hx(1)).state, LifeState::Alive, "{game}: down");
+            assert_eq!(cw.contenders().0, vec![Hx::FIRST, Hx(1)], "{game}");
+            assert!(super::net_verdict(cw, &[]).is_none(), "{game}");
             for _ in 0..4 {
                 sim.step_seats(&press);
             }

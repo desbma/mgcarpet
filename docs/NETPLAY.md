@@ -698,3 +698,16 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
   0.01) and caps the flying bank; kill-switch proved (the old law:
   "banks -0.375 standing still"). 1,646 workspace tests, clippy clean.
   ⏭ re-playtest.
+- 2026-10-17 #31 (ghost playtest): the verdict waited for every dead
+  human to press Space (banishment happens AT the respawn request, and
+  only a banished human was out). ⚖ Player: a corpse may rise or lie as
+  he pleases, but the last wizard standing has won either way. Fix:
+  `World::contenders` counts a human OUT once banished OR DOOMED — down
+  (falling or dead) with no castle (`World::doomed`, each game's own
+  castle lookup as its respawn reads it: MC2 `seat_castle`, MC1
+  `player_castle_bound`). A downed human WITH a castle still contends.
+  Test `a_castle_less_death_in_a_network_game_banishes` extended: a
+  castle-less corpse is out (and `net_verdict` names the winner) before
+  any Space; a castled one (`debug_plant_castle`) still contends, no
+  verdict. Both halves kill-switch proved. 1,646 workspace tests, clippy
+  clean.

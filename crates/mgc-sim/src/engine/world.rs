@@ -14608,19 +14608,35 @@ impl World {
         true
     }
 
+    /// Seat `hx` is down with no castle: in a network game his respawn
+    /// request can only banish him (`banish_instead`, each game's own
+    /// castle lookup as its respawn reads it).
+    fn doomed(&self, hx: Hx) -> bool {
+        let down = self.player_falling(hx) || self.player_dead(hx);
+        let castle = match self.game {
+            GameId::Mc2 => self.seat_castle(hx).is_some(),
+            _ => self.player_castle_bound(hx).is_some(),
+        };
+        down && !castle
+    }
+
     /// Has seat `hx` risen as a spectator ghost? (see [`Self::rise`])
     pub fn risen(&self, hx: Hx) -> bool {
         self.players[hx].risen
     }
 
-    /// The wizards still in a network game: the humans not banished and
-    /// the rivals not eliminated — the app ends the game when one side
-    /// alone stands (or no human does).
+    /// The wizards still in a network game: the humans not out and the
+    /// rivals not eliminated — the app ends the game when one side alone
+    /// stands (or no human does). A human is OUT once banished, or once
+    /// he is down (falling or dead) with no castle to respawn at: his
+    /// Space can only banish him then, so the game does not wait for it
+    /// (player 2026-10-17 — a corpse may rise as a ghost or lie, as he
+    /// pleases, but the last wizard standing has won either way).
     pub fn contenders(&self) -> (Vec<Hx>, Vec<u8>) {
         let humans = self
             .players
             .ixs()
-            .filter(|&hx| !self.banished(hx))
+            .filter(|&hx| !self.banished(hx) && !self.doomed(hx))
             .collect();
         let rivals = self
             .rival_views()
@@ -20514,6 +20530,32 @@ impl World {
     /// Test hook: zero the grace and hand the player a lethal hit
     /// from nothing (killer 0 — no death-camera target).
     #[doc(hidden)]
+    /// Test hook: a bare castle record for seat `hx` (class 3 model 2,
+    /// his tag, the MC1 bound register) in a free pool slot, on no
+    /// chain — enough for every "has he a castle" question
+    /// (`seat_castle`, `player_castle_bound`), nothing more.
+    #[doc(hidden)]
+    pub fn debug_plant_castle(&mut self, hx: Hx) -> usize {
+        let j = (1..self.g.ent.len())
+            .rev()
+            .find(|&j| self.g.ent[j].class64 == 0 && self.g.ent[j].flags & 0x400 != 0)
+            .or_else(|| {
+                (1..self.g.ent.len())
+                    .rev()
+                    .find(|&j| self.g.ent[j].class64 == 0)
+            })
+            .expect("a free slot");
+        let tag = self.g.human_tag[hx].0;
+        let e = &mut self.g.ent[j];
+        e.class64 = 3;
+        e.model65 = 2;
+        e.id24 = tag;
+        e.flags = 0;
+        let seat = self.g.human_seat(hx) as usize;
+        self.g.castle_reg.0[seat] = j as u16;
+        j
+    }
+
     pub fn debug_kill_player(&mut self, hx: Hx) {
         self.players[hx].grace = 0;
         self.g.pmail_mut(hx)[0] = (u32::MAX / 4, 1);
