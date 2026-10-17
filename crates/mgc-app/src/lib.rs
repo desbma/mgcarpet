@@ -263,6 +263,14 @@ struct CampaignRun {
     /// Installed into each fresh world, refreshed at the won edge.
     /// All-zero on MC2 runs.
     mc1_ring: [u8; 24],
+    /// MC1/HW quick-key carry (native-only sidecar, like the ring;
+    /// `SaveHeader::mc1_quick_keys`). `None` = no assignment carried —
+    /// a new campaign or a save from before the carry — and the level
+    /// seeds its keys from scratch like retail (:49216-59); `Some` =
+    /// the player's binds, installed at level entry and refreshed at
+    /// the won edge. App-side only: the keys never reach the sim, so
+    /// replays and the sim hash are untouched.
+    mc1_quick_keys: Option<[Option<u8>; 10]>,
     /// MC2: the levels whose stats tables the map shows on its next
     /// entry, oldest first (retail map mode 4). A win routed to the
     /// map queues its level. A win routed STRAIGHT into a secret level
@@ -271,17 +279,37 @@ struct CampaignRun {
     map_stats: Vec<u32>,
 }
 
-/// The slot's campaign record, native file first: `(retail-format
-/// bytes, the native header's MC1 cycle ring, its MC2 owed stats
-/// tables)`. The ring rides only
-/// the native container (`None` from a retail import or a
-/// version-recovery — those simply start with an empty ring).
+/// The slot's campaign record, native file first: the retail-format
+/// bytes plus the native header's carry — the MC1 cycle ring and
+/// quick keys, the MC2 owed stats tables. The carry rides only the
+/// native container (`None` from a retail import or a version-recovery
+/// — those simply start with an empty ring and fresh quick keys).
 ///
 /// Returns `None` for "start fresh" — either `new_game`, or nothing
 /// on disk. A file that EXISTS but cannot be read is an error, not a
 /// fresh start: silently starting over would overwrite it on the
 /// first level completion.
-#[allow(clippy::type_complexity)]
+/// The native carry beside the retail record (see [`campaign_record`]).
+struct SlotRecord {
+    /// The retail-format record bytes.
+    campaign: Vec<u8>,
+    mc1_ring: Option<[u8; 24]>,
+    mc1_quick_keys: Option<[Option<u8>; 10]>,
+    mc2_map_stats: Vec<u32>,
+}
+
+impl SlotRecord {
+    /// A record with no native carry (a retail import, a recovery).
+    fn bare(campaign: Vec<u8>) -> Self {
+        Self {
+            campaign,
+            mc1_ring: None,
+            mc1_quick_keys: None,
+            mc2_map_stats: Vec::new(),
+        }
+    }
+}
+
 /// `MGC_NO_REQUEST_TIME_LISTENER=1` restores the pre-fix drain-time
 /// listener: sound requests are attenuated against the pose the sim
 /// step ENDED at, so a portal warp's own entry sound (id 22) is
@@ -295,7 +323,7 @@ fn campaign_record(
     tag: &str,
     slot: usize,
     new_game: bool,
-) -> Result<Option<(Vec<u8>, Option<[u8; 24]>, Vec<u32>)>, String> {
+) -> Result<Option<SlotRecord>, String> {
     if new_game {
         return Ok(None);
     }
@@ -311,11 +339,12 @@ fn campaign_record(
                     // path's job, not the campaign opener's.
                     println!("campaign {tag}: slot {} holds a mid-level save", slot + 1);
                 }
-                return Ok(Some((
-                    pkg.campaign,
-                    pkg.header.mc1_spell_ring,
-                    pkg.header.mc2_map_stats,
-                )));
+                return Ok(Some(SlotRecord {
+                    campaign: pkg.campaign,
+                    mc1_ring: pkg.header.mc1_spell_ring,
+                    mc1_quick_keys: pkg.header.mc1_quick_keys,
+                    mc2_map_stats: pkg.header.mc2_map_stats,
+                }));
             }
             // A container this build cannot apply. The campaign record
             // inside is retail's byte layout, so it survives any
@@ -330,7 +359,7 @@ fn campaign_record(
                     slot + 1,
                     rec.save_version
                 );
-                return Ok(Some((rec.campaign, None, Vec::new())));
+                return Ok(Some(SlotRecord::bare(rec.campaign)));
             }
         }
     }
@@ -342,7 +371,7 @@ fn campaign_record(
             retail.display()
         );
         return std::fs::read(&retail)
-            .map(|b| Some((b, None, Vec::new())))
+            .map(|b| Some(SlotRecord::bare(b)))
             .map_err(|e| format!("{}: {e}", retail.display()));
     }
     Ok(None)
@@ -408,12 +437,13 @@ impl CampaignRun {
             Some(s) => campaign_record(id.tag(), s, new_game)?,
             None => None,
         };
-        let mc1_ring = record.as_ref().and_then(|(_, r, _)| *r).unwrap_or([0; 24]);
+        let mc1_ring = record.as_ref().and_then(|r| r.mc1_ring).unwrap_or([0; 24]);
+        let mc1_quick_keys = record.as_ref().and_then(|r| r.mc1_quick_keys);
         let map_stats = record
             .as_ref()
-            .map(|(_, _, m)| m.clone())
+            .map(|r| r.mc2_map_stats.clone())
             .unwrap_or_default();
-        let record = record.map(|(b, _, _)| b);
+        let record = record.map(|r| r.campaign);
         match id {
             CampaignId::Mc1 | CampaignId::Mc1Hw => {
                 let save = if let Some(bytes) = record {
@@ -460,6 +490,7 @@ impl CampaignRun {
                     save: CampaignSave::Mc1(save),
                     next: None,
                     mc1_ring,
+                    mc1_quick_keys,
                     map_stats: Vec::new(),
                 })
             }
@@ -502,6 +533,7 @@ impl CampaignRun {
                     save: CampaignSave::Mc2(save),
                     next: None,
                     mc1_ring: [0; 24],
+                    mc1_quick_keys: None,
                     map_stats,
                 })
             }
@@ -562,6 +594,10 @@ impl CampaignRun {
         // ring-less saves keep their old shape.
         if self.id != campaign::CampaignId::Mc2 && self.mc1_ring != [0; 24] {
             header.mc1_spell_ring = Some(self.mc1_ring);
+        }
+        // The MC1 quick keys likewise (omitted while unbound).
+        if self.id != campaign::CampaignId::Mc2 {
+            header.mc1_quick_keys = self.mc1_quick_keys;
         }
         // MC2: tables still owed (a secret level's parent, saved from
         // inside the secret level).
@@ -4341,6 +4377,7 @@ impl App {
     /// restarts the level) and reset the flyer to the level start.
     fn restart_level(&mut self) {
         let patches = self.world_patches_now();
+        let keep_quick_keys = self.carried_quick_keys().is_some();
         {
             let Some(sess) = self.session.as_deref_mut() else {
                 return;
@@ -4360,7 +4397,11 @@ impl App {
             // Retail wipes + reseeds the quick keys at level init
             // (:49216-59) — the acquisition diff below re-seeds the
             // starting spells in canonical order on the first tick.
-            self.quick_binds = [None; 10];
+            // A campaign carrying the player's binds keeps the live
+            // ones instead (a restart is no reason to lose a rebind).
+            if !keep_quick_keys {
+                self.quick_binds = [None; 10];
+            }
             self.prev_owned = [false; 24];
             // A restart is a level entry — the situational sim speed
             // resets with the rest (mirrors `install_level`).
@@ -4632,6 +4673,9 @@ impl App {
             {
                 let ring = w.loadout(local_hx()).ring;
                 package.header.mc1_spell_ring = (ring != [0; 24]).then_some(ring);
+                // The live quick keys likewise (the run's carry only
+                // refreshes at the won edge).
+                package.header.mc1_quick_keys = quick_keys_carry(&self.quick_binds);
             }
             package.snapshot = Some(sess.sim.snapshot());
             package.header.resume = Some(mgc_formats::mgcs::InLevel {
@@ -4925,7 +4969,7 @@ impl App {
         // the per-level UI state.
         self.pool_dropped_total = 0;
         self.misfits_reported = 0;
-        self.quick_binds = [None; 10];
+        self.quick_binds = self.carried_quick_keys().unwrap_or([None; 10]);
         self.prev_owned = [false; 24];
         self.castle_pos = None;
         self.subtitle = None;
@@ -5803,6 +5847,21 @@ impl App {
     /// vanished MC1 spells and undead-stolen MC2 spells stay members,
     /// they are just skipped). A single-member ring re-selects itself.
     /// The equip carries the spell's STORED level (`array_0x437`).
+    /// The MC1/HW campaign's carried quick keys, if it carries any
+    /// (`CampaignRun::mc1_quick_keys`) — the running campaign's, or in
+    /// a lobby game the one parked for it (`net_campaign`): players
+    /// bring their own binds into MP (player ask 2026-10-17). `None`
+    /// outside a campaign (replays, `--level`, CLI netplay), on MC2,
+    /// and on a campaign with no binds saved — all of which seed from
+    /// scratch like retail.
+    fn carried_quick_keys(&self) -> Option<[Option<u8>; 10]> {
+        self.campaign
+            .as_ref()
+            .or(self.net_campaign.as_ref())
+            .filter(|run| run.id != campaign::CampaignId::Mc2)
+            .and_then(|run| run.mc1_quick_keys)
+    }
+
     fn cycle_spell_ring(&mut self, hand: u8, backward: bool) {
         let Some(w) = self.session.as_deref().and_then(|s| s.sim.world.as_ref()) else {
             return;
@@ -8694,6 +8753,11 @@ impl App {
                 }
                 if let Some(run) = &mut self.campaign {
                     campaign_complete(run, sess.level.level_number, sess.sim.tick, w);
+                    // MC1/HW quick-key carry (app-side, so not in
+                    // `campaign_complete`, which sees only the world).
+                    if run.id != campaign::CampaignId::Mc2 {
+                        run.mc1_quick_keys = quick_keys_carry(&self.quick_binds);
+                    }
                     // MC2 only: the map, or a secret level first.
                     if run.id == campaign::CampaignId::Mc2
                         && matches!(
@@ -10067,6 +10131,18 @@ impl ApplicationHandler for App {
                                     }
                                     self.quick_binds[d] = Some(spell.0);
                                     println!("quick key {}: {}", (d + 1) % 10, spell.name());
+                                    // A rebind is a preference, not
+                                    // progress: the campaign carry takes
+                                    // it now, so every save and the next
+                                    // MP game see it without a level won
+                                    // first. (In MP the campaign is
+                                    // parked — a rebind there stays in
+                                    // that game.)
+                                    if let Some(run) = &mut self.campaign
+                                        && run.id != campaign::CampaignId::Mc2
+                                    {
+                                        run.mc1_quick_keys = quick_keys_carry(&self.quick_binds);
+                                    }
                                 }
                             } else if let Some(spell) = self.quick_binds[d] {
                                 if self.ctrl_mod {
@@ -11796,6 +11872,12 @@ fn mc1_campaign_carry(run: Option<&CampaignRun>) -> Vec<u8> {
 /// 4-step fade back to the level palette (EF:31912-19): six ticks
 /// grey, then 3/4, 1/2, 1/4, colour, and again. The CORPSE installs it
 /// every tick (EF:60665, :55628) — solid monochrome until Space.
+/// The quick keys as campaign carry: `None` while nothing is bound, so
+/// an unbound campaign keeps the old save shape and seeds from scratch.
+fn quick_keys_carry(binds: &[Option<u8>; 10]) -> Option<[Option<u8>; 10]> {
+    binds.iter().any(Option::is_some).then_some(*binds)
+}
+
 fn death_greyscale(state: mgc_sim::engine::world::LifeState, tick: u64) -> f32 {
     use mgc_sim::engine::world::LifeState;
     match state {

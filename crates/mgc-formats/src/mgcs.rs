@@ -130,6 +130,14 @@ pub struct SaveHeader {
     /// MC2 slots and on pre-ring saves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mc1_spell_ring: Option<[u8; 24]>,
+    /// MC1/HW quick keys 1..9,0 → spell id (`null` = unbound) — the
+    /// same native-only campaign carry as the ring (player ask
+    /// 2026-10-17: rebinding the digits every level was a chore).
+    /// `None` on MC2 slots, on saves from before the carry, and when
+    /// nothing is bound — such a campaign seeds its keys from scratch
+    /// at level start, exactly as retail does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mc1_quick_keys: Option<[Option<u8>; 10]>,
     /// MC2: the stats tables the map still owes, oldest first — a
     /// secret level's parent, won through the alternate portal, whose
     /// table waits for the next map entry. Native-only; saved
@@ -380,6 +388,7 @@ pub fn hub_header(game: Game, label: String, campaign_level: u32, level: u32) ->
         bake_epoch: BAKE_EPOCH,
         resume: None,
         mc1_spell_ring: None,
+        mc1_quick_keys: None,
         mc2_map_stats: Vec::new(),
     }
 }
@@ -437,6 +446,30 @@ mod tests {
         let plain = hub_header(Game::MagicCarpet2, "HUB".into(), 4, 4);
         let json = serde_json::to_string(&plain).unwrap();
         assert!(!json.contains("mc2_map_stats"), "omitted while empty");
+    }
+
+    /// The MC1 quick keys ride the header; a header without them keeps
+    /// its old shape, and a save from before the carry (no field at
+    /// all) reads as "no keys" — the level seeds them from scratch.
+    #[test]
+    fn mc1_quick_keys_ride_the_header() {
+        let mut header = hub_header(Game::MagicCarpet1, "KEYS".into(), 3, 3);
+        let mut keys = [None; 10];
+        keys[0] = Some(0);
+        keys[9] = Some(17);
+        header.mc1_quick_keys = Some(keys);
+        let save = SavePackage {
+            header,
+            campaign: campaign(),
+            snapshot: None,
+        };
+        let back = read(std::io::Cursor::new(&to_bytes(&save).unwrap())).unwrap();
+        assert_eq!(back.header.mc1_quick_keys, Some(keys));
+        let plain = hub_header(Game::MagicCarpet1, "HUB".into(), 3, 3);
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("mc1_quick_keys"), "omitted while unbound");
+        let old: SaveHeader = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.mc1_quick_keys, None);
     }
 
     #[test]
