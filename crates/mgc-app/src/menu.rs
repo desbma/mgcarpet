@@ -674,7 +674,7 @@ pub fn draw(
         Some(i) => {
             let spec = &specs[i];
             let lock = if st.pinned.get(i).copied().unwrap_or(false) {
-                " (fixed by the host for this session)"
+                " (fixed for this session)"
             } else if spec.mutability() == Mutability::Startup {
                 " (applies at level load)"
             } else {

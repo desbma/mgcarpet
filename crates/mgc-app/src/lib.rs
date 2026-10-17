@@ -3381,7 +3381,7 @@ impl App {
             if let Err(e) = rules::adopt(&mut self.cfg, &agreed) {
                 eprintln!("{e}");
             }
-            self.mini_toast("netplay: the host fixed this option for the session");
+            self.mini_toast("netplay: this option is fixed for the session");
             return;
         }
         match cfg_path {
@@ -13327,6 +13327,7 @@ impl App {
             level: mc2_arena_path(*MC2_ARENAS.start()),
             rules: rules::session(&self.cfg),
             admin_key: None,
+            frozen_after: net::FROZEN_AFTER,
         };
         match net::ServerHandle::spawn(&addr, opts, ServerWorld::boxed) {
             Ok(server) => {
@@ -13501,8 +13502,11 @@ impl App {
     fn lobby_action(&mut self, action: lobby_mc2::LobbyAction, view: &lobby::LobbyView) {
         use lobby_mc2::LobbyAction as A;
         if action == A::Exit {
-            println!("net: left the lobby");
-            self.leave_lobby(None);
+            // A hosting player's Exit stops his server: warned first.
+            if self.hosted_end_confirmed("exit") {
+                println!("net: left the lobby");
+                self.leave_lobby(None);
+            }
             return;
         }
         let Some(nl) = &mut self.netlobby else { return };
@@ -13658,17 +13662,26 @@ impl App {
     /// everyone); a second close within the warning's window goes
     /// through.
     fn request_close(&mut self, event_loop: &ActiveEventLoop) {
+        if self.hosted_end_confirmed("close") {
+            event_loop.exit();
+        }
+    }
+
+    /// Stopping this app's server (`what`: the close, the lobby's
+    /// Exit) ends the session for every other player on it: the first
+    /// try warns, a second within 5 s goes through. True = go ahead.
+    fn hosted_end_confirmed(&mut self, what: &str) -> bool {
         let others = self.hosted_others();
         let warned = self
             .close_warned
             .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(5));
         if others == 0 || warned {
-            event_loop.exit();
-            return;
+            self.close_warned = None;
+            return true;
         }
         self.close_warned = Some(std::time::Instant::now());
         let text = format!(
-            "{others} player{} still in this session - close again to end it for everyone",
+            "{others} player{} still in this session - {what} again to end it for everyone",
             if others == 1 { "" } else { "s" }
         );
         match &mut self.netlobby {
@@ -13678,6 +13691,7 @@ impl App {
             }
             None => self.mini_toast(text),
         }
+        false
     }
 }
 
@@ -13876,6 +13890,7 @@ fn net_handshake(
                     level: level_path.to_string_lossy().into_owned(),
                     rules: rules::session(cfg),
                     admin_key: None,
+                    frozen_after: net::FROZEN_AFTER,
                 },
                 ServerWorld::boxed,
             )?;
@@ -13953,6 +13968,7 @@ fn run_server(addr: &str, args: &Args) -> std::process::ExitCode {
         level,
         rules: rules::session(&config::Config::default()),
         admin_key: None,
+        frozen_after: net::FROZEN_AFTER,
     };
     match net::serve(addr, opts, ServerWorld::boxed()) {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -14294,6 +14310,7 @@ mod net_lockstep_tests {
                 level: path.to_string_lossy().into_owned(),
                 rules: super::rules::session(&config::Config::default()),
                 admin_key: None,
+                frozen_after: net::FROZEN_AFTER,
             },
             super::ServerWorld::boxed,
         )

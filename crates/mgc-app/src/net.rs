@@ -70,6 +70,11 @@ pub const CHECK_EVERY: u64 = 24;
 /// After the verdict, the longest the server waits for the players'
 /// fade-out before it reopens the lobby anyway.
 pub const GAME_OVER_GRACE: Duration = Duration::from_secs(10);
+/// A player the game has waited on this long — connected, but no input
+/// (his app hung) — is dropped like a lost connection (player
+/// 2026-10-17: slowdowns are accepted, a frozen player is not). Covers
+/// the slowest machine's level load at the game's start.
+pub const FROZEN_AFTER: Duration = Duration::from_secs(30);
 /// A frame larger than this is a broken peer, not a message.
 const MAX_FRAME: usize = 1 << 20;
 
@@ -365,6 +370,8 @@ pub struct ServerOpts {
     /// A hosted server: the key its own player claims the admin role
     /// with. `None` (dedicated): the first member in is the admin.
     pub admin_key: Option<String>,
+    /// How long the game waits on a silent player ([`FROZEN_AFTER`]).
+    pub frozen_after: Duration,
 }
 
 /// A running game on the server: turn assembly, departures, verdict.
@@ -386,6 +393,9 @@ struct Match {
     announce: Option<String>,
     /// Hash checks stamped (the summary).
     checks: u64,
+    /// Per seat, when its last input arrived (the game's start before
+    /// the first).
+    heard: Vec<Instant>,
 }
 
 impl Match {
@@ -421,6 +431,7 @@ pub struct Server {
     clients: Vec<(u32, Conn)>,
     referee: Box<dyn Referee>,
     game: Option<Match>,
+    frozen_after: Duration,
     dirty: bool,
 }
 
@@ -439,6 +450,7 @@ impl Server {
             clients: Vec::new(),
             referee,
             game: None,
+            frozen_after: opts.frozen_after,
             dirty: false,
         }
     }
@@ -476,6 +488,7 @@ impl Server {
         self.accept();
         self.handshake();
         self.serve();
+        self.drop_frozen();
         self.referee_turns();
         self.flush();
     }
@@ -684,6 +697,7 @@ impl Server {
             return;
         }
         let n = g.ids.len();
+        g.heard[ix] = Instant::now();
         g.pending.entry(tick).or_insert_with(|| vec![None; n])[ix] = Some(input);
         self.complete();
     }
@@ -750,6 +764,27 @@ impl Server {
                     let _ = c.tx.shutdown(Shutdown::Both);
                 }
             }
+        }
+    }
+
+    /// Drop every player the game has been waiting on for
+    /// `frozen_after`: still playing, silent that long, and missing
+    /// from the next turn (the others ran ahead and wait on him — they
+    /// are silent too, but not missing).
+    fn drop_frozen(&mut self) {
+        let Some(g) = &self.game else { return };
+        let next = g.pending.get(&g.next_complete);
+        let frozen: Vec<u32> = (0..g.ids.len())
+            .filter(|&ix| {
+                g.active(ix)
+                    && g.heard[ix].elapsed() > self.frozen_after
+                    && next.is_none_or(|turn| turn[ix].is_none())
+            })
+            .map(|ix| g.ids[ix])
+            .collect();
+        let why = format!("no input for {} s", self.frozen_after.as_secs());
+        for id in frozen {
+            self.drop_client(id, &why);
         }
     }
 
@@ -831,6 +866,7 @@ impl Server {
             over: None,
             announce: None,
             checks: 0,
+            heard: vec![Instant::now(); n],
         });
         self.core.begin();
         // A player lost while the game starts leaves at its first tick,
@@ -1602,6 +1638,11 @@ mod tests {
     /// A hosted-style server on a free loopback port (no admin key: the
     /// first member in is the admin, like a dedicated one).
     fn server(pass: &str, verdict_at: Option<u64>) -> Rig {
+        frozen_server(pass, verdict_at, FROZEN_AFTER)
+    }
+
+    /// [`server`] dropping a player silent for `frozen`.
+    fn frozen_server(pass: &str, verdict_at: Option<u64>, frozen: Duration) -> Rig {
         let begun = Arc::new(Mutex::new(Vec::new()));
         let b = begun.clone();
         let server = ServerHandle::spawn(
@@ -1613,6 +1654,7 @@ mod tests {
                 level: "baked/mc2/level-050.mgcl".into(),
                 rules: serde_json::json!({"fog": 40}),
                 admin_key: Some(String::new()),
+                frozen_after: FROZEN_AFTER.min(frozen),
             },
             move || {
                 Box::new(Counter {
@@ -1832,6 +1874,7 @@ mod tests {
                 level: "baked/mc2/level-050.mgcl".into(),
                 rules: serde_json::json!({}),
                 admin_key: None,
+                frozen_after: FROZEN_AFTER,
             },
             move || {
                 Box::new(Counter {
@@ -1897,7 +1940,11 @@ mod tests {
         settle(&mut [&mut a, &mut b], |g| g[1].view().rev == 1);
         assert!(!a.view().all_agreed() && !b.view().all_agreed());
         assert_eq!(b.view().rules, serde_json::json!({"fog": 90}));
+        // Play before the agreement — a round trip on A's own
+        // connection (a limit change) proves the server took it first.
         a.play();
+        a.set_capacity(3);
+        settle(&mut [&mut a], |g| g[0].view().capacity == 3);
         b.agree();
         settle(&mut [&mut a, &mut b], |g| g[0].view().all_agreed());
         assert!(!b.started(), "the refused Play never started");
@@ -2064,6 +2111,37 @@ mod tests {
         let out = pump(&mut [Some(&mut ls[0])], 40);
         assert_eq!(out[0].1, vec![1], "seat 1 leaves");
         assert!(ls[0].closed().is_none());
+    }
+
+    /// A player connected but silent (his app hung) holds the game only
+    /// so long: he is dropped and banished, the rest play on. The
+    /// others, waiting on him, are silent too — but not dropped.
+    #[test]
+    fn a_frozen_player_is_dropped_after_the_timeout() {
+        let r = frozen_server("pw", None, Duration::from_millis(400));
+        let links = start(vec![guest(&r, "ONE"), guest(&r, "TWO")]);
+        let mut ls: Vec<Lockstep> = links.into_iter().map(Lockstep::start).collect();
+        {
+            let (a, b) = ls.split_at_mut(1);
+            pump(&mut [Some(&mut a[0]), Some(&mut b[0])], 20);
+        }
+        // TWO freezes: polls nothing, sends nothing.
+        let mut two = ls.pop().unwrap();
+        let start = Instant::now();
+        let out = pump(&mut [Some(&mut ls[0])], 20);
+        assert!(start.elapsed() >= Duration::from_millis(300), "ONE waited");
+        assert_eq!(out[0].1, vec![1], "TWO banished");
+        assert!(ls[0].closed().is_none(), "ONE plays on");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while two.closed().is_none() {
+            assert!(Instant::now() < deadline);
+            two.poll();
+        }
+        assert!(
+            two.closed().unwrap().contains("no input"),
+            "{:?}",
+            two.closed()
+        );
     }
 
     /// The server stopping (the hosting app closed) ends the session for

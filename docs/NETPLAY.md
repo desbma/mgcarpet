@@ -39,9 +39,10 @@ the passphrase → the lobby (retail HSCREEN0 case 7, `lobby_mc2.rs`):
 In the game: Esc → exit leaves the game for everyone alike, the hosting
 player too — banished, back to the lobby, waiting for the game to finish.
 The server's verdict (one wizard standing) returns everyone to the lobby.
-Closing the hosting app with other players on its server warns first
-("N players still in this session - close again…"); the second close
-within 5 s stops the server.
+Closing the hosting app — or its player's Exit from the lobby — with
+other players on its server warns first ("N players still in this
+session - close/exit again…"); the second try within 5 s stops the
+server.
 The campaign steps aside for a lobby game (no campaign book — every seat
 gets the level's own — and no campaign progress or saves). Entries
 persist in `saves/netplay.json` (recent hosts, port, passphrase).
@@ -151,7 +152,7 @@ peer plays by them.
   assistant are preferences (player, 10-15); the table gets fine-tuned
   over time.
 - In play, a pinned option snaps back with a toast (keys), and its menu row
-  is locked "fixed by the host" — a preset row too when it would set a
+  is locked "fixed for this session" — a preset row too when it would set a
   pinned member (Controls: the flight models; Visuals: fog, tags, map aids).
 - A pinned value is never written to the player's `mgcarpet.json` (it is
   the host's, not his).
@@ -176,6 +177,14 @@ peer plays by them.
   server plays on). Only the SERVER stopping (`--serve` killed, the
   hosting app closed) ends netplay: a player whose server is gone goes on
   locally, the other carpets idle.
+- A FROZEN player (connected, silent: his app hung) is dropped once the
+  game has waited on him `FROZEN_AFTER` = 30 s — banished like a lost
+  connection, the rest play on (player 2026-10-17: slowdowns are
+  accepted, a frozen player is not). Only a player missing from the next
+  turn counts: the others, waiting on him, are silent too.
+- Game speed is a session pin (`sim`): everyone runs Normal, F3 snaps
+  back (a speed-up cannot outrun the lockstep; a slow-down would slow
+  every player).
 
 ## Evidence
 
@@ -582,3 +591,13 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
   `a_level_names_its_game`; 1,639 workspace tests, clippy clean. CLI: no
   `--game` → exit 2; MC2 level under `--game mc1` → refused; an MC1 joiner
   at an MC2 server → "this server runs Magic Carpet 2".
+- 2026-10-17 #27: (1) the hosting player's lobby EXIT warns like the close
+  (`App::hosted_end_confirmed`, shared). (2) A FROZEN player is dropped
+  after 30 s (`Server::drop_frozen`, `ServerOpts::frozen_after`); test
+  `a_frozen_player_is_dropped_after_the_timeout` (kill-switch proved: no
+  drop → stall). Its "missing from the next turn" clause is a guard the
+  test cannot tell apart (a waiting player always spoke after the one he
+  waits on) — kept, unproven. (3) Game speed was already pinned (F3 snaps
+  back); the messages no longer name a host ("fixed for this session").
+  Fixed a race in `play_waits_for_agreement…`. 1,640 workspace tests,
+  clippy clean.
