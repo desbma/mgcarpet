@@ -394,6 +394,21 @@ const LIFT_DRIFT_MC1: i16 = 8;
 /// lift only spares the pitch-and-fly micromanagement of reaching it.
 const LIFT_BAND_MC1: i16 = 1024;
 
+/// The spectator ghost (`Simulation::move_ghost`): top speed, tiles per
+/// second — twice the faithful cruise (player: faster than a carpet, to
+/// reach the fight).
+const GHOST_SPEED: f32 = 2.0 * FAITHFUL_CRUISE_TPS;
+/// The lift keys' vertical speed under ExtendedLift, as a share of
+/// [`GHOST_SPEED`].
+const GHOST_LIFT: f32 = 0.5;
+/// The share of the gap to the wanted velocity closed per tick.
+const GHOST_EASE: f32 = 0.15;
+/// How high above the ground a ghost may float, tiles (a live carpet's
+/// band is 4).
+const GHOST_CEILING: f32 = 12.0;
+/// The ghost rises this far off its corpse, tiles.
+const GHOST_RISE: f32 = 1.0;
+
 /// [`Simulation::state_sections`]' name for the world's folded digest
 /// (its own sections follow it).
 const WORLD_FOLD: &str = "world";
@@ -687,6 +702,11 @@ impl Simulation {
             })
     }
 
+    /// Every seat's flyer, seat order.
+    pub fn flyers(&self) -> Vec<Flyer> {
+        self.flyer.ixs().map(|hx| self.flyer[hx]).collect()
+    }
+
     /// Ground altitude in tile units at a world position (nearest tile;
     /// the engine interpolates across the tile's two triangles, which
     /// can wait until collision matters beyond a hover clamp).
@@ -880,6 +900,13 @@ impl Simulation {
             None => (false, false),
         };
         let mut input = *input;
+        // A risen ghost: the corpse hears nothing — the ghost flies on
+        // the seat's controls (below).
+        let ghost_input = input;
+        let ghost = self.world.as_ref().is_some_and(|w| w.risen(hx));
+        if ghost {
+            input = FlightInput::default();
+        }
         if falling || dead {
             // ⚠ ONLY THE COMMAND DIES. `sub_46840` is skipped from
             // state 2 on, but the STICK lives in the input pass and
@@ -926,7 +953,7 @@ impl Simulation {
         let classic_walk = self.thrust_model[hx] == ThrustModel::Mc1 && self.world.is_some();
         let enhanced_walk = self.thrust_model[hx] == ThrustModel::Enhanced && self.world.is_some();
         let walk = classic_walk || enhanced_walk;
-        if dead {
+        if dead && !ghost {
             self.flyer[hx].vx = 0.0;
             self.flyer[hx].vy = 0.0;
             self.flyer[hx].vz = 0.0;
@@ -1076,6 +1103,10 @@ impl Simulation {
             cheat: input.cheat,
         };
 
+        if ghost {
+            self.move_ghost(hx, &ghost_input);
+        }
+
         SeatPre {
             input: *input,
             falling,
@@ -1086,6 +1117,7 @@ impl Simulation {
             walk,
             pre_walk,
             pcmd,
+            ghost,
         }
     }
 
@@ -1127,7 +1159,7 @@ impl Simulation {
             .enumerate()
             .map(|(k, ((flyer, aim_lead), turn_rate))| {
                 let p = &pres[k];
-                (p.walk && p.enhanced_walk).then(|| EnhancedKernel {
+                (p.walk && p.enhanced_walk && !p.ghost).then(|| EnhancedKernel {
                     flyer,
                     aim_lead,
                     turn_rate,
@@ -1193,8 +1225,12 @@ impl Simulation {
             dead,
             walk_mc2,
             classic_walk,
+            ghost,
             ..
         } = *pre;
+        // A ghost's flyer is its own: the corpse's carpet never
+        // derives it.
+        let walked_prev = walked_prev.filter(|_| !ghost);
         if let Some(prev) = walked_prev
             && walk_mc2
         {
@@ -1468,6 +1504,91 @@ impl Simulation {
                 self.carpet[hx].tgt_speed = 0;
             }
         }
+        // The respawn key at a banished corpse raises the spectator
+        // ghost — after the turn, so the press that BANISHED the seat
+        // (its castle-less respawn request, `banish_instead`) raises it
+        // too: one Space.
+        if input.respawn
+            && !ghost
+            && let Some(w) = &mut self.world
+            && w.rise(hx)
+        {
+            let f = &mut self.flyer[hx];
+            f.y += GHOST_RISE;
+            f.vx = 0.0;
+            f.vy = 0.0;
+            f.vz = 0.0;
+            f.pitch = 0.0;
+            f.roll = 0.0;
+            self.turn_rate[hx] = 0.0;
+        }
+    }
+
+    /// The spectator ghost's flight (netplay, player ruling 2026-10-17):
+    /// free flight on the seat's own controls, faster than any carpet
+    /// and through every wall, kept above the ground and under
+    /// [`GHOST_CEILING`]. It flies by the ENHANCED CARPET'S OWN LAWS
+    /// (player 2026-10-17: the first cut's instant turn and speed-blind
+    /// bank felt wrong): chase-the-pointer steering on the deltas, the
+    /// [`enhanced_bank`] law (no bank standing still), and the altitude
+    /// split — under the faithful altitude model pitch climbs while
+    /// moving, under ExtendedLift pitch is pure look and the lift keys
+    /// own the vertical. The classic virtual stick steers too (a turn
+    /// rate and a pitch target, the stick's own sense). The world never
+    /// sees the flyer — only the drawing does.
+    fn move_ghost(&mut self, hx: Hx, input: &FlightInput) {
+        const RAD: f32 = std::f32::consts::TAU / 2048.0;
+        // Chase steering, as the enhanced kernel's.
+        self.aim_lead[hx] = (self.aim_lead[hx] + input.yaw_delta).clamp(-LEAD_MAX, LEAD_MAX);
+        let chase = if self.aim_lead[hx].abs() < 1e-4 {
+            self.aim_lead[hx]
+        } else {
+            (self.aim_lead[hx] * CHASE_GAIN * TICK_DT)
+                .clamp(-TURN_RATE_MAX * TICK_DT, TURN_RATE_MAX * TICK_DT)
+        };
+        self.aim_lead[hx] -= chase;
+        let stick_x = f32::from(input.stick_x.clamp(-127, 127)) / 127.0;
+        let turn = chase + stick_x * TURN_RATE_MAX * TICK_DT;
+        self.turn_rate[hx] = turn / TICK_DT;
+        let pitch_climbs = self.altitude_model[hx] == AltitudeModel::Faithful;
+        let f = &mut self.flyer[hx];
+        f.yaw = (f.yaw + turn).rem_euclid(std::f32::consts::TAU);
+        if input.stick_y != 0 {
+            // The classic stick's pitch: `-(2·stick_y)` angle units at
+            // rest (`sync_flyer_from_carpet`'s sense), eased in.
+            let target = -(2.0 * f32::from(input.stick_y.clamp(-127, 127))) * RAD;
+            f.pitch += (target - f.pitch) / 4.0;
+        }
+        f.pitch = (f.pitch + input.pitch_delta).clamp(-MAX_PITCH, MAX_PITCH);
+        let (sy, cy) = f.yaw.sin_cos();
+        let thrust = input.thrust.clamp(-1.0, 1.0);
+        let strafe = input.strafe.clamp(-1.0, 1.0);
+        let climb = if pitch_climbs {
+            f.pitch.sin() * thrust
+        } else {
+            input.lift.clamp(-1.0, 1.0) * GHOST_LIFT
+        };
+        let want = [
+            (sy * thrust + cy * strafe) * GHOST_SPEED,
+            climb * GHOST_SPEED,
+            (-cy * thrust + sy * strafe) * GHOST_SPEED,
+        ];
+        f.vx += (want[0] - f.vx) * GHOST_EASE;
+        f.vy += (want[1] - f.vy) * GHOST_EASE;
+        f.vz += (want[2] - f.vz) * GHOST_EASE;
+        f.x = (f.x + f.vx * TICK_DT).rem_euclid(MAP_TILES as f32);
+        f.z = (f.z + f.vz * TICK_DT).rem_euclid(MAP_TILES as f32);
+        f.y += f.vy * TICK_DT;
+        // The carpet's bank, its speed scaled to the carpet's range: a
+        // full-speed ghost banks as a carpet at full cruise does.
+        let fwd_sp = f.vx * sy - f.vz * cy;
+        f.roll = enhanced_bank(
+            self.turn_rate[hx],
+            fwd_sp * FAITHFUL_CRUISE_TPS / GHOST_SPEED,
+        );
+        let g = self.ground_height(self.flyer[hx].x, self.flyer[hx].z);
+        let f = &mut self.flyer[hx];
+        f.y = f.y.clamp(g + MIN_CLEARANCE, g + GHOST_CEILING);
     }
 
     /// The faithful MC1 mover (remc1 sub_455D0, ported in [`flight`])
@@ -1769,6 +1890,10 @@ struct SeatPre {
     walk: bool,
     pre_walk: flight::Mc1State,
     pcmd: world::PlayerCommand,
+    /// The seat is a risen spectator ghost: the world turns its corpse
+    /// as any banished one (no input reaches it), and the flyer is the
+    /// ghost's ([`Simulation::move_ghost`]) — never derived from it.
+    ghost: bool,
 }
 
 struct EnhancedKernel<'a> {

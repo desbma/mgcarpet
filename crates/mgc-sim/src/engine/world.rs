@@ -371,6 +371,13 @@ pub struct Player {
     /// game goes on without it (the port keeps the player's machine in
     /// the lockstep, watching, until the game ends).
     pub(crate) banished: bool,
+    /// The banished seat's player ROSE as a spectator ghost (Space at
+    /// his corpse — player ruling 2026-10-17): the corpse stays where it
+    /// fell, the world goes on treating the seat exactly as a banished
+    /// corpse, and the ghost is the flight tier's alone
+    /// (`Simulation::move_ghost`) — nothing in the world sees or
+    /// touches it. Network-only like `banished` (the resync tail).
+    pub(crate) risen: bool,
 }
 
 impl Default for Player {
@@ -410,6 +417,7 @@ impl Default for Player {
             lost: false,
             mc2_respawn_timer_reg: 0,
             banished: false,
+            risen: false,
         }
     }
 }
@@ -456,6 +464,7 @@ impl std::hash::Hash for Player {
             lost,
             mc2_respawn_timer_reg: mc2_respawn_timer,
             banished,
+            risen,
         } = self;
         (mana, mana_max, mana_delta, banked, world_mana, left, right).hash(h);
         (owned, shield, invisible, rebound, beyond_sight, heal_active).hash(h);
@@ -468,6 +477,11 @@ impl std::hash::Hash for Player {
         // Transparent at pristine: only a network game ever banishes.
         if *banished {
             banished.hash(h);
+        }
+        // TAG-ONLY, like the world's latches: only a banished seat
+        // rises.
+        if *risen {
+            h.write_u8(0x6E);
         }
         if *mc2_respawn_timer != 0 {
             mc2_respawn_timer.hash(h);
@@ -14582,6 +14596,23 @@ impl World {
         self.players[hx].banished
     }
 
+    /// A banished seat's player asks to rise as a spectator ghost (the
+    /// respawn key at his corpse): true when he rises now — banished,
+    /// lying dead, not risen yet. See [`Player::risen`].
+    pub fn rise(&mut self, hx: Hx) -> bool {
+        let p = &self.players[hx];
+        if !p.banished || p.risen || !self.player_dead(hx) {
+            return false;
+        }
+        self.players[hx].risen = true;
+        true
+    }
+
+    /// Has seat `hx` risen as a spectator ghost? (see [`Self::rise`])
+    pub fn risen(&self, hx: Hx) -> bool {
+        self.players[hx].risen
+    }
+
     /// The wizards still in a network game: the humans not banished and
     /// the rivals not eliminated — the app ends the game when one side
     /// alone stands (or no human does).
@@ -27477,8 +27508,9 @@ impl Snap for Player {
             mc2_respawn_timer_reg: mc2_respawn_timer,
             // Not in the save: only a network game banishes, and a
             // network game is never saved — its resync snapshot carries
-            // it (`net_snap_write`).
+            // it (`net_snap_write`) — the ghost's rise likewise.
             banished: _,
+            risen: _,
         } = self;
         w.put(mana);
         w.put(mana_max);
@@ -27550,6 +27582,7 @@ impl Snap for Player {
             lost: r.get()?,
             mc2_respawn_timer_reg: r.get()?,
             banished: false,
+            risen: false,
         })
     }
 }
@@ -27574,13 +27607,14 @@ impl World {
 
     /// What a network resync needs beyond the save's stream
     /// ([`crate::Simulation::net_snapshot`]): a resync is a CLONE of the
-    /// server's world, not a retail load. Each seat's banishment (only
-    /// a network game has it), and the pool's ranked recycle victims —
+    /// server's world, not a retail load. Each seat's banishment and
+    /// ghost (only a network game has them), and the pool's ranked recycle victims —
     /// retail's load empties that list (`Gen::snap_apply`), the server's
     /// world has not (proven by `mc1_a_forked_player_is_resynced`).
     pub(crate) fn net_snap_write(&self, w: &mut Writer) {
         for hx in self.players.ixs() {
             w.put(&self.players[hx].banished);
+            w.put(&self.players[hx].risen);
         }
         w.put(&self.g.mc2_recycle.stack);
     }
@@ -27588,6 +27622,7 @@ impl World {
     pub(crate) fn net_snap_apply(&mut self, r: &mut Reader) -> Result<(), SnapshotError> {
         for hx in self.players.ixs() {
             self.players[hx].banished = r.get()?;
+            self.players[hx].risen = r.get()?;
         }
         self.g.mc2_recycle.stack = r.get()?;
         Ok(())

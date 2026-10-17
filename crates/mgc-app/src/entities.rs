@@ -2107,6 +2107,30 @@ pub fn human_billboard(
     Some(b)
 }
 
+/// A netplay SPECTATOR GHOST: a banished player risen from his corpse
+/// (`World::risen`, player ruling 2026-10-17) — his seat's carpet art
+/// in its own colours, TRANSLUCENT (retail's ⅓-opaque raster mode, the
+/// smoke's), banking through its turns. Minted at draw time from his
+/// flyer like the `--thirdperson` subject: the world has no entity for
+/// him, which is what keeps him untouchable.
+pub fn spectator_billboard(
+    game: GameId,
+    row: u16,
+    x: f32,
+    alt: f32,
+    z: f32,
+    yaw: f32,
+    bank: f32,
+    sprite_dims: &impl Fn(u16) -> Option<(u16, u16, u16)>,
+) -> Option<Billboard> {
+    let mut b = instrument_billboard(game, row, x, alt, z, yaw, SPECTATOR_BLEND, sprite_dims)?;
+    b.roll = bank;
+    Some(b)
+}
+
+/// The spectator ghost's blend: retail mode 2, ⅓ opaque.
+const SPECTATOR_BLEND: u8 = 2;
+
 /// A billboard that belongs to the app, not to the world: no tile
 /// chain, no distance concealment, an explicit blend.
 fn instrument_billboard(

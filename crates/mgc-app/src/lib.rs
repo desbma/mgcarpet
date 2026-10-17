@@ -1935,6 +1935,33 @@ fn push_replay_instruments(
     }
 }
 
+/// Every OTHER seat's spectator ghost (netplay — a banished player
+/// risen from his corpse, `World::risen`): his seat's carpet art,
+/// translucent in its own colours, lerped from `prev` (seat order; empty
+/// = the tick's own pose) to the flyer. The local ghost is the camera.
+fn push_spectators(
+    out: &mut Vec<Billboard>,
+    sim: &Simulation,
+    prev: &[Flyer],
+    alpha: f32,
+    dims: &impl Fn(u16) -> Option<(u16, u16, u16)>,
+) {
+    let Some(w) = &sim.world else { return };
+    for hx in w.seat_ixs() {
+        if hx == local_hx() || !w.risen(hx) {
+            continue;
+        }
+        let now = sim.flyer[hx];
+        let was = prev.get(usize::from(hx.0)).unwrap_or(&now);
+        let (x, y, z, yaw) = interp_carpet(was, &now, alpha);
+        let row = w.human_carpet_row(hx);
+        if let Some(b) = entities::spectator_billboard(w.game(), row, x, y, z, yaw, now.roll, dims)
+        {
+            out.push(b);
+        }
+    }
+}
+
 /// `MGC_REPLAY_GHOST=1`: put the replay ghost back on screen — the
 /// recorded retail pose as a translucent carpet over the port's solid
 /// one, the A/B picture for a take that HAS diverged. Off by default
@@ -2204,6 +2231,10 @@ struct Session {
     level: LoadedLevel,
     sim: Simulation,
     prev_flyer: Flyer,
+    /// Every seat's flyer before the last tick (seat order) — the
+    /// other seats' spectator ghosts draw lerped over the same window
+    /// as the local camera (`push_spectators`).
+    prev_flyers: Vec<Flyer>,
     /// The last two sim-tick pose snapshots (smooth_motion): the
     /// renderer draws entities lerped prev→cur at the frame's
     /// accumulator fraction — the same one-tick-behind timeline the
@@ -2235,6 +2266,7 @@ impl Session {
     /// the payload, so they come back mutually consistent.
     fn reseed_after_restore(&mut self) {
         self.prev_flyer = self.sim.flyer[local_hx()];
+        self.prev_flyers = self.sim.flyers();
         self.pose_prev = Vec::new();
         self.pose_cur = Vec::new();
         self.fire_blasts.clear();
@@ -4829,6 +4861,7 @@ impl App {
             self.campaign.as_ref(),
         );
         let prev_flyer = sim.flyer[local_hx()];
+        let prev_flyers = sim.flyers();
         // A button held across the level change must not resume its
         // autofire chain in the new world.
         self.autofire.halt();
@@ -4837,6 +4870,7 @@ impl App {
             level,
             sim,
             prev_flyer,
+            prev_flyers,
             pose_prev: Vec::new(),
             pose_cur: Vec::new(),
             fire_blasts: entities::BlastLedger::default(),
@@ -4936,13 +4970,18 @@ impl App {
 
     /// The local wizard is falling or dead — retail's `life < 0`, the
     /// state in which it reads no gameplay input but the respawn key.
+    /// A risen spectator ghost is not down: it flies (the sim hears its
+    /// controls and nothing else).
     fn player_down(&self) -> bool {
         self.screen == Screen::Level
             && self
                 .session
                 .as_deref()
                 .and_then(|s| s.sim.world.as_ref())
-                .is_some_and(|w| w.player_falling(local_hx()) || w.player_dead(local_hx()))
+                .is_some_and(|w| {
+                    (w.player_falling(local_hx()) || w.player_dead(local_hx()))
+                        && !w.risen(local_hx())
+                })
     }
 
     /// While the wizard is down, the view is the main view and nothing
@@ -5279,6 +5318,7 @@ impl App {
             self.chase.bank_now(),
             &dims,
         );
+        push_spectators(&mut billboards, &sess.sim, &sess.prev_flyers, alpha, &dims);
         if let Some((portal, k)) = shrink {
             shrink_portal(&mut billboards, portal, k);
         }
@@ -5587,6 +5627,7 @@ impl App {
                     self.chase.bank_now(),
                     &dims,
                 );
+                push_spectators(&mut set, sim, &[], 1.0, &dims);
                 if let Some((portal, k)) = shrink {
                     shrink_portal(&mut set, portal, k);
                 }
@@ -7459,6 +7500,7 @@ impl App {
             {
                 let sess = sess!(self);
                 sess.prev_flyer = sess.sim.flyer[local_hx()];
+                sess.prev_flyers = sess.sim.flyers();
             }
             // Replay playback replaces the live input wholesale; when
             // the take ends, control hands back to the player.
@@ -8725,7 +8767,14 @@ impl App {
             }
             self.hovered = hovered;
             self.append_software_cursor(&mut quads);
-            let grey = death_greyscale(vitals.state, sess.sim.tick);
+            // A risen ghost watches in full colour (player ruling
+            // 2026-10-17); its corpse stays dead underneath.
+            let risen = sess.sim.world.as_ref().is_some_and(|w| w.risen(local_hx()));
+            let grey = if risen {
+                0.0
+            } else {
+                death_greyscale(vitals.state, sess.sim.tick)
+            };
             if let Some(r) = &mut self.renderer {
                 // Retail's black-and-white palette over the death fall
                 // and the corpse (`death_greyscale`).
@@ -13264,7 +13313,11 @@ impl App {
             self.won_handled = true;
             self.quit_fade = Some(-1.0);
         } else if banished && !self.won_handled && w.seat_ixs().count() > 1 {
-            w.notify_option("Banished - waiting for the game to end");
+            w.notify_option(if w.risen(local_hx()) {
+                "Spectating - waiting for the game to end"
+            } else {
+                "Banished - press Space to rise as a ghost"
+            });
         }
     }
 
@@ -14754,6 +14807,94 @@ mod net_lockstep_tests {
                 "{game}: never respawns"
             );
             assert_eq!(w.contenders(), (vec![Hx::FIRST], vec![]), "{game}");
+        }
+    }
+
+    /// ⭐ THE SPECTATOR GHOST (player ruling 2026-10-17): ONE Space at a
+    /// castle-less corpse banishes the seat AND raises its ghost. The
+    /// ghost flies on the seat's controls, faster than a carpet; the
+    /// corpse stays where it fell, dead, and the seat contends no more.
+    /// Two builds stepping the same inputs agree tick for tick, and a
+    /// resync snapshot carries the ghost (its rise and its flight).
+    #[test]
+    fn a_banished_player_rises_as_a_ghost() {
+        use mgc_sim::engine::world::LifeState;
+        for game in ["mc2", "mc1"] {
+            let (Some(mut a), Some(mut b)) =
+                (net_sim(game, 50, &[0, 1], 0), net_sim(game, 50, &[0, 1], 0))
+            else {
+                eprintln!("skipping: no baked {game} arena");
+                return;
+            };
+            let step = |sim: &mut Simulation, seat1: FlightInput| {
+                sim.step_seats(&[FlightInput::default(), seat1]);
+            };
+            for sim in [&mut a, &mut b] {
+                sim.world.as_mut().unwrap().debug_kill_player(Hx(1));
+            }
+            let mut t = 0;
+            while a.world.as_ref().unwrap().vitals(Hx(1)).state != LifeState::Dead {
+                step(&mut a, FlightInput::default());
+                step(&mut b, FlightInput::default());
+                t += 1;
+                assert!(t < 3000, "{game}: seat 2 never came to rest dead");
+            }
+            let c = a.carpet[Hx(1)];
+            let corpse = (c.x, c.y);
+            let space = FlightInput {
+                respawn: true,
+                ..FlightInput::default()
+            };
+            step(&mut a, space);
+            step(&mut b, space);
+            let w = a.world.as_ref().unwrap();
+            assert!(w.banished(Hx(1)) && w.risen(Hx(1)), "{game}: one Space");
+            // Standing still, turning hard both ways: the carpet's bank
+            // law — none without speed (player-reported 2026-10-17: the
+            // first cut banked to the clamp on the spot).
+            for t in 0..48 {
+                let turn = FlightInput {
+                    yaw_delta: if t < 24 { 0.3 } else { -0.3 },
+                    ..FlightInput::default()
+                };
+                step(&mut a, turn);
+                step(&mut b, turn);
+                let roll = a.flyer[Hx(1)].roll;
+                assert!(roll.abs() < 0.01, "{game}: banks {roll} standing still");
+            }
+            let from = a.flyer[Hx(1)];
+            // Forward, turning a little, climbing a little: 10 s.
+            let fly = FlightInput {
+                thrust: 1.0,
+                yaw_delta: 0.01,
+                pitch_delta: 0.002,
+                fire_left: true,
+                ..FlightInput::default()
+            };
+            for t in 0..240 {
+                step(&mut a, fly);
+                step(&mut b, fly);
+                assert_eq!(a.state_hash(), b.state_hash(), "{game}: tick {t}");
+                if t == 120 {
+                    b.net_restore(&a.net_snapshot()).unwrap();
+                    assert!(b.world.as_ref().unwrap().risen(Hx(1)));
+                }
+            }
+            let to = a.flyer[Hx(1)];
+            // At full speed it banks as a carpet at full cruise does.
+            let cruise = mgc_sim::enhanced_bank(2.4, 7.5);
+            assert!(to.roll.abs() <= cruise + 1e-3, "{game}: banks {}", to.roll);
+            let (dx, dz) = (to.x - from.x, to.z - from.z);
+            let dist = (dx * dx + dz * dz).sqrt();
+            // 10 s at twice the carpet's 7.5 tiles/s, less the turn's
+            // chord and the ease-in.
+            assert!(dist > 60.0, "{game}: the ghost flew {dist} tiles");
+            let w = a.world.as_ref().unwrap();
+            let c = a.carpet[Hx(1)];
+            // (Its height settles on its own, risen or not.)
+            assert_eq!((c.x, c.y), corpse, "{game}: the corpse lies still");
+            assert_eq!(w.vitals(Hx(1)).state, LifeState::Dead, "{game}");
+            assert_eq!(w.contenders().0, vec![Hx::FIRST], "{game}");
         }
     }
 

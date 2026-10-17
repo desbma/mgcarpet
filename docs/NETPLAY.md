@@ -292,7 +292,7 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
    (`sin_cos`/`sin` in the enhanced mover, `hypot` in world.rs) + a
    guard against new platform-math calls; cross-platform FP is the one
    known source of an honest fork.
-5. Later: 🏦 **spectator ghosts** (player idea, 10-15, banked — "a cherry
+5. ✅ **Spectator ghosts** LANDED 2026-10-17 (log #29). Was: (player idea, 10-15, banked — "a cherry
    on top"): a BANISHED player rises from his last corpse as a visible
    in-game ghost (mostly translucent, greyscale or another filter), flies
    freely and watches the rest of the battle, but can neither touch nor be
@@ -657,3 +657,44 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
   `ServerWorld`: a player banishes his own seat alone at tick 300 →
   DESYNC at 312 → resynced at 315, report `player[1]`, identical after).
   ⏭ playtest (nothing should change: a healthy session never resyncs).
+- 2026-10-17 #29: ✅ **SPECTATOR GHOSTS** — ⚖ rulings (player): others
+  see the ghost TRANSLUCENT IN ITS SEAT'S OWN COLOURS; its own view is
+  FULL COLOUR, NO HUD, the line "Spectating - waiting for the game to
+  end"; it flies THROUGH WALLS and FASTER than a carpet; it rises on
+  SPACE at the corpse. ⚖ libm DEFERRED until a maths fork is actually
+  seen (the resync heals it, the report names it).
+  Design: the ghost is NOT in the world. `Player::risen` (hashed
+  tag-only 0x6E, resync tail) marks the seat; the world goes on turning
+  its corpse exactly as any banished one (no input reaches it — a
+  control corpse settles identically), so nothing can see or touch the
+  ghost by construction. The flight tier flies the seat's flyer with
+  `Simulation::move_ghost` (either control scheme; 2× the faithful
+  cruise; ground clearance to 12 tiles; no wall gate at all) and never
+  derives it from the corpse (`SeatPre::ghost`). ONE Space: the rise is
+  checked after the turn, so the press that banishes also raises
+  (`World::rise`). Drawing: `push_spectators` (both draw arms) mints
+  each OTHER risen seat's carpet art at its lerped flyer
+  (`Session::prev_flyers`), `entities::spectator_billboard`, retail
+  blend mode 2 (⅓ opaque — the knob is `SPECTATOR_BLEND`); the local
+  ghost is the camera. App: a risen seat is not `player_down` (full
+  controls; the sim drops its casts), greyscale off, HUD still cleared
+  (its corpse is Dead), toast line as above. Test
+  `a_banished_player_rises_as_a_ghost` (MC1 + MC2: one Space → banished
+  + risen; 10 s forward flight > 60 tiles; corpse x/y unmoved and Dead;
+  not a contender; two builds hash-identical every tick; a resync at
+  t=120 carries the ghost). 1,646 workspace tests, clippy clean.
+  ⏭ playtest (feel: speed/ease/ceiling knobs `GHOST_*` in mgc-sim
+  lib.rs; the ⅓ alpha at distance).
+- 2026-10-17 #30 (ghost playtest, MC2, enhanced thrust + altitude): the
+  ghost banked to the clamp while turning on the spot. The first cut's
+  mover had its own laws — a speed-blind bank, an instant turn, pitch
+  always climbing. `move_ghost` now flies by the ENHANCED CARPET'S laws:
+  chase-the-pointer steering (`aim_lead`, `CHASE_GAIN`, the turn-rate
+  cap), `enhanced_bank` on the forward speed scaled to the carpet's
+  range (a full-speed ghost banks like a carpet at full cruise; none
+  standing still), and the altitude split (faithful: pitch climbs while
+  moving; ExtendedLift: pitch is pure look, Q/E own the vertical at
+  `GHOST_LIFT` × speed). The ghost test turns hard on the spot (|roll| <
+  0.01) and caps the flying bank; kill-switch proved (the old law:
+  "banks -0.375 standing still"). 1,646 workspace tests, clippy clean.
+  ⏭ re-playtest.

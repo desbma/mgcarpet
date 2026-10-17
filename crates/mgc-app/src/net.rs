@@ -1996,7 +1996,8 @@ mod tests {
         assert!(told[1].1.contains("resynced from the server"), "{told:?}");
         assert!(told[1].1.contains("the counter"), "{told:?}");
         assert_eq!(ls[0].desyncs(), (1, 1));
-        assert_eq!(worlds[0], worlds[1], "healed");
+        // (One peer may have stepped a tick further.)
+        assert_eq!(worlds[0] - stepped[0], worlds[1] - stepped[1], "healed");
         assert_eq!(ls[1].desyncs(), (0, 0));
         assert!(ls[0].agreed >= 3, "the checks go on after the resync");
     }
