@@ -14921,6 +14921,45 @@ mod net_lockstep_tests {
         }
     }
 
+    /// ⭐ THE ARENA EXIT OPENS FOR THE LAST WIZARD STANDING (retail: MP
+    /// installs one type-8 "kill all wizards" row per player, and the
+    /// arenas' level-end release `(11,4)` spawns the exit pair once a
+    /// player's row completes). With every human standing there is no
+    /// exit and no completion (player-reported 2026-10-17: it opened on
+    /// the first tick, for seat 0); once seat 0 falls castle-less, SEAT
+    /// 1's row completes and the exit opens.
+    #[test]
+    fn an_mc2_arena_exit_opens_for_the_last_wizard_standing() {
+        for arena in [51, 59] {
+            let Some(mut sim) = net_sim("mc2", arena, &[0, 1], 0) else {
+                eprintln!("skipping: no baked mc2 arena {arena}");
+                return;
+            };
+            let idle = [FlightInput::default(); 2];
+            for _ in 0..96 {
+                sim.step_seats(&idle);
+            }
+            let w = sim.world.as_ref().unwrap();
+            assert_eq!(
+                w.debug_exit_trips(),
+                0,
+                "arena {arena}: an exit while both stand"
+            );
+            assert!(
+                !w.completed(Hx::FIRST) && !w.completed(Hx(1)),
+                "arena {arena}"
+            );
+            sim.world.as_mut().unwrap().debug_kill_player(Hx::FIRST);
+            for _ in 0..96 {
+                sim.step_seats(&idle);
+            }
+            let w = sim.world.as_ref().unwrap();
+            assert!(w.completed(Hx(1)), "arena {arena}: the survivor's row");
+            assert!(!w.completed(Hx::FIRST), "arena {arena}");
+            assert_eq!(w.debug_exit_trips(), 1, "arena {arena}: the exit opens");
+        }
+    }
+
     #[test]
     fn four_mc2_peers_stay_identical() {
         n_peers_stay_identical("mc2", 50, 4, 0);

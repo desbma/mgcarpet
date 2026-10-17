@@ -12748,8 +12748,17 @@ impl World {
         // (`sub_415C0`, a different frame).
         if matches!(self.g.verbs.objective, ObjectiveVerb::Mc2) {
             // The stage engine is the world's: it runs ONCE, on the
-            // local player's completion latch.
-            self.objective_mc2(self.local_seat());
+            // local player's completion latch. A NETWORK world runs it
+            // for every seat (retail's `sub_58F00` loops
+            // `NumberOfPlayers`, each player's own latch): the arenas'
+            // last-standing row completes for the WINNER, whoever he is.
+            if self.players.len() > 1 {
+                for hx in self.players.ixs() {
+                    self.objective_mc2(hx);
+                }
+            } else {
+                self.objective_mc2(self.local_seat());
+            }
             // The objective-message presenter runs right after the
             // stage engine every tick (EF:31817-31818).
             self.speech_ramp_mc2();
@@ -20530,6 +20539,18 @@ impl World {
     /// Test hook: zero the grace and hand the player a lethal hit
     /// from nothing (killer 0 — no death-camera target).
     #[doc(hidden)]
+    /// Test hook: the live level-exit trips — MC2's `(11,12)` X and
+    /// `(11,31)` mouth switches.
+    #[doc(hidden)]
+    pub fn debug_exit_trips(&self) -> usize {
+        self.g
+            .ent
+            .iter()
+            .skip(1)
+            .filter(|e| e.class64 == 11 && matches!(e.model65, 12 | 31) && e.flags & 0x400 == 0)
+            .count()
+    }
+
     /// Test hook: a bare castle record for seat `hx` (class 3 model 2,
     /// his tag, the MC1 bound register) in a free pool slot, on no
     /// chain — enough for every "has he a castle" question
@@ -22266,7 +22287,23 @@ impl World {
                 }
                 // Kill ALL players (:40835-50): every other color's
                 // alive-flag clear. Current stage only.
-                8 => idx == self.mc2_stage_current && self.mc2_rivals.iter().all(|r| r.eliminated),
+                // Kill all wizards (EF:41110-22): every OTHER wizard is
+                // out — the rivals, and in a network game the other
+                // humans (retail has no AI wizards there: its MP rows
+                // test the players' in-game flag). Single player has
+                // no other seat. Without the human half every lobby
+                // arena (one type-8 row each) completed for seat 0 on
+                // its first tick and the level-end release opened the
+                // exit (player-reported 2026-10-17).
+                8 => {
+                    idx == self.mc2_stage_current
+                        && self.mc2_rivals.iter().all(|r| r.eliminated)
+                        && self
+                            .players
+                            .ixs()
+                            .filter(|&o| o != hx)
+                            .all(|o| self.banished(o) || self.doomed(o))
+                }
                 // DESTROY BUILDING (:40851-75): no live class-10
                 // model-45 building whose `byte_0x46_70` (= our `f71`,
                 // the par1 the ctor stamped) is in the target's

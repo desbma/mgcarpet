@@ -711,3 +711,28 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
   any Space; a castled one (`debug_plant_castle`) still contends, no
   verdict. Both halves kill-switch proved. 1,646 workspace tests, clippy
   clean.
+- 2026-10-17 #32 (playtest, MC2 lobby arena 59 = "level 60"): the exit
+  opened on the first tick and its trip flew SEAT 0's carpet. Retail
+  (research + binary): MP discards the level's objective rows and
+  installs ONE type-8 "kill all wizards" row per player (`InitStages_58940`
+  0x7D19A `test $0x10,%ah`; `sub_58F00` loops `NumberOfPlayers`, the
+  row completes when no OTHER player's in-game flag stands — ⚖ player:
+  retail MP has no AI wizards, so the row means the other HUMANS). The
+  arenas (all but 54) gate their exit pair `(11,12)`+`(14,3)` on the
+  model-4 LEVEL-END RELEASE `(11,4)` (`AddSwitch0B_04_6F150`: fires when
+  a player's `IsLevelEnd_0` latches) — so the exit appears only for the
+  last wizard standing. Touching it in retail ends the level for EVERY
+  peer as "won" (the endGameSeq's level-state writes index the LOCAL
+  slot) — a retail quirk. Port bugs fixed: type 8 ignored the other
+  humans (vacuously true with no AI) and the stage engine ran for seat 0
+  only. Now: type 8 also needs every other human seat out (banished or
+  doomed), and a network world runs `objective_mc2` for EVERY seat
+  (single player unchanged). Test
+  `an_mc2_arena_exit_opens_for_the_last_wizard_standing` (arenas 51/59:
+  no exit and no completion while both stand; seat 0 falls castle-less
+  → seat 1 completes, the exit opens); both halves kill-switch proved.
+  ⚠ Still seat-0-keyed: `mc2_end_pending` (the trip installs the ending
+  on the first seat to dispatch) — moot while the server's verdict ends
+  the game on the same tick the exit opens. ⚠ The agent's first read
+  called `(11,4)` a creature count — wrong: that is `sub_6F300(a,4)` =
+  model 17. 1,647 workspace tests, clippy clean.
