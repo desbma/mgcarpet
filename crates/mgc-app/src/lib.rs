@@ -5100,7 +5100,8 @@ impl App {
         // the SELECTOR LAYOUT, per game law (player ruling
         // 2026-07-24): retail MC1's map replaces flight input with
         // the ball+arrow cursor for BOOK spell-picking, so a map
-        // carrying the book (`map_book`) suspends; retail MC2's map
+        // carrying the book (`map_book`) suspends (steering only since
+        // 2026-10-17 — see `book_map` below); retail MC2's map
         // keeps NORMAL CONTROLS live — you fly HUD-less (keyboard
         // only here: mouse-look is grab-gated and the map frees the
         // pointer for the CTRL pane/roster). An MC1 run with the
@@ -5114,17 +5115,27 @@ impl App {
         //
         // The netplay menu holds the carpet in an idle hover: no
         // movement read (as the dialog), and the speed stopped too.
+        //
+        // DEVIATION (player ruling 2026-10-17, no toggle): the BOOK map
+        // suspends only STEERING — the mouse is the spell picker there,
+        // and the turn/pitch keys go with it — while the movement keys
+        // (thrust, strafe, lift) stay live. Retail's map kept the speed
+        // target and flew on; under the enhanced thrust model a zeroed
+        // thrust key is a stop, so suspending it froze the carpet for
+        // every spell pick. The dialogs still suspend everything.
         let net_menu = self.net_menu();
-        let book = (self.book_open() && self.selector.map_book) || self.exit_confirm || net_menu;
+        let book_map = self.book_open() && self.selector.map_book;
+        let suspended = self.exit_confirm || net_menu;
+        let book = book_map || suspended;
         let mc1 = self.cfg.controls.models.thrust == config::ThrustModel::Classic;
         // MC2's barrel roll: both strafe keys down this tick with
         // NEITHER down the last — retail's edge detect against the
         // prev-frame strafe byte (PlayerInput.cpp:2088-97; you must
         // press both from neutral, and holding one and tapping the
         // other does nothing). The sim's flight-verb gate makes the
-        // command MC2-only; the book map swallows it with the rest of
-        // the movement input.
-        let strafes = (k.left && !book, k.right && !book);
+        // command MC2-only; the dialogs swallow it with the rest of
+        // the movement input (the book map keeps it, like the keys).
+        let strafes = (k.left && !suspended, k.right && !suspended);
         // `controls.preferences.disable_barrel_roll` drops the trigger
         // here; the edge state still tracks, so re-enabling mid-hold
         // does not fire a roll.
@@ -5247,10 +5258,14 @@ impl App {
             // (:20635-:20744 never reach the mouse read or command 6)
             // — the steering filters decay to center while the speed
             // target persists (the "map fixes your orientation, not
-            // your velocity" behavior).
-            input.thrust = 0.0;
-            input.strafe = 0.0;
-            input.lift = 0.0;
+            // your velocity" behavior). The book map keeps the
+            // movement keys (see `book_map` above); steering goes in
+            // both.
+            if suspended {
+                input.thrust = 0.0;
+                input.strafe = 0.0;
+                input.lift = 0.0;
+            }
             input.stick_x = 0;
             input.stick_y = 0;
             input.yaw_delta = 0.0;
