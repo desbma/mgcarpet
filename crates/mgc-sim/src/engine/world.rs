@@ -17110,7 +17110,12 @@ impl World {
     /// (hp_frac = actLife/maxLife, cargo_frac = stored/capacity), both
     /// clamped to [0,1]. No castle → no roster (the marble [54] case,
     /// :27281).
-    fn player_balloons(&self, castle: Option<usize>) -> Vec<Option<(f32, f32)>> {
+    /// Seat `hx`'s OWN balloons (owner tag = his carpet): with several
+    /// humans, any human's tag let the HUD show whichever player's
+    /// balloons came first in the pool — crossed between the players,
+    /// and swapping as balloons died and re-deployed (player-reported
+    /// 2026-10-17).
+    fn player_balloons(&self, hx: Hx, castle: Option<usize>) -> Vec<Option<(f32, f32)>> {
         let level = match castle {
             Some(c) => self.g.ent[c].f26.clamp(0, 255),
             None => return Vec::new(),
@@ -17130,7 +17135,7 @@ impl World {
             let e = &self.g.ent[j];
             if e.class64 == 3
                 && e.model65 == 3
-                && self.g.is_human_tag(e.id24)
+                && self.g.hx_of_tag(e.id24) == Some(hx)
                 && e.flags & 0x400 == 0
             {
                 let hp = e.act_life.max(0) as f32 / (e.max_life.max(1) as f32);
@@ -19907,7 +19912,7 @@ impl World {
                     e.f26.clamp(0, 255) as u8,
                 )
             }),
-            balloons: self.player_balloons(castle_slot),
+            balloons: self.player_balloons(hx, castle_slot),
             castle_hp: castle_slot.map(|c| {
                 let e = &self.g.ent[c];
                 (e.act_life.max(0), e.max_life.max(1))
@@ -20827,10 +20832,10 @@ impl World {
     }
 
     /// The census mana riding decaying spheres (flag 0x2000) — the
-    /// world's share and the player's: `(all, player-owned)`. Counted
+    /// world's share and seat `hx`'s: `(all, player-owned)`. Counted
     /// over exactly the census's sphere arm (`recompute_mana`: live
     /// (10,39), owner from `+144`).
-    fn temporary_sphere_mana(&self) -> (u32, u32) {
+    fn temporary_sphere_mana(&self, hx: Hx) -> (u32, u32) {
         let (mut all, mut owned) = (0u32, 0u32);
         for e in self.g.ent.iter().skip(1) {
             let temporary = e.flags & 0x2000 != 0 && e.flags & 0x400 == 0;
@@ -20839,7 +20844,7 @@ impl World {
             }
             let m = e.f140.max(0) as u32;
             all = all.saturating_add(m);
-            if self.g.is_human_tag(e.f144) {
+            if self.g.hx_of_tag(e.f144) == Some(hx) {
                 owned = owned.saturating_add(m);
             }
         }
@@ -20886,7 +20891,7 @@ impl World {
         // final level could never read 100 %), so the enhanced rows
         // leave them out of the world total and the owned share alike.
         let seed = if mc2 { 1 } else { WIZARD_BASE_MANA };
-        let (temporary, temporary_owned) = self.temporary_sphere_mana();
+        let (temporary, temporary_owned) = self.temporary_sphere_mana(hx);
         s.mana_world = self
             .world_mana
             .saturating_sub(seed)
@@ -43447,6 +43452,33 @@ mod tests {
         assert_eq!(run(), run());
     }
 
+    /// Each seat's HUD shows HIS balloons only (player 2026-10-17: the
+    /// two players saw each other's, crossing as balloons re-deployed).
+    /// The other seat's balloon comes FIRST in the pool — the shape
+    /// that crossed them.
+    #[test]
+    fn each_seat_sees_only_its_own_balloons() {
+        let mut w = flat_world();
+        let h1 = w.push_seat(5);
+        w.g.human_tag[h1].0 = 9;
+        for (castle, hx, reg) in [(1usize, Hx::FIRST, 0usize), (2, h1, 5)] {
+            let tag = w.g.human_tag[hx].0;
+            let e = &mut w.g.ent[castle];
+            (e.class64, e.model65, e.id24, e.flags, e.f26) = (3, 2, tag, 0, 1);
+            w.g.castle_reg[reg] = castle as u16;
+        }
+        // Seat 1's balloon first, then seat 0's: hurt and laden apart.
+        for (slot, hx, life) in [(3usize, h1, 25), (4, Hx::FIRST, 100)] {
+            let tag = w.g.human_tag[hx].0;
+            let e = &mut w.g.ent[slot];
+            (e.class64, e.model65, e.id24, e.flags) = (3, 3, tag, 0);
+            (e.max_life, e.act_life, e.f136, e.f140) = (100, life, 100, 0);
+        }
+        let hp = |w: &World, hx| w.loadout(hx).balloons[0].expect("a live balloon").0;
+        assert!((hp(&w, Hx::FIRST) - 1.0).abs() < 1e-3, "seat 0 reads its own");
+        assert!((hp(&w, h1) - 0.25).abs() < 1e-3, "seat 1 reads its own");
+    }
+
     #[test]
     fn loadout_surfaces_the_balloon_roster_by_castle_level() {
         // The HUD balloon panel (sub_22E50 slot B): the roster size is
@@ -47330,7 +47362,7 @@ mod tests {
 
         // Expired (0x400) spheres were never in the census at all.
         w.g.ent[rain].flags |= 0x400;
-        assert_eq!(w.temporary_sphere_mana(), (200, 200));
+        assert_eq!(w.temporary_sphere_mana(Hx::FIRST), (200, 200));
     }
 
     fn mc2_thing(slot: u32, class: u16, model: u16, x: u16, y: u16, dis_id: u16) -> Thing {

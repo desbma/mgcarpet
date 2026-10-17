@@ -367,3 +367,11 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
   broadcast death line). 1,624 workspace tests, 633/633 fixtures, clippy
   clean. Xvfb: B leaves → host "BRAN has been banished from the realm.",
   "ARIEL is victorious!", fade to the lobby (Ariel alone, rules kept).
+- 2026-10-17 #16: **CROSSED BALLOON HUD** (player-reported: a player saw the
+  other's balloon damage/cargo, swapping after a redeploy). `World::
+  player_balloons` took the first balloons owned by ANY human
+  (`is_human_tag`) — pool order decided whose. Now seat-scoped
+  (`hx_of_tag(id) == Some(hx)`); the stats screen's temporary-sphere share
+  (`temporary_sphere_mana`) had the same any-human read and is scoped too.
+  Test `each_seat_sees_only_its_own_balloons` (kill-switch proved); 1,625
+  tests, 633/633 fixtures, clippy clean.
