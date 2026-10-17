@@ -479,6 +479,11 @@ pub struct MapIcons {
     /// [`Self::jar_icons`]. Player ask 2026-09-07: even the faithful
     /// magenta dot is lost in a sea of dwelling flags.
     pub grave_icons: std::collections::HashMap<u16, mgc_render::MapStamp>,
+    /// Icon-swap stamp for the (10,34) teleporter pad — its own gate
+    /// sprite (MC1 286, MC2 168), keyed like [`Self::jar_icons`].
+    /// Player ask 2026-10-17: the retail 2x2 magenta block said
+    /// nothing about what it was.
+    pub portal_icons: std::collections::HashMap<u16, mgc_render::MapStamp>,
     /// The messaging font as map stamps, indexed by ASCII byte:
     /// (white-masked glyph, advance in source px) — the Beyond-Sight
     /// rival NAME labels (`rival_reveals`). Empty on an atlas without
@@ -498,16 +503,20 @@ pub struct MapIcons {
 /// (10,40) wizard grave, both games — the corpse you possess to
 /// reclaim a dead wizard's mana wears its own bones sprite instead
 /// of a dot indistinguishable from the dwelling flags around it.
+/// Added 2026-10-17 (player ask): the (10,34) teleporter pad, both
+/// games — its gate sprite instead of the 2x2 magenta block.
 pub enum SwapFamily {
     Jar,
     Static,
     Grave,
+    Portal,
 }
 
 pub fn icon_swap_family(game: GameId, class: u8, model: u8) -> Option<SwapFamily> {
     match (game, class, model) {
         (_, 12 | 15, _) => Some(SwapFamily::Jar),
         (_, 10, 40) => Some(SwapFamily::Grave),
+        (_, 10, 34) => Some(SwapFamily::Portal),
         (GameId::Mc2, 2, 1 | 2) => Some(SwapFamily::Static),
         (GameId::Mc1 | GameId::Mc1Hw, 2, 1..=3) => Some(SwapFamily::Static),
         _ => None,
@@ -994,6 +1003,7 @@ pub fn map_stamps_from_poses(
             (12 | 15, _) if marker_icons => icons.jar_icons.get(&p.type_index),
             (2, _) if marker_icons => icons.static_icons.get(&p.type_index),
             (10, 40) if marker_icons => icons.grave_icons.get(&p.type_index),
+            (10, 34) if marker_icons => icons.portal_icons.get(&p.type_index),
             // (MC2 exit X/O markers are NOT pose-driven — hidden
             // markers must plot too; see `exit_marker_stamps`.)
             _ => None,
@@ -3168,6 +3178,7 @@ mod tests {
         let pal = [[0u8; 4]; 256];
         let mut swapped = std::collections::HashSet::new();
         swapped.insert(42u16);
+        swapped.insert(223u16); // the teleporter pad, below
         let dots = |game, p: LivePose| {
             map_dots_from_poses(game, &[p], &pal, None, false, Mc2MapEnv::Day, 0, &swapped)
         };
@@ -3230,6 +3241,20 @@ mod tests {
             Some(SwapFamily::Grave)
         ));
         assert!(icon_swap_family(GameId::Mc2, 10, 39).is_none());
+        // The teleporter pad: its own table and family, both games,
+        // and its 2x2 dot leaves both walks once swapped.
+        icons.portal_icons.insert(223, mini);
+        for game in [GameId::Mc1, GameId::Mc2] {
+            let s = map_stamps_from_poses(game, &[pose(10, 34, false, 223)], &icons, false, false, true);
+            assert_eq!(s.len(), 1);
+            assert_eq!(s[0].uv, mini.uv);
+            assert!(matches!(
+                icon_swap_family(game, 10, 34),
+                Some(SwapFamily::Portal)
+            ));
+        }
+        assert!(dots(GameId::Mc1, pose(10, 34, false, 223)).is_empty());
+        assert!(dots(GameId::Mc2, pose(10, 34, false, 223)).is_empty());
     }
 
     /// Stamp compositing (player ask 2026-09-11): a spell jar walked

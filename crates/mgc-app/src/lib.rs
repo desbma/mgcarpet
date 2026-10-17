@@ -945,6 +945,7 @@ fn capture_marker_icons(
             Some(entities::SwapFamily::Jar) => &mut level.map_icons.jar_icons,
             Some(entities::SwapFamily::Static) => &mut level.map_icons.static_icons,
             Some(entities::SwapFamily::Grave) => &mut level.map_icons.grave_icons,
+            Some(entities::SwapFamily::Portal) => &mut level.map_icons.portal_icons,
             None => continue,
         };
         if bucket.contains_key(&p.type_index) {
@@ -959,9 +960,16 @@ fn capture_marker_icons(
         // these stones "dolmens"; the code and the decompile call (2,2)
         // — the regen SHRINE (`AddDolmen_4ADF0`) — the dolmen, and
         // (2,1) the stone (`AddStone_4AD70`). The shrine keeps the
-        // full rule.
-        let half = (p.class, p.model) == (2, 1);
-        if let Some(stamp) = ui.append_world_icon(sidx, spx, sprite, &level.palette_rgba, half) {
+        // full rule. On top of that, the stones and MC1's statues
+        // (models 1/3) shrink by `STONE_STATUE_SHRINK` (player ask
+        // 2026-10-17: "20-30%" smaller); the shrine stays as it was.
+        const STONE_STATUE_SHRINK: f32 = 0.75;
+        let scale = match (p.class, p.model) {
+            (2, 1) => 0.5 * STONE_STATUE_SHRINK,
+            (2, 3) => STONE_STATUE_SHRINK,
+            _ => 1.0,
+        };
+        if let Some(stamp) = ui.append_world_icon(sidx, spx, sprite, &level.palette_rgba, scale) {
             bucket.insert(p.type_index, stamp);
             grew = true;
         }
@@ -981,6 +989,7 @@ fn dot_swap_set(level: &LoadedLevel, cfg: &config::Config) -> std::collections::
     }
     set.extend(level.map_icons.static_icons.keys().copied());
     set.extend(level.map_icons.grave_icons.keys().copied());
+    set.extend(level.map_icons.portal_icons.keys().copied());
     if !cfg.render.enhancement.expose_jar_spells {
         set.extend(level.map_icons.jar_icons.keys().copied());
     }
@@ -1866,6 +1875,7 @@ fn load_level_with(
             jar_icons: Default::default(),
             static_icons: Default::default(),
             grave_icons: Default::default(),
+            portal_icons: Default::default(),
         },
         map_stamps: Vec::new(),
         objective_marks: Vec::new(),

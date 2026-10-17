@@ -705,7 +705,7 @@ impl UiAssets {
         pixels: &[u8],
         sprite: u16,
         palette: &[[u8; 4]; 256],
-        half: bool,
+        scale: f32,
     ) -> Option<mgc_render::MapStamp> {
         let e = index.sprites.get(sprite as usize)?;
         let f = e.frames.first()?;
@@ -745,11 +745,13 @@ impl UiAssets {
         // halo the dots read right at marker scale 1 and these
         // miniatures were the one family left too small — "2x their
         // current size at 1x". The halo itself stays one static pixel.
-        // `half` keeps a family at the 2026-08-07 size: the standing
-        // stones (2,1), which come in circles and clusters and
-        // dominated the view at the full rule (player ruling
-        // 2026-09-09; the player's word for them is "dolmen").
-        let scale = (12.0 / sw.max(sh) as f32).min(1.0) * if half { 0.5 } else { 1.0 };
+        // `scale` sizes a family against that rule (1.0 = the rule):
+        // the caller halves the standing stones (2,1), which come in
+        // circles and clusters and dominated the view at the full rule
+        // (player ruling 2026-09-09; the player's word for them is
+        // "dolmen"), and shrinks stones and statues a further 25%
+        // (player ask 2026-10-17).
+        let scale = (12.0 / sw.max(sh) as f32).min(1.0) * scale;
         sw = ((sw as f32 * scale) as u32).max(1);
         sh = ((sh as f32 * scale) as u32).max(1);
         let mut stamp = mgc_render::MapStamp::new(

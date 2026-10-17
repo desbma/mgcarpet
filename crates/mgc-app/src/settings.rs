@@ -1355,8 +1355,9 @@ pub fn registry() -> Vec<Spec> {
             read: toggle!(c => render.enhancement.map_marker_icons),
             desc: "Swap selected map dots for miniature pictures of the \
                    thing itself: spell jars, dolmens/shrines, statues, \
-                   and dead wizards' graves (the bones you possess to \
-                   reclaim their mana - a dot is lost among the flags). \
+                   teleporters, and dead wizards' graves (the bones you \
+                   possess to reclaim their mana - a dot is lost among \
+                   the flags). \
                    Drawn small — half the spell-stamp size — and scaled \
                    by the marker-size slider. (The expose-jar-spells \
                    debug option outranks this for jars.)",
@@ -1364,7 +1365,7 @@ pub fn registry() -> Vec<Spec> {
                 set: |c, v| c.render.enhancement.map_marker_icons = v,
                 descs: [
                     "Plain dots, as retail draws them.",
-                    "Jars, dolmens, statues and wizard graves wear miniature sprites.",
+                    "Jars, dolmens, statues, teleporters and wizard graves wear miniature sprites.",
                 ],
             },
         },
