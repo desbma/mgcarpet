@@ -926,20 +926,32 @@ pub fn registry() -> Vec<Spec> {
             cli: None,
             cfg_path: "render.preference.window_size",
             read: |c| Val::Choice {
-                cur: match c.render.preference.window_size {
-                    crate::config::WindowSize::W1280x960 => 0,
-                    crate::config::WindowSize::W1600x1200 => 1,
-                },
-                faithful: 0,
-                variants: &["1280x960", "1600x1200"],
+                cur: c.render.preference.window_size.index(),
+                faithful: crate::config::WindowSize::W1280x960.index(),
+                variants: &[
+                    "640x480",
+                    "1280x960",
+                    "1600x1200",
+                    "1920x1440",
+                    "1920x1080",
+                    "2560x1440",
+                    "3840x2160",
+                ],
             },
             desc: "The window's size when not fullscreen. It can still be \
-                   resized by hand; the next start opens at this size again.",
+                   resized by hand; the next start opens at this size again. \
+                   A size larger than the monitor is allowed (the window \
+                   manager may clamp it).",
             ctl: Ctl::Choice {
                 set: |c, i| c.render.preference.window_size = crate::config::WindowSize::ALL[i],
                 descs: &[
+                    "640 × 480, the original's own frame, pixel for pixel.",
                     "1280 × 960, twice the original 640 × 480 (default).",
                     "1600 × 1200, two and a half times 640 × 480.",
+                    "1920 × 1440, three times 640 × 480.",
+                    "1920 × 1080, Full HD (16:9).",
+                    "2560 × 1440, QHD (16:9).",
+                    "3840 × 2160, 4K UHD (16:9).",
                 ],
             },
         },

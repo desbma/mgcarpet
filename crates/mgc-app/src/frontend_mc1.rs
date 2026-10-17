@@ -1125,7 +1125,12 @@ mod tests {
         let (x, y) = spot(&m, 3);
         m.click((320.0, 200.0), (x, y));
         assert_eq!(m.take_action(), Some(Mc1Action::Network));
-        m.open_network(vec!["box:7000".into()], "7777".into(), "7777".into(), String::new());
+        m.open_network(
+            vec!["box:7000".into()],
+            "7777".into(),
+            "7777".into(),
+            String::new(),
+        );
         assert!(m.editing());
         m.key_enter();
         m.key_enter();
@@ -1140,7 +1145,12 @@ mod tests {
             })
         );
         // No address: the scroll stays up.
-        m.open_network(vec!["box".into()], "7777".into(), "7777".into(), "pw".into());
+        m.open_network(
+            vec!["box".into()],
+            "7777".into(),
+            "7777".into(),
+            "pw".into(),
+        );
         for _ in 0..3 {
             m.key_backspace();
         }
@@ -1154,7 +1164,10 @@ mod tests {
         assert!(m.editing());
         m.open_connecting();
         m.escape();
-        assert!(matches!(m.modal, Some(Modal::Connecting)), "no way out mid-join");
+        assert!(
+            matches!(m.modal, Some(Modal::Connecting)),
+            "no way out mid-join"
+        );
         m.close_connecting();
         assert!(m.modal.is_none());
     }

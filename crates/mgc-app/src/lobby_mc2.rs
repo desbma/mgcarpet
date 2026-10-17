@@ -429,7 +429,11 @@ impl LobbyScreen {
             rows.push(RuleRow {
                 label: "Passphrase".into(),
                 // Empty = an open session (anyone gets in).
-                value: if p.is_empty() { "none".into() } else { p.clone() },
+                value: if p.is_empty() {
+                    "none".into()
+                } else {
+                    p.clone()
+                },
             });
         }
         rows.extend(self.rules.iter().cloned());

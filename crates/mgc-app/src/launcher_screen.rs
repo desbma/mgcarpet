@@ -445,25 +445,31 @@ impl Launcher {
         self.monitor = monitor;
     }
 
-    /// The Display row's choices: fullscreen, then each window size
-    /// that fits the monitor (and the configured one regardless).
-    fn modes(&self, cfg: &Config) -> Vec<Mode> {
-        let cur = Mode::of(cfg);
-        let mut list = vec![Mode::Fullscreen];
-        for w in WindowSize::ALL {
-            let (x, y) = w.dims();
-            let fits = self.monitor.is_none_or(|(mw, mh)| x <= mw && y <= mh);
-            if fits || cur == Mode::Window(w) {
-                list.push(Mode::Window(w));
-            }
-        }
-        list
+    /// The Display row's choices: fullscreen, then every window size.
+    /// Sizes larger than the monitor stay on offer (player ask
+    /// 2026-10-17: a 4K window on a smaller screen is a performance
+    /// check) — [`Launcher::value`] tags them instead.
+    fn modes(&self) -> Vec<Mode> {
+        std::iter::once(Mode::Fullscreen)
+            .chain(WindowSize::ALL.into_iter().map(Mode::Window))
+            .collect()
+    }
+
+    /// Whether a window size overflows the known monitor.
+    fn oversized(&self, w: WindowSize) -> bool {
+        let (x, y) = w.dims();
+        self.monitor.is_some_and(|(mw, mh)| x > mw || y > mh)
     }
 
     /// The row's value as shown.
     fn value(&self, row: usize, cfg: &Config) -> String {
         match &OPTIONS[row].1 {
-            RowKind::Display => Mode::of(cfg).label(),
+            RowKind::Display => match Mode::of(cfg) {
+                Mode::Window(w) if self.oversized(w) => {
+                    format!("{} (larger than screen)", Mode::Window(w).label())
+                }
+                m => m.label(),
+            },
             RowKind::Preset(g) => match g.current(cfg) {
                 Some(p) => p.label().to_string(),
                 None => "Custom".to_string(),
@@ -474,7 +480,7 @@ impl Launcher {
     fn step_option(&mut self, row: usize, right: bool, cfg: &mut Config) {
         match &OPTIONS[row].1 {
             RowKind::Display => {
-                let list = self.modes(cfg);
+                let list = self.modes();
                 let n = list.len();
                 let at = list.iter().position(|&m| m == Mode::of(cfg)).unwrap_or(0);
                 let next = if right {
@@ -1444,9 +1450,10 @@ mod tests {
         );
     }
 
-    /// Row 0 is Display: fullscreen, then the window sizes that fit.
+    /// Row 0 is Display: fullscreen, then every window size, the ones
+    /// larger than the monitor tagged rather than hidden.
     #[test]
-    fn the_display_row_offers_the_sizes_that_fit() {
+    fn the_display_row_offers_every_size() {
         let root = std::env::temp_dir().join(format!("mgc-launcher-d-{}", std::process::id()));
         let mut cfg = Config {
             gamedata: Some(root.join("no-such-gamedata")),
@@ -1456,18 +1463,25 @@ mod tests {
         l.set_monitor(Some((1920, 1080)));
         assert_eq!(l.value(0, &cfg), "Fullscreen");
         l.step_option(0, true, &mut cfg);
-        assert_eq!(l.value(0, &cfg), "Window 1280 × 960");
+        assert_eq!(l.value(0, &cfg), "Window 640 × 480");
         assert!(!cfg.render.preference.fullscreen);
+        l.step_option(0, true, &mut cfg);
+        assert_eq!(l.value(0, &cfg), "Window 1280 × 960");
         l.step_option(0, true, &mut cfg);
         assert_eq!(
             l.value(0, &cfg),
-            "Fullscreen",
+            "Window 1600 × 1200 (larger than screen)",
             "1600 × 1200 does not fit 1080 rows"
         );
-        l.set_monitor(Some((2560, 1440)));
         l.step_option(0, false, &mut cfg);
-        assert_eq!(l.value(0, &cfg), "Window 1600 × 1200");
-        assert_eq!(cfg.render.preference.window_size, WindowSize::W1600x1200);
+        l.step_option(0, false, &mut cfg);
+        l.step_option(0, false, &mut cfg);
+        assert_eq!(l.value(0, &cfg), "Fullscreen");
+        l.step_option(0, false, &mut cfg);
+        assert_eq!(l.value(0, &cfg), "Window 3840 × 2160 (larger than screen)");
+        assert_eq!(cfg.render.preference.window_size, WindowSize::W3840x2160);
+        l.set_monitor(Some((3840, 2160)));
+        assert_eq!(l.value(0, &cfg), "Window 3840 × 2160");
         assert!(l.take_changed().contains(&"render.preference.window_size"));
     }
 

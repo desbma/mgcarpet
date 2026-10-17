@@ -366,7 +366,11 @@ impl Mc1LobbyScreen {
             rows.push(RuleRow {
                 label: "Passphrase".into(),
                 // Empty = an open session (anyone gets in).
-                value: if p.is_empty() { "none".into() } else { p.clone() },
+                value: if p.is_empty() {
+                    "none".into()
+                } else {
+                    p.clone()
+                },
             });
         }
         if let Some(v) = &self.view {
@@ -484,7 +488,11 @@ impl Mc1LobbyScreen {
         if k == pass {
             let Some(v) = &self.view else { return };
             let cap = usize::from(v.capacity);
-            let next = if forward { cap + 1 } else { cap.saturating_sub(1) };
+            let next = if forward {
+                cap + 1
+            } else {
+                cap.saturating_sub(1)
+            };
             self.actions.push(LobbyAction::SetCapacity(next));
         } else {
             self.actions.push(LobbyAction::StepRule {

@@ -301,11 +301,11 @@ pub struct RenderPreference {
     /// with no retail analogue (DOS was 320×200/640×480 exclusive),
     /// hence Preference — fidelity-free either way.
     pub fullscreen: bool,
-    /// The game window's size when not fullscreen. Two fixed sizes,
-    /// both 4:3 multiples of 640×480 so the UI lands on whole pixels
-    /// (player ruling 2026-09-25: keep it simple until players ask for
-    /// more). The window stays resizable by hand; a hand resize is not
-    /// remembered.
+    /// The game window's size when not fullscreen. A fixed list: the
+    /// 4:3 multiples of 640×480 (1× and 2× land the UI on whole pixels)
+    /// plus the standard widescreen sizes up to 4K (player ask
+    /// 2026-10-17, widening the 09-25 two-size ruling). The window stays
+    /// resizable by hand; a hand resize is not remembered.
     pub window_size: WindowSize,
     /// Play the full-screen FMV movies (intro, MC2 cutscenes, outro).
     /// ON is the faithful setting — retail plays them and offers no
@@ -426,9 +426,14 @@ impl Default for RenderPreference {
 /// hooked per drawn class-3 model-0/1 sprite at :5010-17). Retail MC2
 /// ships it ON with a "Player Names" toggle (PlayerInput.cpp:1503);
 /// retail MC1 has no such tag at all.
-/// The windowed sizes (see [`RenderPreference::window_size`]).
+/// The windowed sizes (see [`RenderPreference::window_size`]). The
+/// 4:3 sizes first, smallest to largest, then the common widescreen
+/// ones; `ALL` is that order and the settings/launcher lists follow it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowSize {
+    /// 1× 640×480: retail's own frame, pixel for pixel.
+    #[serde(rename = "640x480")]
+    W640x480,
     /// 2× 640×480: the long-standing default.
     #[default]
     #[serde(rename = "1280x960")]
@@ -436,17 +441,47 @@ pub enum WindowSize {
     /// 2.5× 640×480.
     #[serde(rename = "1600x1200")]
     W1600x1200,
+    /// 3× 640×480.
+    #[serde(rename = "1920x1440")]
+    W1920x1440,
+    /// Full HD, 16:9 — the HUD layout law anchors the panels.
+    #[serde(rename = "1920x1080")]
+    W1920x1080,
+    /// QHD, 16:9.
+    #[serde(rename = "2560x1440")]
+    W2560x1440,
+    /// 4K UHD, 16:9.
+    #[serde(rename = "3840x2160")]
+    W3840x2160,
 }
 
 impl WindowSize {
-    pub const ALL: [WindowSize; 2] = [WindowSize::W1280x960, WindowSize::W1600x1200];
+    pub const ALL: [WindowSize; 7] = [
+        WindowSize::W640x480,
+        WindowSize::W1280x960,
+        WindowSize::W1600x1200,
+        WindowSize::W1920x1440,
+        WindowSize::W1920x1080,
+        WindowSize::W2560x1440,
+        WindowSize::W3840x2160,
+    ];
 
     /// Physical pixels.
     pub fn dims(self) -> (u32, u32) {
         match self {
+            WindowSize::W640x480 => (640, 480),
             WindowSize::W1280x960 => (1280, 960),
             WindowSize::W1600x1200 => (1600, 1200),
+            WindowSize::W1920x1440 => (1920, 1440),
+            WindowSize::W1920x1080 => (1920, 1080),
+            WindowSize::W2560x1440 => (2560, 1440),
+            WindowSize::W3840x2160 => (3840, 2160),
         }
+    }
+
+    /// Position in [`WindowSize::ALL`].
+    pub fn index(self) -> usize {
+        WindowSize::ALL.iter().position(|&w| w == self).unwrap_or(0)
     }
 }
 
