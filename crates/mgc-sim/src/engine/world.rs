@@ -547,6 +547,69 @@ impl std::hash::Hasher for Fnv {
     }
 }
 
+pub(crate) const FNV_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// A state-hash walk's sink: the plain [`Fnv`] ignores the section
+/// marks, a [`Sectioned`] digests each section on its own as well.
+/// ONE walk feeds both, so the sectioned report can never drift from
+/// the hash it explains (netplay's desync report, `docs/NETPLAY.md`).
+pub(crate) trait HashSink: std::hash::Hasher {
+    /// Everything hashed from here to the next mark is section `name`.
+    fn section(&mut self, _name: impl FnOnce() -> String) {}
+}
+
+impl HashSink for Fnv {}
+
+/// The main stream (byte-identical to a plain [`Fnv`]) plus one digest
+/// per marked section. Bytes before the first mark go to the main
+/// stream only.
+pub(crate) struct Sectioned {
+    main: Fnv,
+    cur: Option<(String, Fnv)>,
+    done: Vec<(String, u64)>,
+}
+
+impl Sectioned {
+    pub(crate) fn new() -> Self {
+        Self {
+            main: Fnv(FNV_BASIS),
+            cur: None,
+            done: Vec::new(),
+        }
+    }
+
+    /// The main digest and every section's, in walk order.
+    pub(crate) fn finish_sections(mut self) -> (u64, Vec<(String, u64)>) {
+        self.close();
+        (self.main.0, self.done)
+    }
+
+    fn close(&mut self) {
+        if let Some((name, h)) = self.cur.take() {
+            self.done.push((name, h.0));
+        }
+    }
+}
+
+impl std::hash::Hasher for Sectioned {
+    fn finish(&self) -> u64 {
+        self.main.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        self.main.write(bytes);
+        if let Some((_, h)) = &mut self.cur {
+            h.write(bytes);
+        }
+    }
+}
+
+impl HashSink for Sectioned {
+    fn section(&mut self, name: impl FnOnce() -> String) {
+        self.close();
+        self.cur = Some((name(), Fnv(FNV_BASIS)));
+    }
+}
+
 /// The player's mortality snapshot for the app layer.
 #[derive(Debug, Clone, Copy)]
 pub struct PlayerVitals {
@@ -15374,7 +15437,38 @@ impl World {
     /// makes a new `World` field a compile error here: extend the
     /// hash deliberately.
     pub fn state_hash(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
+        use std::hash::Hasher;
+        let mut h = Fnv(FNV_BASIS);
+        self.hash_walk(&mut h);
+        h.finish()
+    }
+
+    /// [`Self::state_hash`] broken down: one digest per part of the
+    /// state (each `Gen` field, each pool slot, each world lane), in
+    /// walk order — two worlds differ exactly where these do. The
+    /// netplay desync report (`docs/NETPLAY.md`).
+    pub fn state_sections(&self) -> Vec<(String, u64)> {
+        let mut h = Sectioned::new();
+        self.hash_walk(&mut h);
+        h.finish_sections().1
+    }
+
+    /// Pool slot `i` in a line — what a desync report names beside a
+    /// diverged `g.ent[i]` section.
+    pub fn slot_summary(&self, i: usize) -> String {
+        let Some(e) = self.g.ent.get(i) else {
+            return "beyond the pool".into();
+        };
+        format!(
+            "class {} model {} at ({}, {}, {}) life {}/{} flags {:#x}",
+            e.class64, e.model65, e.x, e.y, e.z, e.act_life, e.max_life, e.flags
+        )
+    }
+
+    /// The one state-hash walk ([`Self::state_hash`],
+    /// [`Self::state_sections`]).
+    fn hash_walk<H: HashSink>(&self, h: &mut H) {
+        use std::hash::Hash;
         let World {
             g,
             game,
@@ -15499,7 +15593,6 @@ impl World {
             mc2_duel,
             mc2_recast_surcharge,
         } = self;
-        let mut h = Fnv(0xcbf2_9ce4_8422_2325);
         // Diagnostic (`MGC_HASH_EXCLUDE_CARPET=1`): hash the pool
         // with the human's carpet record blanked, so a step that only
         // changes WHAT THE RECORD HOLDS can be proven behaviour-neutral
@@ -15519,27 +15612,35 @@ impl World {
                 gg.player_mail[Hx::FIRST] = gg.ent[cs].mail;
             }
             gg.ent[cs] = crate::engine::features::Ent::default();
-            gg.hash(&mut h);
+            gg.hash_walk(h);
         } else {
-            g.hash(&mut h);
+            g.hash_walk(h);
         }
-        table.hash(&mut h);
+        h.section(|| "table".into());
+        table.hash(h);
         // One block per seat, in seat order — a one-seat world hashes
         // exactly as the single block did.
         for hx in self.players.ixs() {
-            self.player_view(hx).hash(&mut h);
+            h.section(|| format!("player[{}]", hx.0));
+            self.player_view(hx).hash(h);
         }
-        rivals.hash(&mut h);
-        kill_tally.hash(&mut h);
+        h.section(|| "rivals".into());
+        rivals.hash(h);
+        h.section(|| "kill_tally".into());
+        kill_tally.hash(h);
         for hx in self.players.ixs() {
-            self.human_pose(hx).hash(&mut h);
+            h.section(|| format!("human_pose[{}]", hx.0));
+            self.human_pose(hx).hash(h);
         }
-        duel.hash(&mut h);
-        start_markers.hash(&mut h);
+        h.section(|| "duel".into());
+        duel.hash(h);
+        h.section(|| "start_markers".into());
+        start_markers.hash(h);
+        h.section(|| "latches".into());
         (
             win_pct, win_streak, completed, dev_spells, prev_fire, invincible,
         )
-            .hash(&mut h);
+            .hash(h);
         // The ghost / inert cheats — TAG-ONLY while on, like the
         // latches below, so every pinned golden is unmoved.
         if *ghost {
@@ -15548,7 +15649,7 @@ impl World {
         if *inert {
             h.write_u8(0xE6);
         }
-        (game, placeholders).hash(&mut h);
+        (game, placeholders).hash(h);
         // The ending latches — hash-transparent until a level ending
         // actually runs (field tags per the aliasing discipline),
         // so every pinned golden is unmoved.
@@ -15558,13 +15659,13 @@ impl World {
         for hx in self.players.ixs() {
             if let Some(seq) = &mc2_endseq[hx] {
                 h.write_u8(0xE1);
-                seq.hash(&mut h);
+                seq.hash(h);
             }
         }
         for hx in self.players.ixs() {
             if let Some(d) = mc2_duel[hx] {
                 h.write_u8(0xE2);
-                d.hash(&mut h);
+                d.hash(h);
             }
         }
         // The MC2 castle re-cast surcharge latch (`byte_0x1BE_446`) —
@@ -15580,11 +15681,12 @@ impl World {
         }
         // Hashed only when populated: MC1 worlds keep their goldens
         // across this MC2-only layout addition.
+        h.section(|| "mc2_stages".into());
         if !mc2_stages.is_empty() {
-            mc2_stages.hash(&mut h);
-            mc2_stage_current.hash(&mut h);
-            mc2_objective_pause.hash(&mut h);
-            mc2_speech_ramp.hash(&mut h);
+            mc2_stages.hash(h);
+            mc2_stage_current.hash(h);
+            mc2_objective_pause.hash(h);
+            mc2_speech_ramp.hash(h);
             // Hash-transparent while clear (the bldgprm/spells
             // precedent). Each contribution is preceded by a distinct
             // FIELD TAG: without one, adjacent conditional fields of
@@ -15594,15 +15696,15 @@ impl World {
             // clear (every pinned golden) are unmoved.
             if *mc2_apocalypse {
                 h.write_u8(0xA1);
-                mc2_apocalypse.hash(&mut h);
+                mc2_apocalypse.hash(h);
             }
             if *mc2_doom_meter != 0 {
                 h.write_u8(0xA2);
-                mc2_doom_meter.hash(&mut h);
+                mc2_doom_meter.hash(h);
             }
             if *mc2_doom_level {
                 h.write_u8(0xA3);
-                mc2_doom_level.hash(&mut h);
+                mc2_doom_level.hash(h);
             }
         } else if *mc2_speech_ramp != 0 {
             // `set_mc2_stages` arms the ramp even when ZERO rows
@@ -15612,7 +15714,7 @@ impl World {
             // are. Transparent-while-clear AND appended after the
             // (empty) stages gate, so every existing pin's byte stream
             // is unchanged.
-            mc2_speech_ramp.hash(&mut h);
+            mc2_speech_ramp.hash(h);
         }
         // The campaign REPLAY gate (`setting_38545 & 4`) — TAG-ONLY and
         // OUTSIDE the stages gate above, deliberately. It changes SIM
@@ -15626,7 +15728,7 @@ impl World {
         // byte and moves all of them.
         if *mc2_level_replayed {
             h.write_u8(0xA4);
-            mc2_level_replayed.hash(&mut h);
+            mc2_level_replayed.hash(h);
         }
         // The castle-purge level bit (`byte_0x2FED2 & 4`) — the same
         // TAG-ONLY, transparent-while-clear shape as 0xA4 above, and
@@ -15634,23 +15736,25 @@ impl World {
         // behaviour on levels 022/062 and must be hash-visible there.
         if *mc2_castle_purge_level {
             h.write_u8(0xA5);
-            mc2_castle_purge_level.hash(&mut h);
+            mc2_castle_purge_level.hash(h);
         }
         // The MC2 spell book (Phase 4.2): pristine = transparent
         // (MC1 goldens hold; every MC2 world touches it via the
         // fireball+possess baseline, so it always hashes there).
         for hx in self.players.ixs() {
+            h.section(|| format!("mc2_book[{}]", hx.0));
             if !mc2_book[hx].is_pristine() {
-                mc2_book[hx].hash(&mut h);
+                mc2_book[hx].hash(h);
             }
         }
         // The MC1 cycle ring — transparent while clear (tag 0xB5,
         // the selector's array_0x3B5 idiom): every pre-ring golden
         // stands.
         for hx in self.players.ixs() {
+            h.section(|| format!("mc1_ring[{}]", hx.0));
             if mc1_ring[hx] != [0; 24] {
                 h.write_u8(0xB5);
-                mc1_ring[hx].hash(&mut h);
+                mc1_ring[hx].hash(h);
             }
         }
         // The retail cheat-replay flags (tag 0x1E, retail's own cheat
@@ -15659,27 +15763,29 @@ impl World {
         // armed: `cheat_mode` opens the castle XP clamp and
         // `mc2_free_spells` rewrites every manifestation built after
         // it (engine::world::cheats).
+        h.section(|| "cheats".into());
         if *cheat_mode || *mc2_free_spells {
             h.write_u8(0x1E);
-            (cheat_mode, mc2_free_spells).hash(&mut h);
+            (cheat_mode, mc2_free_spells).hash(h);
         }
         // The MC2 rival column (Phase 4.3b): hash-gated on presence
         // — every pre-rivals golden stands.
+        h.section(|| "mc2_rivals".into());
         if !mc2_rivals.is_empty() {
-            mc2_rivals.hash(&mut h);
+            mc2_rivals.hash(h);
         }
         // The MC2 StageVar subsystem (the hold-gate layer): hash-gated
         // on presence so MC1 + StageVar-less MC2 goldens are untouched.
+        h.section(|| "mc2_stagevars".into());
         if !mc2_stagevars.is_empty() {
-            mc2_stagevars.hash(&mut h);
-            mc2_sv_held.hash(&mut h);
+            mc2_stagevars.hash(h);
+            mc2_sv_held.hash(h);
             // Deferred m9 holds join only when live (own gate: an
             // empty vec must not shift the pinned stagevar goldens).
             if !mc2_sv_deferred.is_empty() {
-                mc2_sv_deferred.hash(&mut h);
+                mc2_sv_deferred.hash(h);
             }
         }
-        h.finish()
     }
 
     /// The world's game profile and tier-5 verb column (fixed at
@@ -27369,9 +27475,9 @@ impl Snap for Player {
             hit_flash,
             lost,
             mc2_respawn_timer_reg: mc2_respawn_timer,
-            // ⚠ Not in the snapshot: only a network game banishes, and
-            // a network game is never saved (the reconciliation stage
-            // will add it with a SNAPSHOT_VERSION bump).
+            // Not in the save: only a network game banishes, and a
+            // network game is never saved — its resync snapshot carries
+            // it (`net_snap_write`).
             banished: _,
         } = self;
         w.put(mana);
@@ -27464,6 +27570,27 @@ impl World {
         r.expect("level table size", self.table.len())?;
         r.expect("human seats", self.players.len())?;
         self.g.snap_check_identity(r)
+    }
+
+    /// What a network resync needs beyond the save's stream
+    /// ([`crate::Simulation::net_snapshot`]): a resync is a CLONE of the
+    /// server's world, not a retail load. Each seat's banishment (only
+    /// a network game has it), and the pool's ranked recycle victims —
+    /// retail's load empties that list (`Gen::snap_apply`), the server's
+    /// world has not (proven by `mc1_a_forked_player_is_resynced`).
+    pub(crate) fn net_snap_write(&self, w: &mut Writer) {
+        for hx in self.players.ixs() {
+            w.put(&self.players[hx].banished);
+        }
+        w.put(&self.g.mc2_recycle.stack);
+    }
+
+    pub(crate) fn net_snap_apply(&mut self, r: &mut Reader) -> Result<(), SnapshotError> {
+        for hx in self.players.ixs() {
+            self.players[hx].banished = r.get()?;
+        }
+        self.g.mc2_recycle.stack = r.get()?;
+        Ok(())
     }
 
     pub(crate) fn snap_write(&self, w: &mut Writer) {
@@ -32372,6 +32499,36 @@ mod tests {
     /// own state (writes through `players[hx]` never alias seat 0),
     /// and it is hashed — while a one-seat world hashes exactly as the
     /// single block did (the corpus goldens are that half).
+    #[test]
+    fn the_sectioned_walk_is_the_derived_hash() {
+        use std::hash::{Hash, Hasher};
+        let mut w = mc2_flat_world();
+        w.push_seat(5);
+        w.g.player_danger[Hx(1)] = 7;
+        // `Gen`'s field walk feeds the derive's exact byte stream.
+        let mut derived = Fnv(FNV_BASIS);
+        w.g.hash(&mut derived);
+        let mut walked = Sectioned::new();
+        w.g.hash_walk(&mut walked);
+        let (main, sections) = walked.finish_sections();
+        assert_eq!(main, derived.finish());
+        assert!(sections.iter().any(|(n, _)| n == "g.ent[0]"));
+        // The world's sectioned digest is its hash, and names a change.
+        let mut h = Sectioned::new();
+        w.hash_walk(&mut h);
+        assert_eq!(h.finish_sections().0, w.state_hash());
+        let before = w.state_sections();
+        w.g.ent[3].x ^= 1;
+        let after = w.state_sections();
+        let moved: Vec<&str> = before
+            .iter()
+            .zip(&after)
+            .filter(|(a, b)| a != b)
+            .map(|(a, _)| a.0.as_str())
+            .collect();
+        assert_eq!(moved, ["g.ent[3]"]);
+    }
+
     #[test]
     fn a_second_seat_is_its_own_block_and_is_hashed() {
         let mut w = mc2_flat_world();

@@ -703,6 +703,308 @@ impl std::hash::Hash for Rec {
     }
 }
 
+impl Gen {
+    /// `#[derive(Hash)]`'s byte stream, field by field in declaration
+    /// order, with a section mark before each field (and each pool
+    /// slot) — [`crate::engine::world::World::state_sections`]. The
+    /// full destructure makes a new field a compile error here; the
+    /// order is pinned against the derive by
+    /// `the_sectioned_walk_is_the_derived_hash`.
+    pub(crate) fn hash_walk<H: crate::engine::world::HashSink>(&self, h: &mut H) {
+        use std::hash::Hash;
+        let Gen {
+            t,
+            assets,
+            retile,
+            map_entity,
+            ent,
+            slot_gen,
+            free,
+            ball_chain,
+            wiz_chain,
+            proj_chain,
+            bldg_chain,
+            paint_chain,
+            mob_chains,
+            mc2_recycle,
+            m27_v34_slot,
+            mc2_pinned,
+            mc1_pinned,
+            mc1_guard_reg,
+            mc1_balloon_reg,
+            human_seat,
+            human_tag,
+            rand,
+            pseudo,
+            crt_rand,
+            spawn_count,
+            player_mail,
+            player_damage,
+            erupting,
+            plume,
+            player_knock,
+            mc1_buffet_post,
+            player_spin,
+            player_whirl,
+            ww_walk_published,
+            seat_view,
+            m22_seg_residue,
+            player_hurl,
+            player_flood_pull,
+            player_deflect_debit,
+            mc2_debuffs,
+            rival_ents,
+            castle_reg,
+            mc2_life_scale,
+            player_aggro,
+            rival_wanted,
+            player_invisible,
+            player_ghost,
+            player_vel,
+            mc2_flyers_clear,
+            skeletons_convert_traders,
+            human_roll_0x20,
+            player_rebound_reg,
+            player_chain,
+            kills,
+            shots,
+            hits,
+            stats,
+            player_danger,
+            banked_houses,
+            rival_banked_houses,
+            castle_alert,
+            player_alert,
+            balloon_alert,
+            pal_flash,
+            exhausted,
+            castle_watchdog_fired,
+            chassis,
+            verbs,
+            verb_fallbacks,
+            misfits,
+            sounds,
+            terrain_dirty,
+            mc2_night_shade,
+            mc2_spawn_ord,
+            mc2_player_drain,
+            mc2_rival_leech,
+            mc2_scrolls,
+            mc2_spell_tokens,
+            mc2_cast_xp,
+            mc2_ladder_sync,
+            mc2_castle_lock_mail,
+            mc2_steal_mail,
+            bolt_fx,
+            volcano_blind,
+            mc1_aim_latch,
+            mc2_beam_defer,
+            mc2_pred_axis,
+            mc2_aura_claim,
+            mc2_wanted,
+            mc2_rebound_precise,
+            mc2_allied,
+            mc2_castle_research,
+            mc2_mobilize,
+            mc2_slow,
+        } = self;
+        h.section(|| "g.t".into());
+        t.hash(h);
+        h.section(|| "g.assets".into());
+        assets.hash(h);
+        h.section(|| "g.retile".into());
+        retile.hash(h);
+        h.section(|| "g.map_entity".into());
+        map_entity.hash(h);
+        // The pool slot by slot (the derive's length prefix, then each
+        // element — `Hash for [T]`'s own shape).
+        h.section(|| "g.ent".into());
+        h.write_usize(ent.len());
+        for (i, e) in ent.iter().enumerate() {
+            h.section(|| format!("g.ent[{i}]"));
+            e.hash(h);
+        }
+        h.section(|| "g.slot_gen".into());
+        slot_gen.hash(h);
+        h.section(|| "g.free".into());
+        free.hash(h);
+        h.section(|| "g.ball_chain".into());
+        ball_chain.hash(h);
+        h.section(|| "g.wiz_chain".into());
+        wiz_chain.hash(h);
+        h.section(|| "g.proj_chain".into());
+        proj_chain.hash(h);
+        h.section(|| "g.bldg_chain".into());
+        bldg_chain.hash(h);
+        h.section(|| "g.paint_chain".into());
+        paint_chain.hash(h);
+        h.section(|| "g.mob_chains".into());
+        mob_chains.hash(h);
+        h.section(|| "g.mc2_recycle".into());
+        mc2_recycle.hash(h);
+        h.section(|| "g.m27_v34_slot".into());
+        m27_v34_slot.hash(h);
+        h.section(|| "g.mc2_pinned".into());
+        mc2_pinned.hash(h);
+        h.section(|| "g.mc1_pinned".into());
+        mc1_pinned.hash(h);
+        h.section(|| "g.mc1_guard_reg".into());
+        mc1_guard_reg.hash(h);
+        h.section(|| "g.mc1_balloon_reg".into());
+        mc1_balloon_reg.hash(h);
+        h.section(|| "g.human_seat".into());
+        human_seat.hash(h);
+        h.section(|| "g.human_tag".into());
+        human_tag.hash(h);
+        h.section(|| "g.rand".into());
+        rand.hash(h);
+        h.section(|| "g.pseudo".into());
+        pseudo.hash(h);
+        h.section(|| "g.crt_rand".into());
+        crt_rand.hash(h);
+        h.section(|| "g.spawn_count".into());
+        spawn_count.hash(h);
+        h.section(|| "g.player_mail".into());
+        player_mail.hash(h);
+        h.section(|| "g.player_damage".into());
+        player_damage.hash(h);
+        h.section(|| "g.erupting".into());
+        erupting.hash(h);
+        h.section(|| "g.plume".into());
+        plume.hash(h);
+        h.section(|| "g.player_knock".into());
+        player_knock.hash(h);
+        h.section(|| "g.mc1_buffet_post".into());
+        mc1_buffet_post.hash(h);
+        h.section(|| "g.player_spin".into());
+        player_spin.hash(h);
+        h.section(|| "g.player_whirl".into());
+        player_whirl.hash(h);
+        h.section(|| "g.ww_walk_published".into());
+        ww_walk_published.hash(h);
+        h.section(|| "g.seat_view".into());
+        seat_view.hash(h);
+        h.section(|| "g.m22_seg_residue".into());
+        m22_seg_residue.hash(h);
+        h.section(|| "g.player_hurl".into());
+        player_hurl.hash(h);
+        h.section(|| "g.player_flood_pull".into());
+        player_flood_pull.hash(h);
+        h.section(|| "g.player_deflect_debit".into());
+        player_deflect_debit.hash(h);
+        h.section(|| "g.mc2_debuffs".into());
+        mc2_debuffs.hash(h);
+        h.section(|| "g.rival_ents".into());
+        rival_ents.hash(h);
+        h.section(|| "g.castle_reg".into());
+        castle_reg.hash(h);
+        h.section(|| "g.mc2_life_scale".into());
+        mc2_life_scale.hash(h);
+        h.section(|| "g.player_aggro".into());
+        player_aggro.hash(h);
+        h.section(|| "g.rival_wanted".into());
+        rival_wanted.hash(h);
+        h.section(|| "g.player_invisible".into());
+        player_invisible.hash(h);
+        h.section(|| "g.player_ghost".into());
+        player_ghost.hash(h);
+        h.section(|| "g.player_vel".into());
+        player_vel.hash(h);
+        h.section(|| "g.mc2_flyers_clear".into());
+        mc2_flyers_clear.hash(h);
+        h.section(|| "g.skeletons_convert_traders".into());
+        skeletons_convert_traders.hash(h);
+        h.section(|| "g.human_roll_0x20".into());
+        human_roll_0x20.hash(h);
+        h.section(|| "g.player_rebound_reg".into());
+        player_rebound_reg.hash(h);
+        h.section(|| "g.player_chain".into());
+        player_chain.hash(h);
+        h.section(|| "g.kills".into());
+        kills.hash(h);
+        h.section(|| "g.shots".into());
+        shots.hash(h);
+        h.section(|| "g.hits".into());
+        hits.hash(h);
+        h.section(|| "g.stats".into());
+        stats.hash(h);
+        h.section(|| "g.player_danger".into());
+        player_danger.hash(h);
+        h.section(|| "g.banked_houses".into());
+        banked_houses.hash(h);
+        h.section(|| "g.rival_banked_houses".into());
+        rival_banked_houses.hash(h);
+        h.section(|| "g.castle_alert".into());
+        castle_alert.hash(h);
+        h.section(|| "g.player_alert".into());
+        player_alert.hash(h);
+        h.section(|| "g.balloon_alert".into());
+        balloon_alert.hash(h);
+        h.section(|| "g.pal_flash".into());
+        pal_flash.hash(h);
+        h.section(|| "g.exhausted".into());
+        exhausted.hash(h);
+        h.section(|| "g.castle_watchdog_fired".into());
+        castle_watchdog_fired.hash(h);
+        h.section(|| "g.chassis".into());
+        chassis.hash(h);
+        h.section(|| "g.verbs".into());
+        verbs.hash(h);
+        h.section(|| "g.verb_fallbacks".into());
+        verb_fallbacks.hash(h);
+        h.section(|| "g.misfits".into());
+        misfits.hash(h);
+        h.section(|| "g.sounds".into());
+        sounds.hash(h);
+        h.section(|| "g.terrain_dirty".into());
+        terrain_dirty.hash(h);
+        h.section(|| "g.mc2_night_shade".into());
+        mc2_night_shade.hash(h);
+        h.section(|| "g.mc2_spawn_ord".into());
+        mc2_spawn_ord.hash(h);
+        h.section(|| "g.mc2_player_drain".into());
+        mc2_player_drain.hash(h);
+        h.section(|| "g.mc2_rival_leech".into());
+        mc2_rival_leech.hash(h);
+        h.section(|| "g.mc2_scrolls".into());
+        mc2_scrolls.hash(h);
+        h.section(|| "g.mc2_spell_tokens".into());
+        mc2_spell_tokens.hash(h);
+        h.section(|| "g.mc2_cast_xp".into());
+        mc2_cast_xp.hash(h);
+        h.section(|| "g.mc2_ladder_sync".into());
+        mc2_ladder_sync.hash(h);
+        h.section(|| "g.mc2_castle_lock_mail".into());
+        mc2_castle_lock_mail.hash(h);
+        h.section(|| "g.mc2_steal_mail".into());
+        mc2_steal_mail.hash(h);
+        h.section(|| "g.bolt_fx".into());
+        bolt_fx.hash(h);
+        h.section(|| "g.volcano_blind".into());
+        volcano_blind.hash(h);
+        h.section(|| "g.mc1_aim_latch".into());
+        mc1_aim_latch.hash(h);
+        h.section(|| "g.mc2_beam_defer".into());
+        mc2_beam_defer.hash(h);
+        h.section(|| "g.mc2_pred_axis".into());
+        mc2_pred_axis.hash(h);
+        h.section(|| "g.mc2_aura_claim".into());
+        mc2_aura_claim.hash(h);
+        h.section(|| "g.mc2_wanted".into());
+        mc2_wanted.hash(h);
+        h.section(|| "g.mc2_rebound_precise".into());
+        mc2_rebound_precise.hash(h);
+        h.section(|| "g.mc2_allied".into());
+        mc2_allied.hash(h);
+        h.section(|| "g.mc2_castle_research".into());
+        mc2_castle_research.hash(h);
+        h.section(|| "g.mc2_mobilize".into());
+        mc2_mobilize.hash(h);
+        h.section(|| "g.mc2_slow".into());
+        mc2_slow.hash(h);
+    }
+}
+
 /// Runtime event entity — the subset of remc1's 164-byte
 /// `Type_AE400_29795` the load-time feature path uses. Names keep the
 /// original byte offsets for traceability.

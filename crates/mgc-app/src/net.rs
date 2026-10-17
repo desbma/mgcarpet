@@ -27,7 +27,14 @@
 //!
 //! Unlike retail (no desync detection at all), the server stamps its
 //! pre-step `state_hash` every [`CHECK_EVERY`] ticks onto the turn and
-//! every client compares — DETECTION only for now.
+//! every client compares. A client that disagrees asks for a RESYNC:
+//! the server sends its world's snapshot ([`Referee::snapshot`], taken
+//! before the next turn it steps) ahead of that turn, and the client
+//! applies it right before stepping the same tick — the server's world
+//! wins. The client reports where it had diverged (the sectioned state
+//! hash, `Simulation::divergence_report`) and checks the restored hash;
+//! a resync that does not heal stops the checks. Every resync is told
+//! loudly: it hides a fork, it does not fix the bug behind it.
 //!
 //! A client leaving mid-game (Bye, its socket lost, or [`Msg::Leave`])
 //! does not end the game: the server drops that seat at the first turn
@@ -58,7 +65,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 /// Bumped whenever [`Msg`] changes shape.
-const PROTOCOL: u32 = 6;
+const PROTOCOL: u32 = 7;
 /// The most players a session holds — retail's 8 (one per wizard). The
 /// admin lowers it in the lobby (`Guest::set_capacity`).
 pub const MAX_PLAYERS: usize = 8;
@@ -75,8 +82,9 @@ pub const GAME_OVER_GRACE: Duration = Duration::from_secs(10);
 /// 2026-10-17: slowdowns are accepted, a frozen player is not). Covers
 /// the slowest machine's level load at the game's start.
 pub const FROZEN_AFTER: Duration = Duration::from_secs(30);
-/// A frame larger than this is a broken peer, not a message.
-const MAX_FRAME: usize = 1 << 20;
+/// A frame larger than this is a broken peer, not a message (a resync
+/// snapshot is the largest: ~0.6 MiB of world, compressed).
+const MAX_FRAME: usize = 16 << 20;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "msg", rename_all = "snake_case")]
@@ -176,6 +184,18 @@ enum Msg {
         /// The game is decided: the winner's announcement.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         over: Option<String>,
+    },
+    /// Client → server: my world disagreed with yours at `tick` —
+    /// send me yours.
+    Resync {
+        tick: u64,
+    },
+    /// Server → client: its world before stepping `tick` (sent ahead of
+    /// that turn): the net snapshot, zstd + base64, and its state hash.
+    Snapshot {
+        tick: u64,
+        hash: u64,
+        data: String,
     },
     Bye {
         why: String,
@@ -337,6 +357,9 @@ pub trait Referee {
     fn begin(&mut self, game: &Game) -> Result<(), String>;
     /// The pre-step state hash (asked on check ticks only).
     fn hash(&self) -> u64;
+    /// The pre-step world, for a player's resync
+    /// (`Simulation::net_snapshot`).
+    fn snapshot(&self) -> Vec<u8>;
     /// Banish the seats in `left`, then step the turn.
     fn step(&mut self, inputs: &[PortInput], left: &[u8]);
     /// The game is decided: the winner's announcement.
@@ -396,6 +419,11 @@ struct Match {
     /// Per seat, when its last input arrived (the game's start before
     /// the first).
     heard: Vec<Instant>,
+    /// The seats that asked for a resync: the server's world goes out
+    /// to them ahead of the next turn.
+    resync: Vec<usize>,
+    /// Resync snapshots sent (the summary).
+    resyncs: u64,
 }
 
 impl Match {
@@ -594,6 +622,7 @@ impl Server {
             Err(e) => self.drop_client(id, &e),
             Ok(Msg::Bye { why }) => self.drop_client(id, &why),
             Ok(Msg::Input { tick, input }) => self.input(id, tick, input),
+            Ok(Msg::Resync { tick }) => self.resync(id, tick),
             Ok(Msg::Leave) => self.leave_game(id),
             Ok(Msg::Wizard { want }) => self.dirty |= self.core.pick_wizard(id, want),
             Ok(Msg::Agree { rev }) => self.dirty |= self.core.agree(id, rev),
@@ -702,6 +731,19 @@ impl Server {
         self.complete();
     }
 
+    /// Member `id`'s world disagreed at `tick`: his seat gets the
+    /// server's world ahead of the next turn.
+    fn resync(&mut self, id: u32, tick: u64) {
+        let Some(g) = &mut self.game else { return };
+        let Some(ix) = g.seat_of(id).filter(|&ix| g.active(ix)) else {
+            return;
+        };
+        if !g.resync.contains(&ix) {
+            g.resync.push(ix);
+        }
+        self.note(format!("seat {ix} desynced at tick {tick} — resync asked"));
+    }
+
     /// Every turn whose seats have all reported, in tick order: the
     /// server's world steps it, and it goes out to the players.
     fn complete(&mut self) {
@@ -736,6 +778,24 @@ impl Server {
                 g.checks += 1;
                 if trace() {
                     println!("server: tick {t} hash {h:016x}");
+                }
+            }
+            // A resync: the world before this turn, ahead of it.
+            if !g.resync.is_empty() {
+                let hash = self.referee.hash();
+                let data = encode_snapshot(&self.referee.snapshot());
+                let kib = data.len() / 1024;
+                let snap = Msg::Snapshot { tick, hash, data };
+                for ix in std::mem::take(&mut g.resync) {
+                    let id = g.ids[ix];
+                    if let Some((_, c)) = self.clients.iter_mut().find(|(c, _)| *c == id)
+                        && let Err(e) = c.send(&snap)
+                    {
+                        eprintln!("server: send to {}: {e}", c.peer);
+                        let _ = c.tx.shutdown(Shutdown::Both);
+                    }
+                    g.resyncs += 1;
+                    println!("server: seat {ix} resynced at tick {tick} ({kib} KiB)");
                 }
             }
             let left = g.departures.remove(&tick).unwrap_or_default();
@@ -801,8 +861,8 @@ impl Server {
         }
         let g = self.game.take().expect("a game");
         self.note(format!(
-            "game over after {} ticks, {} hash checks stamped",
-            g.next_complete, g.checks
+            "game over after {} ticks, {} hash checks stamped, {} resyncs",
+            g.next_complete, g.checks, g.resyncs
         ));
         self.referee.end();
         self.core.reopen();
@@ -867,6 +927,8 @@ impl Server {
             announce: None,
             checks: 0,
             heard: vec![Instant::now(); n],
+            resync: Vec::new(),
+            resyncs: 0,
         });
         self.core.begin();
         // A player lost while the game starts leaves at its first tick,
@@ -1319,6 +1381,30 @@ pub fn join(
     }
 }
 
+/// The server's world for a resync: applied before stepping `tick`,
+/// its pre-step state hash `hash` (`Simulation::net_snapshot` bytes).
+pub struct Snapshot {
+    pub tick: u64,
+    pub hash: u64,
+    pub bytes: Vec<u8>,
+}
+
+/// A resync snapshot on the wire: zstd, then base64 (the frame is
+/// JSON).
+fn encode_snapshot(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    let packed = zstd::bulk::compress(bytes, 3).expect("zstd compresses in memory");
+    base64::engine::general_purpose::STANDARD.encode(packed)
+}
+
+fn decode_snapshot(data: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    let packed = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|e| e.to_string())?;
+    zstd::stream::decode_all(&packed[..]).map_err(|e| e.to_string())
+}
+
 /// A player's running lockstep: input out, turns in, the hash check
 /// against the server. Non-blocking — the app polls it once per sim
 /// tick. Runs on the session's connection and hands it back at the
@@ -1338,8 +1424,19 @@ pub struct Lockstep {
     /// Hashes awaiting their counterpart.
     ours: BTreeMap<u64, u64>,
     theirs: BTreeMap<u64, u64>,
+    /// A desync or resync to tell (the toast).
     desync: Option<String>,
-    desync_seen: bool,
+    /// Desyncs detected (the summary).
+    desyncs: u64,
+    /// A resync asked for (at the desynced tick), not yet applied: the
+    /// checks wait for it.
+    resync_asked: Option<u64>,
+    /// The server's world, waiting for its tick.
+    snapshot: Option<Snapshot>,
+    /// Resyncs that healed.
+    resyncs: u64,
+    /// A resync that did not heal: the checks stop.
+    unhealed: bool,
     /// Hash checks that agreed (the session summary).
     agreed: u64,
     closed: Option<String>,
@@ -1365,7 +1462,11 @@ impl Lockstep {
             ours: BTreeMap::new(),
             theirs: BTreeMap::new(),
             desync: None,
-            desync_seen: false,
+            desyncs: 0,
+            resync_asked: None,
+            snapshot: None,
+            resyncs: 0,
+            unhealed: false,
             agreed: 0,
             closed: None,
             ended: false,
@@ -1474,6 +1575,15 @@ impl Lockstep {
                         checked = true;
                     }
                 }
+                Recv::Msg(Msg::Snapshot { tick, hash, data }) => match decode_snapshot(&data) {
+                    Ok(bytes) => self.snapshot = Some(Snapshot { tick, hash, bytes }),
+                    Err(e) => {
+                        let why = format!("resync snapshot: {e}");
+                        g.conn.close(&why);
+                        self.closed = Some(why);
+                        break;
+                    }
+                },
                 Recv::Msg(Msg::Lobby { view }) => {
                     g.view = view;
                     self.ended = true;
@@ -1511,10 +1621,51 @@ impl Lockstep {
         self.verdict.take()
     }
 
+    /// The server's world to apply before stepping `tick` (a resync),
+    /// once it has arrived — then [`Self::resynced`].
+    pub fn take_snapshot(&mut self, tick: u64) -> Option<Snapshot> {
+        self.snapshot.take_if(|s| s.tick == tick)
+    }
+
+    /// The resync snapshot of `tick` is applied: `Ok` — the world is the
+    /// server's again (its hash checked), the report says where it had
+    /// diverged; `Err` — it did not heal (why): the checks stop.
+    pub fn resynced(&mut self, tick: u64, outcome: Result<&[String], String>) {
+        self.resync_asked = None;
+        self.ours.retain(|&k, _| k >= tick);
+        self.theirs.retain(|&k, _| k >= tick);
+        let msg = match outcome {
+            Ok(report) => {
+                self.resyncs += 1;
+                let head: Vec<&str> = report
+                    .iter()
+                    .take(3)
+                    .map(|l| l.split(':').next().unwrap_or(l))
+                    .collect();
+                let more = report.len().saturating_sub(head.len());
+                let more = if more > 0 {
+                    format!(" +{more}")
+                } else {
+                    String::new()
+                };
+                format!(
+                    "resynced from the server at tick {tick} ({}{more})",
+                    head.join(", ")
+                )
+            }
+            Err(why) => {
+                self.unhealed = true;
+                format!("RESYNC FAILED at tick {tick}: {why} — hash checks stop")
+            }
+        };
+        eprintln!("net: {msg}");
+        self.desync = Some(msg);
+    }
+
     /// The pre-step state of lockstep tick `tick` — hashed (lazily)
-    /// only on check ticks.
+    /// only on check ticks, and not while a resync is on its way.
     pub fn note_hash(&mut self, tick: u64, hash: impl FnOnce() -> u64) {
-        if tick % CHECK_EVERY != 0 || self.desync_seen {
+        if tick % CHECK_EVERY != 0 || self.unhealed || self.resync_asked.is_some() {
             return;
         }
         let h = hash();
@@ -1536,11 +1687,15 @@ impl Lockstep {
             let (ours, theirs) = (self.ours[&t], self.theirs[&t]);
             if ours == theirs {
                 self.agreed += 1;
-            } else if !self.desync_seen {
-                self.desync_seen = true;
-                let msg = format!("DESYNC at tick {t}: server {theirs:016x}, here {ours:016x}");
+            } else if self.resync_asked.is_none() && !self.unhealed {
+                self.desyncs += 1;
+                self.resync_asked = Some(t);
+                let msg = format!(
+                    "DESYNC at tick {t}: server {theirs:016x}, here {ours:016x} — resyncing"
+                );
                 eprintln!("net: {msg}");
                 self.desync = Some(msg);
+                self.send(&Msg::Resync { tick: t });
             }
             // Everything up to a compared tick is settled.
             self.ours.retain(|&k, _| k > t);
@@ -1548,17 +1703,28 @@ impl Lockstep {
         }
     }
 
-    /// A first desync, once (for the toast).
+    /// A desync or a resync to tell, once (for the toast).
     pub fn take_desync(&mut self) -> Option<String> {
         self.desync.take()
     }
 
+    /// Desyncs detected, resyncs that healed.
+    #[cfg(test)]
+    pub fn desyncs(&self) -> (u64, u64) {
+        (self.desyncs, self.resyncs)
+    }
+
     fn summary(&self) {
-        let fate = match (&self.desync_seen, &self.closed) {
-            (true, _) => " — DESYNCED".to_string(),
-            (false, Some(why)) => format!(" — ended: {why}"),
-            (false, None) => String::new(),
-        };
+        let mut fate = String::new();
+        if self.desyncs > 0 {
+            fate += &format!(" — {} DESYNCS, {} resynced", self.desyncs, self.resyncs);
+        }
+        if self.unhealed {
+            fate += " — UNHEALED";
+        }
+        if let Some(why) = &self.closed {
+            fate += &format!(" — ended: {why}");
+        }
         println!(
             "net: {} ticks stepped, {} hash checks agreed{fate}",
             self.next_tick, self.agreed
@@ -1618,6 +1784,9 @@ mod tests {
         }
         fn hash(&self) -> u64 {
             self.tick * 7
+        }
+        fn snapshot(&self) -> Vec<u8> {
+            self.tick.to_le_bytes().to_vec()
         }
         fn step(&mut self, _: &[PortInput], _: &[u8]) {
             self.tick += 1;
@@ -1790,13 +1959,17 @@ mod tests {
     /// A player whose world forks from the SERVER's is told — each
     /// player is checked, the hosting one too.
     #[test]
-    fn a_fork_from_the_server_is_reported_once() {
+    fn a_fork_from_the_server_is_resynced() {
         let r = server("pw", None);
         let links = start(vec![guest(&r, "A"), guest(&r, "B")]);
         let mut ls: Vec<Lockstep> = links.into_iter().map(Lockstep::start).collect();
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut stepped = [0u64; 2];
-        while stepped.iter().any(|&n| n < 60) {
+        // Each player's "world" is the server's counter; player 0's
+        // forks by 1000 at tick 30.
+        let mut worlds = [0u64; 2];
+        let mut told = Vec::new();
+        while stepped.iter().any(|&n| n < 120) {
             assert!(Instant::now() < deadline, "stalled");
             for (k, p) in ls.iter_mut().enumerate() {
                 p.poll();
@@ -1804,16 +1977,28 @@ mod tests {
                     p.submit(input(0));
                 }
                 if let Some((t, _)) = p.take_turn() {
-                    // Player 0's world forks at tick 30.
-                    p.note_hash(t, || if k == 0 && t >= 30 { 1 } else { t * 7 });
+                    if let Some(snap) = p.take_snapshot(t) {
+                        assert_eq!(k, 0, "only the forked player is resynced");
+                        worlds[k] = u64::from_le_bytes(snap.bytes[..].try_into().unwrap());
+                        assert_eq!(worlds[k] * 7, snap.hash);
+                        p.resynced(t, Ok(&["the counter".into()]));
+                    }
+                    let w = worlds[k];
+                    p.note_hash(t, || w * 7);
+                    worlds[k] += 1 + if k == 0 && t == 30 { 1000 } else { 0 };
                     stepped[k] += 1;
+                    told.extend(p.take_desync().map(|d| (k, d)));
                 }
             }
         }
-        let d = ls[0].take_desync().expect("the fork");
-        assert!(d.contains("tick 48"), "{d}");
-        assert!(ls[0].take_desync().is_none(), "once");
-        assert!(ls[1].take_desync().is_none());
+        assert_eq!(told.len(), 2, "{told:?}");
+        assert!(told[0].1.contains("DESYNC at tick 48"), "{told:?}");
+        assert!(told[1].1.contains("resynced from the server"), "{told:?}");
+        assert!(told[1].1.contains("the counter"), "{told:?}");
+        assert_eq!(ls[0].desyncs(), (1, 1));
+        assert_eq!(worlds[0], worlds[1], "healed");
+        assert_eq!(ls[1].desyncs(), (0, 0));
+        assert!(ls[0].agreed >= 3, "the checks go on after the resync");
     }
 
     #[test]

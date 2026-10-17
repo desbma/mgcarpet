@@ -394,8 +394,12 @@ const LIFT_DRIFT_MC1: i16 = 8;
 /// lift only spares the pitch-and-fly micromanagement of reaching it.
 const LIFT_BAND_MC1: i16 = 1024;
 
+/// [`Simulation::state_sections`]' name for the world's folded digest
+/// (its own sections follow it).
+const WORLD_FOLD: &str = "world";
+
 /// The whole game state and its single mutation entry point.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Simulation {
     /// Monotonic tick counter since level start. One tick = one of the
     /// original's game turns (events, water phase, sprite frames).
@@ -527,7 +531,65 @@ impl Simulation {
     /// The full destructure makes a new `Simulation` field a compile
     /// error here: extend the hash deliberately.
     pub fn state_hash(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
+        use std::hash::Hasher;
+        let mut h = world::Fnv(world::FNV_BASIS);
+        self.hash_walk(&mut h);
+        h.finish()
+    }
+
+    /// [`Self::state_hash`] broken down: the flight tier's parts here,
+    /// then the world's own ([`World::state_sections`]) — two sims
+    /// differ exactly where these do (netplay's desync report).
+    pub fn state_sections(&self) -> Vec<(String, u64)> {
+        let mut h = world::Sectioned::new();
+        self.hash_walk(&mut h);
+        let (_, mut out) = h.finish_sections();
+        if let Some(w) = &self.world {
+            out.extend(w.state_sections());
+        }
+        out
+    }
+
+    /// Where this sim and `other` differ, as far as the state hash
+    /// sees: every differing section of [`Self::state_sections`], in
+    /// walk order (a pool slot with both sides' summary). Empty when
+    /// the hashes agree.
+    pub fn divergence_report(&self, other: &Simulation) -> Vec<String> {
+        let theirs: std::collections::HashMap<String, u64> =
+            other.state_sections().into_iter().collect();
+        let ours = self.state_sections();
+        let mut out = Vec::new();
+        for (name, h) in &ours {
+            if name == WORLD_FOLD || theirs.get(name) == Some(h) {
+                continue;
+            }
+            let slot = name
+                .strip_prefix("g.ent[")
+                .and_then(|r| r.strip_suffix(']'))
+                .and_then(|n| n.parse::<usize>().ok());
+            match (slot, &self.world, &other.world) {
+                (Some(i), Some(a), Some(b)) => out.push(format!(
+                    "{name}: here {} / there {}",
+                    a.slot_summary(i),
+                    b.slot_summary(i)
+                )),
+                _ if theirs.contains_key(name) => out.push(name.clone()),
+                _ => out.push(format!("{name}: here only")),
+            }
+        }
+        let mine: std::collections::HashSet<&str> = ours.iter().map(|(n, _)| n.as_str()).collect();
+        for (name, _) in other.state_sections() {
+            if !mine.contains(name.as_str()) {
+                out.push(format!("{name}: there only"));
+            }
+        }
+        out
+    }
+
+    /// The one state-hash walk ([`Self::state_hash`],
+    /// [`Self::state_sections`]).
+    fn hash_walk<H: world::HashSink>(&self, h: &mut H) {
+        use std::hash::Hash;
         let Simulation {
             tick,
             flyer,
@@ -544,11 +606,12 @@ impl Simulation {
             terrain_height,
             world: attached,
         } = self;
-        let mut h = world::Fnv(0xcbf2_9ce4_8422_2325);
-        tick.hash(&mut h);
+        h.section(|| "sim.tick".into());
+        tick.hash(h);
         // One flight block per seat, in seat order (a one-seat sim
         // hashes exactly as the single block did).
         for hx in flyer.ixs() {
+            h.section(|| format!("sim.flight[{}]", hx.0));
             let flyer = &flyer[hx];
             // Floats by BIT PATTERN (the `Player::speed_boost` precedent):
             // determinism here is bit-exact, and `-0.0` must not alias
@@ -564,31 +627,35 @@ impl Simulation {
                 flyer.pitch,
                 flyer.roll,
             ] {
-                f.to_bits().hash(&mut h);
+                f.to_bits().hash(h);
             }
-            (thrust_model[hx], altitude_model[hx]).hash(&mut h);
-            carpet[hx].hash(&mut h);
-            carpet_mc2[hx].hash(&mut h);
-            accel_was_active[hx].hash(&mut h);
-            turn_rate[hx].to_bits().hash(&mut h);
-            aim_lead[hx].to_bits().hash(&mut h);
-            lift_desired[hx].hash(&mut h);
+            (thrust_model[hx], altitude_model[hx]).hash(h);
+            carpet[hx].hash(h);
+            carpet_mc2[hx].hash(h);
+            accel_was_active[hx].hash(h);
+            turn_rate[hx].to_bits().hash(h);
+            aim_lead[hx].to_bits().hash(h);
+            lift_desired[hx].hash(h);
         }
-        weightless.hash(&mut h);
+        h.section(|| "sim.weightless".into());
+        weightless.hash(h);
         // Hash-quiet at rest (the transparent-at-pristine law): the
         // pinned goldens predate the barrel roll; a LIVE roll stamps a
         // tag byte (aliasing guard) + the driver state.
         for hx in broll.ixs() {
+            h.section(|| format!("sim.broll[{}]", hx.0));
             if broll[hx].active() {
-                11u8.hash(&mut h);
-                broll[hx].hash(&mut h);
+                11u8.hash(h);
+                broll[hx].hash(h);
             }
         }
-        terrain_height.hash(&mut h);
+        h.section(|| "sim.terrain_height".into());
+        terrain_height.hash(h);
         // Folded, not re-derived: the world keeps its own pinned
         // goldens and this tier adds to them.
-        attached.as_ref().map(world::World::state_hash).hash(&mut h);
-        h.finish()
+        // (Sectioned: the world's own parts follow the walk.)
+        h.section(|| WORLD_FOLD.into());
+        attached.as_ref().map(world::World::state_hash).hash(h);
     }
 
     /// The AIM heading, radians — where the crosshair points and casts

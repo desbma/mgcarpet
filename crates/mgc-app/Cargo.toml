@@ -22,6 +22,10 @@ png = "0.17"
 ab_glyph = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Netplay's resync snapshot on the wire (`net.rs`): both already in the
+# tree through mgc-formats.
+base64 = "0.22"
+zstd = "0.13"
 mgc-audio = { version = "0.1.0", path = "../mgc-audio" }
 
 # X11 only: the boot-grab focus hammer. winit's `focus_window` merely

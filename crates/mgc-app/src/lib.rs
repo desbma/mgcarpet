@@ -2222,6 +2222,30 @@ struct Session {
     bolts: entities::BoltLedger,
 }
 
+impl Session {
+    /// The sim's world was replaced wholesale (a save's resume, a
+    /// netplay resync): the renderer's terrain and entity mirrors and
+    /// the interpolation history all have to be re-seeded — the same
+    /// set the castle-less-death restart re-seeds, for the same reason.
+    /// `pose_prev`/`pose_cur` in particular MUST be cleared: a stale
+    /// snapshot could coincidentally pair a (slot, generation) that now
+    /// means a different entity.
+    ///
+    /// The flyer needs no re-derivation: it and the carpet are both in
+    /// the payload, so they come back mutually consistent.
+    fn reseed_after_restore(&mut self) {
+        self.prev_flyer = self.sim.flyer[local_hx()];
+        self.pose_prev = Vec::new();
+        self.pose_cur = Vec::new();
+        self.fire_blasts.clear();
+        self.bolts.clear();
+        if let Some(w) = self.sim.world.as_mut() {
+            w.terrain_dirty = true;
+            w.entities_dirty = true;
+        }
+    }
+}
+
 /// Which surface owns the frame: a running level, or one of the
 /// frontend screens. The frontend states hold NO session — the level
 /// is torn down on the way out and rebuilt on the next launch.
@@ -4468,6 +4492,14 @@ impl App {
         };
         self.net_stall = None;
         self.net_stall_told = false;
+        // A resync: the server's world replaces ours before this tick.
+        if let Some(snap) = ls.take_snapshot(tick)
+            && let Some(sess) = self.session.as_deref_mut()
+        {
+            let outcome = net_resync(&mut sess.sim, &snap);
+            ls.resynced(tick, outcome.as_deref().map_err(Clone::clone));
+            sess.reseed_after_restore();
+        }
         if let Some(sess) = self.session.as_deref() {
             ls.note_hash(tick, || sess.sim.state_hash());
         }
@@ -4652,26 +4684,9 @@ impl App {
             return Err(format!("slot {}: {e}", slot + 1));
         }
 
-        // The restore replaced the world wholesale, so the renderer's
-        // terrain and entity mirrors and the interpolation history all
-        // have to be re-seeded — the same set the castle-less-death
-        // restart re-seeds, for the same reason. `pose_prev`/`pose_cur`
-        // in particular MUST be cleared: a stale snapshot could
-        // coincidentally pair a (slot, generation) that now means a
-        // different entity.
-        //
-        // The flyer needs no re-derivation: it and the carpet are both
-        // in the payload, so they come back mutually consistent.
+        // The restore replaced the world wholesale.
         if let Some(sess) = self.session.as_deref_mut() {
-            sess.prev_flyer = sess.sim.flyer[local_hx()];
-            sess.pose_prev = Vec::new();
-            sess.pose_cur = Vec::new();
-            sess.fire_blasts.clear();
-            sess.bolts.clear();
-            if let Some(w) = sess.sim.world.as_mut() {
-                w.terrain_dirty = true;
-                w.entities_dirty = true;
-            }
+            sess.reseed_after_restore();
         }
         self.sync_world();
         println!(
@@ -13733,6 +13748,32 @@ fn net_level(
     )
 }
 
+/// Apply the server's world (a resync) onto `sim` before it steps the
+/// snapshot's tick: `Ok` — the restored hash is the server's, and the
+/// report says where `sim` had diverged (printed in full); `Err` — it
+/// did not heal. The app's and the tests' one path.
+fn net_resync(sim: &mut Simulation, snap: &net::Snapshot) -> Result<Vec<String>, String> {
+    let before = sim.clone();
+    sim.net_restore(&snap.bytes).map_err(|e| e.to_string())?;
+    let report = before.divergence_report(sim);
+    eprintln!(
+        "net: resync at tick {} — {} state sections had diverged:",
+        snap.tick,
+        report.len()
+    );
+    for line in &report {
+        eprintln!("net:   {line}");
+    }
+    let hash = sim.state_hash();
+    if hash != snap.hash {
+        return Err(format!(
+            "restored {hash:016x}, the server's {:016x} (the snapshot misses state)",
+            snap.hash
+        ));
+    }
+    Ok(report)
+}
+
 /// Drop a step's sound requests unheard — what the app's `audio_tick`
 /// does every tick with them, minus the mixer. The world's pending
 /// vec is HASHED: every peer (and the server's world) must drain it
@@ -13809,6 +13850,12 @@ impl net::Referee for ServerWorld {
 
     fn hash(&self) -> u64 {
         self.sim.as_ref().map_or(0, Simulation::state_hash)
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.sim
+            .as_ref()
+            .map_or_else(Vec::new, Simulation::net_snapshot)
     }
 
     fn step(&mut self, inputs: &[mgc_formats::mgcr::PortInput], left: &[u8]) {
@@ -14816,5 +14863,193 @@ mod net_lockstep_tests {
     #[test]
     fn mc2_peers_and_rivals_stay_identical() {
         n_peers_stay_identical("mc2", 52, 2, 3);
+    }
+
+    /// The desync recovery's vehicle: a FORKED world restored from the
+    /// server's snapshot IS the server's world — hash-identical at once,
+    /// and the same turns stepped on both never fork again (what the
+    /// snapshot leaves out would). The authority has banished a seat
+    /// the forked world never saw leave. A fresh build restored the
+    /// same way (a rejoin) too — again every 100 ticks.
+    fn a_snapshot_heals_a_fork(game: &str, arena: u32, n: usize, ai: u8) {
+        let path = level(game, arena);
+        if !path.exists() {
+            eprintln!("skipping: no baked {game} arena {arena}");
+            return;
+        }
+        let g = net::Game {
+            seats: (0..n as u8).collect(),
+            names: vec![String::new(); n],
+            models: (0..n).map(models_of).collect(),
+            ai,
+            level: path.to_string_lossy().into_owned(),
+            rules: super::rules::session(&config::Config::default()),
+        };
+        const LEAVE: u64 = 400;
+        const FORK: u64 = 200;
+        const SNAP: u64 = 900;
+        const AFTER: u64 = 2400;
+        let turn = |t: u64, forked: bool, left: bool| -> Vec<FlightInput> {
+            (0..n)
+                .map(|k| {
+                    if k == n - 1 && left {
+                        return FlightInput {
+                            suicide: t == LEAVE,
+                            ..FlightInput::default()
+                        };
+                    }
+                    script(k + usize::from(forked && k == 1 && t >= FORK), t)
+                })
+                .collect()
+        };
+        let step = |sim: &mut Simulation, t: u64, forked: bool, leaves: bool| {
+            if leaves && t == LEAVE {
+                sim.world.as_mut().unwrap().depart(Hx(n as u8 - 1));
+            }
+            sim.step_seats(&turn(t, forked, leaves && t >= LEAVE));
+            super::drain_sounds(sim.world.as_mut().unwrap());
+        };
+        let mut server = client_sim(&g);
+        let mut forked = client_sim(&g);
+        for t in 0..SNAP {
+            step(&mut server, t, false, true);
+            step(&mut forked, t, true, false);
+        }
+        assert_ne!(server.state_hash(), forked.state_hash(), "{game}: no fork");
+        let snap = server.net_snapshot();
+        let mut fresh = client_sim(&g);
+        for (what, sim) in [("forked", &mut forked), ("fresh", &mut fresh)] {
+            sim.net_restore(&snap).unwrap();
+            let report = sim.divergence_report(&server);
+            assert!(
+                report.is_empty(),
+                "{game}: the {what} world, restored: {report:#?}"
+            );
+        }
+        for t in SNAP..AFTER {
+            // The fresh world re-restores every 100 ticks: many states,
+            // not one (beams in flight, recycle stacks, deaths…).
+            if t % 100 == 0 {
+                fresh.net_restore(&server.net_snapshot()).unwrap();
+            }
+            step(&mut server, t, false, true);
+            for (what, sim) in [("forked", &mut forked), ("fresh", &mut fresh)] {
+                step(sim, t, false, true);
+                if sim.state_hash() == server.state_hash() {
+                    continue;
+                }
+                let report = sim.divergence_report(&server);
+                assert!(
+                    report.is_empty(),
+                    "{game}: the restored {what} world forked again at tick {t}: {report:#?}"
+                );
+            }
+        }
+        let w = forked.world.as_ref().unwrap();
+        assert!(w.banished(Hx(n as u8 - 1)), "{game}: the leaver came back");
+    }
+
+    /// ⭐ RECONCILIATION end to end: two players and AI rivals against
+    /// the hosted server's own world, through the real lockstep. Player
+    /// 1's world forks by an app-side write no input explains (it
+    /// banishes its own seat at tick 300, alone): the next check (312)
+    /// catches it, the server's world comes back ahead of a later turn,
+    /// the report names the seat, and from there on both players'
+    /// worlds are tick-identical again — unbanished, the checks agreeing.
+    fn a_forked_player_is_resynced(game: &str, arena: u32) {
+        let path = level(game, arena);
+        if !path.exists() {
+            eprintln!("skipping: no baked {game} arena {arena}");
+            return;
+        }
+        let (_server, links) = session(&path, 2, 2);
+        let mut sims: Vec<Simulation> = links.iter().map(|l| client_sim(&l.game)).collect();
+        let mut peers: Vec<net::Lockstep> = links.into_iter().map(net::Lockstep::start).collect();
+        const FORK: u64 = 300;
+        const TICKS: u64 = 900;
+        let mut stepped = [0u64; 2];
+        let mut hashes = [Vec::new(), Vec::new()];
+        let mut healed_at = None;
+        let mut told = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while stepped.iter().any(|&n| n < TICKS) {
+            assert!(std::time::Instant::now() < deadline, "lockstep stalled");
+            for k in 0..2 {
+                let p = &mut peers[k];
+                p.poll();
+                assert!(p.closed().is_none(), "peer {k}: {:?}", p.closed());
+                while p.wants_input() {
+                    let t = stepped[k] + net::INPUT_DELAY;
+                    let input = if p.in_lead_in() {
+                        FlightInput::default()
+                    } else {
+                        script(k, t)
+                    };
+                    p.submit(replay::port_input_from(&input));
+                }
+                if stepped[k] < TICKS
+                    && let Some((t, inputs)) = p.take_turn()
+                {
+                    let sim = &mut sims[k];
+                    if let Some(snap) = p.take_snapshot(t) {
+                        assert_eq!(k, 1, "{game}: only the forked player resyncs");
+                        let outcome = super::net_resync(sim, &snap);
+                        let report = outcome.clone().expect("the resync heals");
+                        assert!(
+                            report.iter().any(|l| l.starts_with("player[1]")),
+                            "{game}: {report:#?}"
+                        );
+                        p.resynced(t, outcome.as_deref().map_err(Clone::clone));
+                        healed_at = Some(t);
+                    }
+                    p.note_hash(t, || sim.state_hash());
+                    if k == 1 && t == FORK {
+                        sim.world.as_mut().unwrap().depart(Hx(1));
+                    }
+                    let inputs: Vec<FlightInput> =
+                        inputs.iter().map(replay::flight_input_from).collect();
+                    sim.step_seats(&inputs);
+                    super::drain_sounds(sim.world.as_mut().unwrap());
+                    hashes[k].push(sim.state_hash());
+                    stepped[k] += 1;
+                    told.extend(p.take_desync().map(|d| (k, d)));
+                }
+            }
+        }
+        let healed = healed_at.expect("never resynced") as usize;
+        assert!(healed > 312, "{game}: resynced at {healed}");
+        assert_ne!(hashes[0][FORK as usize], hashes[1][FORK as usize]);
+        for t in healed..TICKS as usize {
+            assert_eq!(
+                hashes[0][t], hashes[1][t],
+                "{game}: tick {t} after the resync"
+            );
+        }
+        assert_eq!(told.len(), 2, "{game}: {told:?}");
+        assert!(told[0].1.contains("DESYNC at tick 312"), "{told:?}");
+        assert!(told[1].1.contains("resynced"), "{told:?}");
+        assert_eq!(peers[1].desyncs(), (1, 1));
+        assert_eq!(peers[0].desyncs(), (0, 0));
+        assert!(!sims[1].world.as_ref().unwrap().banished(Hx(1)));
+    }
+
+    #[test]
+    fn mc1_a_forked_player_is_resynced() {
+        a_forked_player_is_resynced("mc1", 50);
+    }
+
+    #[test]
+    fn mc2_a_forked_player_is_resynced() {
+        a_forked_player_is_resynced("mc2", 52);
+    }
+
+    #[test]
+    fn mc1_a_snapshot_heals_a_fork() {
+        a_snapshot_heals_a_fork("mc1", 50, 3, 3);
+    }
+
+    #[test]
+    fn mc2_a_snapshot_heals_a_fork() {
+        a_snapshot_heals_a_fork("mc2", 52, 3, 3);
     }
 }

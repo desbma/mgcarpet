@@ -730,3 +730,39 @@ impl Simulation {
         Ok(())
     }
 }
+
+// ------------------------------------------------------- network games
+
+impl Simulation {
+    /// A network game's resync snapshot (`docs/NETPLAY.md`): the save's
+    /// own [`Self::snapshot`] plus the lanes only a network game has —
+    /// a seat's banishment. Lobby games are never saved, so those stay
+    /// out of the save format (no `SNAPSHOT_VERSION` bump for a field
+    /// no save could hold).
+    pub fn net_snapshot(&self) -> Vec<u8> {
+        let save = self.snapshot();
+        let mut w = Writer::new();
+        w.put(&(save.len() as u32));
+        w.raw(&save);
+        if let Some(world) = &self.world {
+            world.net_snap_write(&mut w);
+        }
+        w.buf
+    }
+
+    /// Apply a [`Self::net_snapshot`] onto this sim, in place — the
+    /// same contract as [`Self::restore`] (a world built for the same
+    /// level and seats; a failure part way leaves it half-applied).
+    pub fn net_restore(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        let mut r = Reader::new(bytes);
+        let len = r.get::<u32>()? as usize;
+        self.restore(r.raw(len)?)?;
+        if let Some(world) = self.world.as_mut() {
+            world.net_snap_apply(&mut r)?;
+        }
+        if r.remaining() != 0 {
+            return Err(SnapshotError::Trailing(r.remaining()));
+        }
+        Ok(())
+    }
+}

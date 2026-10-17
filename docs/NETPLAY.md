@@ -110,10 +110,38 @@ mgcarpet --join 127.0.0.1                                     # a player (the se
   (`drain_sounds`: the pending vec is hashed).
 - Wire: little-endian `u32` length + one JSON message. Idle input is `{}`.
 - **Desync detection**: the server stamps its own world's pre-step
-  `state_hash` every 24 ticks onto that tick's turn; every player — the
-  hosting one too — compares and toasts/logs the first `DESYNC at tick N`.
-  Detection only — no reconciliation yet. `MGC_NET_TRACE=1` prints every
-  check on the server and the players (diff the logs).
+  `state_hash` (the FULL sim: world + every seat's flight tier) every 24
+  ticks onto that tick's turn; every player — the hosting one too —
+  compares. `MGC_NET_TRACE=1` prints every check on the server and the
+  players (diff the logs).
+- **Reconciliation (resync)**: a player whose hash disagrees toasts
+  `DESYNC at tick N … — resyncing` and sends `Resync`. The server sends
+  its world's NET SNAPSHOT (`Simulation::net_snapshot`: the save's
+  snapshot + a net-only tail — each seat's banishment and the pool's
+  ranked recycle victims, which a retail LOAD empties but a clone must
+  keep), zstd + base64, ~130-240 KiB, taken BEFORE the next turn it
+  steps and sent AHEAD of that turn. The player applies it right before
+  stepping that same tick (`Lockstep::take_snapshot` → `net_resync`) —
+  nothing to re-simulate: TCP order guarantees he has not stepped it
+  yet. The server's world wins.
+- **The divergence report**: before applying, the player's own world is
+  compared with the server's section by section
+  (`Simulation::divergence_report` over `state_sections`: the flight
+  tier per seat, every `Gen` field, EVERY POOL SLOT — with class, model,
+  position, life — and the world's lanes per seat). The sections come
+  from the very walk that makes `state_hash` (`HashSink`: a plain FNV
+  ignores the marks, `Sectioned` digests each section too), so the
+  report cannot drift from the hash. Printed in full to stderr
+  (`net:   g.ent[123]: here class 5 model 24 … / there …`); the toast
+  names the first three (`resynced from the server at tick N
+  (player[1], g.ent[812] +4)`).
+- **The heal is verified**: the restored hash must equal the server's
+  (`Snapshot::hash`) — a miss is `RESYNC FAILED … the snapshot misses
+  state`, and the checks stop (no resync loop). Every resync is told
+  loudly and counted: it hides a fork, it does not fix the bug behind
+  it — the report is the lead. Hash-SILENT state is outside both the
+  check and the report (by definition); a snapshot that dropped some
+  would show as a recurring desync.
 - **The game's end**: the server's world decides (`net_verdict`: one
   wizard standing, or no human); the announcement rides the next turn
   (`Turn::over`), every player shows "<name> is victorious!" and fades
@@ -121,8 +149,10 @@ mgcarpet --join 127.0.0.1                                     # a player (the se
   The server reopens the lobby when nobody plays any more, or 10 s after
   the verdict (`GAME_OVER_GRACE`). A player whose session is lost judges
   his own world.
-- On exit each player prints `net: N ticks stepped, M hash checks agreed`;
-  the server `game over after N ticks, M hash checks stamped`.
+- On exit each player prints `net: N ticks stepped, M hash checks agreed`
+  (+ `— D DESYNCS, R resynced`, `— UNHEALED`); the server `game over after
+  N ticks, M hash checks stamped, R resyncs` (and `seat k resynced at
+  tick N (… KiB)` as it happens).
 
 ## Pinned for the session
 
@@ -255,10 +285,13 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
    Lobby art renders: `sprite-export/mc2-lobby/` (bg, 8 wizard portraits,
    sprite sheet).
 
-4. **Desync recovery.** Detection exists (24-tick hash). Next: a
-   divergence report (which part of the state differs), then the host's
-   snapshot wins (save-format world snapshot over the wire, client
-   reloads and re-simulates the turns it already holds).
+4. ✅ **Desync recovery** (2026-10-17, log #28): the sectioned
+   divergence report + the server's snapshot wins (no re-simulation: it
+   is applied before the very tick it was taken at). Still open:
+   PREVENTION — `libm` for the sim's ~7 transcendental calls
+   (`sin_cos`/`sin` in the enhanced mover, `hypot` in world.rs) + a
+   guard against new platform-math calls; cross-platform FP is the one
+   known source of an honest fork.
 5. Later: 🏦 **spectator ghosts** (player idea, 10-15, banked — "a cherry
    on top"): a BANISHED player rises from his last corpse as a visible
    in-game ghost (mostly translucent, greyscale or another filter), flies
@@ -601,3 +634,26 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
   back); the messages no longer name a host ("fixed for this session").
   Fixed a race in `play_waits_for_agreement…`. 1,640 workspace tests,
   clippy clean.
+- 2026-10-17 #28: ✅ **RECONCILIATION** — full state-hash verification
+  with a sectioned report, and resync from the server's world.
+  (1) `HashSink` / `Sectioned` (world.rs): ONE walk for `state_hash` and
+  `state_sections` (`World::hash_walk`, `Gen::hash_walk` field by field
+  + slot by slot, `Simulation::hash_walk`); every golden unmoved (the
+  main stream is byte-identical; `the_sectioned_walk_is_the_derived_hash`
+  pins `Gen`'s walk against its derive). (2) `Simulation::net_snapshot` /
+  `net_restore` (snapshot.rs): the save + a net tail (banishment, the
+  recycle stack) — NO `SNAPSHOT_VERSION` bump, saves untouched. Found by
+  the tests: `banished` (offline, the report said `player[2]`) and the
+  recycle stack (`g.mc2_recycle` on MC1 — retail's load empties it).
+  (3) Protocol 7: `Resync` / `Snapshot`; `Referee::snapshot`;
+  `Lockstep::take_snapshot` / `resynced`; app `net_resync` (shared with
+  the tests) + `Session::reseed_after_restore` (shared with a save's
+  resume). Tests: `net::tests::a_fork_from_the_server_is_resynced`;
+  `{mc1,mc2}_a_snapshot_heals_a_fork` (3 humans + 3 AI, a forked world
+  and a fresh one restored from the authority's — which banished a seat
+  the fork never saw leave — then 1500 ticks identical, the fresh one
+  re-restored every 100 ticks; also passed ad hoc on MC1 2/9/30 and MC2
+  1/22); `{mc1,mc2}_a_forked_player_is_resynced` (real TCP + the hosted
+  `ServerWorld`: a player banishes his own seat alone at tick 300 →
+  DESYNC at 312 → resynced at 315, report `player[1]`, identical after).
+  ⏭ playtest (nothing should change: a healthy session never resyncs).

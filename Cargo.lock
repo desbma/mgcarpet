@@ -1088,6 +1088,7 @@ name = "mgc-app"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "base64",
  "mgc-audio",
  "mgc-formats",
  "mgc-import",
@@ -1100,6 +1101,7 @@ dependencies = [
  "winit",
  "x11rb",
  "zip",
+ "zstd",
 ]
 
 [[package]]
