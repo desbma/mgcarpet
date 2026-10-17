@@ -571,7 +571,9 @@ impl Server {
                         Some(format!("this server runs {}", self.plays.title()))
                     } else if build != self.build {
                         Some(format!("build {build}, the server runs {}", self.build))
-                    } else if passphrase != self.passphrase {
+                    } else if !self.passphrase.is_empty() && passphrase != self.passphrase {
+                        // An empty passphrase = an open session: anyone
+                        // gets in (player ruling 2026-10-17).
                         Some("wrong passphrase".into())
                     } else {
                         None
@@ -2032,6 +2034,24 @@ mod tests {
         assert_eq!(b.view().me().unwrap().wizard, 1, "the first free wizard");
         assert!(!b.view().is_admin());
         assert_eq!(b.view().passphrase, None, "the admin's only");
+    }
+
+    /// An empty passphrase is an open session: anyone gets in, whatever
+    /// he sends (player ruling 2026-10-17) — until the admin sets one.
+    #[test]
+    fn an_empty_passphrase_opens_the_session() {
+        let r = server("", None);
+        let a = connect(&r, "A", "", "test").unwrap();
+        connect(&r, "B", "anything", "test").unwrap();
+        let mut a = a;
+        a.set_passphrase("now".into());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while a.view().passphrase.as_deref() != Some("now") {
+            assert!(Instant::now() < deadline);
+            a.poll();
+        }
+        let e = connect(&r, "C", "", "test").err().unwrap();
+        assert!(e.contains("wrong passphrase"), "{e}");
     }
 
     /// A session plays ONE game, the server's: a player of another is

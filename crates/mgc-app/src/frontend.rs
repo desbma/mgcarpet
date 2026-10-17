@@ -491,11 +491,12 @@ impl MainMenu {
                 pass,
                 ..
             } => {
-                // Both fields are required (ruling 6: a session has a
-                // passphrase); an empty one clicks and stays.
+                // The address (the port when hosting) is required; the
+                // passphrase is optional — empty = an open session
+                // (player ruling 2026-10-17).
                 self.sounds.push(SND_CLICK);
                 let target = if *host { &*port } else { &*addr };
-                if target.is_empty() || pass.is_empty() {
+                if target.is_empty() {
                     return;
                 }
                 self.pending = Some(if *host {

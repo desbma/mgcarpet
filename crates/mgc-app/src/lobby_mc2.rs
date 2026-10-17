@@ -428,7 +428,8 @@ impl LobbyScreen {
         if let Some(p) = &self.passphrase {
             rows.push(RuleRow {
                 label: "Passphrase".into(),
-                value: p.clone(),
+                // Empty = an open session (anyone gets in).
+                value: if p.is_empty() { "none".into() } else { p.clone() },
             });
         }
         rows.extend(self.rules.iter().cloned());

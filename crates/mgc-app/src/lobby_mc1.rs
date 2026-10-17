@@ -365,7 +365,8 @@ impl Mc1LobbyScreen {
         if let Some(p) = &self.passphrase {
             rows.push(RuleRow {
                 label: "Passphrase".into(),
-                value: p.clone(),
+                // Empty = an open session (anyone gets in).
+                value: if p.is_empty() { "none".into() } else { p.clone() },
             });
         }
         if let Some(v) = &self.view {

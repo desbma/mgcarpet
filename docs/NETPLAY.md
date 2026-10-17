@@ -133,7 +133,8 @@ mgcarpet --join 127.0.0.1                                     # a player (the se
   mismatch is a refusal.
 - `--passphrase WORD`: the session's passphrase (the server's; players
   must match; empty when omitted). Not a secret — just keeps strangers and
-  kicked players out.
+  kicked players out. An EMPTY passphrase is an open session: anyone gets
+  in, whatever they send (player ruling 2026-10-17).
 - Under the hood the CLI goes through the LOBBY (`lobby.rs` +
   `net::Server`/`net::Guest`, protocol 5): a `--join` that is not the
   admin agrees to whatever is set by itself; the admin (`--host`'s player,
@@ -324,7 +325,9 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
       over voice (Discord) these days.
    6. A session needs a PASSPHRASE to enter: the host hands out hostname +
       passphrase, and can change it (a kicked player can't come back).
-      Maybe optional later; required for now.
+      ⚖ 2026-10-17: OPTIONAL — empty by default; an empty passphrase is an
+      open session (anyone gets in; a kicked player too, until the host
+      sets one).
    7. Only the host sets the level and presses Play. The level is part of
       the rules everyone agrees to; Play is possible only once everyone
       has agreed.

@@ -543,8 +543,9 @@ impl Mc1Menu {
         }
     }
 
-    /// OK on the network scroll: both fields are required (a session
-    /// has a passphrase); an empty one keeps the scroll up.
+    /// OK on the network scroll: the address (the port when hosting) is
+    /// required, an empty one keeps the scroll up; the passphrase is
+    /// optional (empty = an open session, player ruling 2026-10-17).
     fn net_ok(&mut self) {
         let Some(Modal::Network {
             host,
@@ -558,7 +559,7 @@ impl Mc1Menu {
             return;
         };
         let target = if *host { port } else { addr };
-        if target.is_empty() || pass.is_empty() {
+        if target.is_empty() {
             return;
         }
         self.pending = Some(if *host {
@@ -1113,8 +1114,8 @@ mod tests {
 
     /// Multiplayer (button 3) is live and asks the app for the network
     /// scroll; the scroll's Join face fills from the most recent host,
-    /// Enter walks its fields and the last one joins; an empty
-    /// passphrase keeps it up.
+    /// Enter walks its fields and the last one joins — with an empty
+    /// passphrase too (an open session); an empty address keeps it up.
     #[test]
     fn the_network_scroll_joins() {
         let Some(mut m) = menu() else {
@@ -1129,19 +1130,28 @@ mod tests {
         m.key_enter();
         m.key_enter();
         m.key_enter();
-        assert!(m.take_action().is_none(), "no passphrase yet");
-        for c in "pw!".chars() {
-            m.key_char(c);
-        }
-        m.key_enter();
+        // No passphrase: an open session (player ruling 2026-10-17).
         assert_eq!(
             m.take_action(),
             Some(Mc1Action::Join {
                 addr: "box".into(),
                 port: "7000".into(),
-                passphrase: "pw!".into(),
+                passphrase: String::new(),
             })
         );
+        // No address: the scroll stays up.
+        m.open_network(vec!["box".into()], "7777".into(), "7777".into(), "pw".into());
+        for _ in 0..3 {
+            m.key_backspace();
+        }
+        m.key_enter();
+        m.key_enter();
+        for c in "pw!".chars() {
+            m.key_char(c);
+        }
+        m.key_enter();
+        assert!(m.take_action().is_none(), "no address");
+        assert!(m.editing());
         m.open_connecting();
         m.escape();
         assert!(matches!(m.modal, Some(Modal::Connecting)), "no way out mid-join");
