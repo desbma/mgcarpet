@@ -23,7 +23,8 @@ struct MapGlobals {
     // in tiles (MAP_TILES; the toroidal wrap + texture size)
     mode: vec4<f32>,
     // x = Beyond-Sight ripple strength (0 = off), y = its animation
-    // clock in seconds
+    // clock in seconds, z = the death greyscale amount (retail's
+    // black-and-white palette greys the radar with everything else)
     fx: vec4<f32>,
 };
 
@@ -211,6 +212,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // tip = no lift.
         let d = select(cuv.y / arm_y, cuv.x / arm_x, on_h);
         rgb = mix(rgb, vec3<f32>(1.0), (1.0 - d) * 0.85);
+    }
+
+    // The death greyscale: the world shaders' sRGB `(r+g+b)/3` mix.
+    if mg.fx.z > 0.0 {
+        var srgb = select(1.055 * pow(rgb, vec3<f32>(1.0 / 2.4)) - 0.055, rgb * 12.92, rgb <= vec3<f32>(0.0031308));
+        srgb = mix(srgb, vec3<f32>((srgb.r + srgb.g + srgb.b) / 3.0), mg.fx.z);
+        rgb = select(pow((srgb + 0.055) / 1.055, vec3<f32>(2.4)), srgb / 12.92, srgb <= vec3<f32>(0.04045));
     }
 
     // Output alpha carries the HUD transparency (radar follows the same

@@ -2101,6 +2101,22 @@ pub struct Renderer {
     /// (the dots must read over the radar frame art), so the fade
     /// quad cannot cover them — they dim themselves instead.
     overlay_fade: f32,
+    /// The in-flight marker LAYER (layer.wgsl): the radar's markers
+    /// draw into `marker_layer` (scene-sized, cleared transparent,
+    /// premultiplied accumulation) with `marker_layer_pipeline` — the
+    /// UI shader, single-sampled, no depth — and the composite pipeline
+    /// lays the finished layer over the radar once, applying the HUD
+    /// transparency, the level-end fade and the death greyscale to the
+    /// layer as a whole. Per-quad alpha let every miniature's halo
+    /// silhouettes show through it (player-reported 2026-10-17: hazy
+    /// icons under HUD transparency, icons flaring white in the fade,
+    /// no greyscale at all).
+    marker_layer_pipeline: wgpu::RenderPipeline,
+    marker_comp_pipeline: wgpu::RenderPipeline,
+    marker_comp_layout: wgpu::BindGroupLayout,
+    marker_comp_buf: wgpu::Buffer,
+    /// (view, composite bind group, size) — rebuilt on a size change.
+    marker_layer: Option<(wgpu::TextureView, wgpu::BindGroup, (u32, u32))>,
     fill_pipeline: wgpu::RenderPipeline,
     /// The textured parallax-sky pass; the bind groups exist only
     /// while a level's sky bitmap is loaded (see `load_sky`). The
@@ -3598,6 +3614,136 @@ impl Renderer {
             cache: None,
         });
 
+        // The in-flight marker layer (see `Renderer::marker_layer`):
+        // the UI shader again, but into a single-sampled, depthless
+        // offscreen target, accumulating PREMULTIPLIED colour (colour
+        // src·a + dst·(1-a), alpha a + dst·(1-a)) from a transparent
+        // clear — so the layer holds what the quads would show opaque.
+        let marker_layer_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("marker layer"),
+            layout: Some(&ui_layout),
+            vertex: wgpu::VertexState {
+                module: &ui_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<UiQuad>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x4, 1 => Float32x4, 2 => Float32x4,
+                    ],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &ui_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+        let marker_comp_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("marker composite"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("layer.wgsl").into()),
+        });
+        let marker_comp_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("marker composite"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let marker_comp_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("marker composite globals"),
+            size: 48,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let marker_comp_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("marker composite"),
+                bind_group_layouts: &[&marker_comp_layout],
+                push_constant_ranges: &[],
+            });
+        let marker_comp_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("marker composite"),
+            layout: Some(&marker_comp_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &marker_comp_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &marker_comp_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            // Drawn inside the main pass, so it matches its depth
+            // attachment and sample count (like the UI pipeline).
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: ms,
+            multiview: None,
+            cache: None,
+        });
+
         let depth = create_depth(&device, width, height, samples);
 
         Self {
@@ -3645,6 +3791,11 @@ impl Renderer {
             map_zoom_mult: 1.0,
             minimap_alpha: 1.0,
             overlay_fade: 0.0,
+            marker_layer_pipeline,
+            marker_comp_pipeline,
+            marker_comp_layout,
+            marker_comp_buf,
+            marker_layer: None,
             map_bind_group_layout,
             map_bind_group: None,
             sight_tex,
@@ -5707,6 +5858,47 @@ impl Renderer {
         self.msaa_color = self.make_msaa_target(dw, dh, "msaa-scene");
     }
 
+    /// The marker layer at the scene size `(w, h)`, built or rebuilt
+    /// on a size change (see `marker_layer`).
+    fn ensure_marker_layer(&mut self, w: u32, h: u32) {
+        if self.marker_layer.as_ref().is_some_and(|l| l.2 == (w, h)) {
+            return;
+        }
+        let view = self
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("marker layer"),
+                size: wgpu::Extent3d {
+                    width: w.max(1),
+                    height: h.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("marker composite"),
+            layout: &self.marker_comp_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.marker_comp_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+            ],
+        });
+        self.marker_layer = Some((view, bind_group, (w, h)));
+    }
+
     /// A multisampled colour attachment, or `None` when MSAA is off.
     fn make_msaa_target(&self, w: u32, h: u32, label: &str) -> Option<wgpu::TextureView> {
         if self.samples <= 1 {
@@ -6422,25 +6614,14 @@ impl Renderer {
             }
         }
 
-        // The level-end fade over the marker layer: in flight the
-        // stamps draw after the app UI (and so after its fade quad) —
-        // dim them here so the radar markers sink into the black with
-        // the rest of the HUD. On the map screen the app UI draws
-        // last and the fade quad already covers them.
-        if self.overlay_fade > 0.0 && !self.map_view {
-            let keep = 1.0 - self.overlay_fade;
-            for q in &mut stamp_quads {
-                q.tint[3] *= keep;
-            }
-        }
-        // In flight the stamps ARE the radar's markers: they take the
-        // radar's HUD transparency, or they float opaque over a
-        // see-through disc. (The map screen is not HUD.)
-        if !self.map_view && self.minimap_alpha < 1.0 {
-            for q in &mut stamp_quads {
-                q.tint[3] *= self.minimap_alpha;
-            }
-        }
+        // In flight the stamps ARE the radar's markers: they draw into
+        // the marker layer and composite over the radar as one image,
+        // taking the radar's HUD transparency, the level-end fade (in
+        // flight they draw after the app UI, so after its fade quad)
+        // and the death greyscale there (`marker_layer`). On the map
+        // screen they draw straight: not HUD, the app UI draws last
+        // and its fade quad covers them, and death shuts the map.
+        let layered = !self.map_view && !stamp_quads.is_empty();
 
         // UI quads (screen-space overlay, both views) + the projected
         // map stamps/ants on top — written as two regions of one
@@ -6530,7 +6711,7 @@ impl Renderer {
                 MAP_TILES as f32, // world period for the toroidal wrap
                 self.sight_mist.0,
                 self.sight_mist.1,
-                0.0,
+                self.greyscale, // the death greyscale (map.wgsl fx.z)
                 0.0,
             ];
             self.queue
@@ -6556,7 +6737,7 @@ impl Renderer {
                 MAP_TILES as f32,   // world period for the toroidal wrap
                 self.sight_mist.0,
                 self.sight_mist.1,
-                0.0,
+                self.greyscale, // the death greyscale (map.wgsl fx.z)
                 0.0,
             ];
             self.queue.write_buffer(
@@ -6566,7 +6747,55 @@ impl Renderer {
             );
         }
 
+        if layered {
+            self.ensure_marker_layer(w, hpx);
+            let (disc, _, _) = self.minimap_rect(w, hpx);
+            let globals: [f32; 12] = [
+                0.0,
+                0.0,
+                disc,
+                disc,
+                w as f32,
+                hpx as f32,
+                0.0,
+                0.0,
+                self.minimap_alpha,
+                1.0 - self.overlay_fade,
+                self.greyscale,
+                0.0,
+            ];
+            self.queue
+                .write_buffer(&self.marker_comp_buf, 0, bytemuck::cast_slice(&globals));
+        }
+        // The UI stream's instance ranges: in flight the app UI comes
+        // first, then the markers (see the buffer write above).
+        let ui_len = self.ui_quads.len() as u32;
+
         let mut encoder = self.device.create_command_encoder(&Default::default());
+        // The marker layer (in flight): the radar's markers, cleared
+        // transparent and drawn single-sampled into their own target;
+        // the main pass composites it (`marker_layer`).
+        if layered
+            && let (Some((layer_view, _, _)), Some(bg), Some(buf)) =
+                (&self.marker_layer, &self.ui_bind_group, &self.ui_buf)
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("marker layer"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: layer_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.marker_layer_pipeline);
+            pass.set_bind_group(0, bg, &[]);
+            pass.set_vertex_buffer(0, buf.slice(..));
+            pass.draw(0..6, ui_len..ui_count);
+        }
         // The water-reflection MIRROR pass: the terrain grid y-flipped
         // about the sea plane (atlas.w = 2), rendered into the mirror
         // texture the main pass's water fragments sample. Terrain
@@ -6869,6 +7098,15 @@ impl Renderer {
                         pass.set_pipeline(&self.ui_pipeline);
                         pass.set_bind_group(0, bg, &[]);
                         pass.draw(0..6, stamp_count..ui_count);
+                    }
+                } else if layered {
+                    if ui_len > 0 {
+                        pass.draw(0..6, 0..ui_len);
+                    }
+                    if let Some((_, lbg, _)) = &self.marker_layer {
+                        pass.set_pipeline(&self.marker_comp_pipeline);
+                        pass.set_bind_group(0, lbg, &[]);
+                        pass.draw(0..6, 0..1);
                     }
                 } else {
                     pass.draw(0..6, 0..ui_count);
@@ -7712,6 +7950,25 @@ mod tests {
             wgpu::naga::valid::Capabilities::all(),
         );
         v.validate(&module).expect("ui.wgsl validates");
+    }
+
+    /// The marker-layer composite and the map shader (its death
+    /// greyscale, 2026-10-17) are likewise runtime-compiled only.
+    #[test]
+    fn marker_layer_and_map_shaders_parse_and_validate() {
+        for (name, src) in [
+            ("layer.wgsl", include_str!("layer.wgsl")),
+            ("map.wgsl", include_str!("map.wgsl")),
+        ] {
+            let module = wgpu::naga::front::wgsl::parse_str(src)
+                .unwrap_or_else(|e| panic!("{name} parses: {e}"));
+            let mut v = wgpu::naga::valid::Validator::new(
+                wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::all(),
+            );
+            v.validate(&module)
+                .unwrap_or_else(|e| panic!("{name} validates: {e:?}"));
+        }
     }
 
     /// The world shaders (colour grade, 2026-10-05) validate, and their
