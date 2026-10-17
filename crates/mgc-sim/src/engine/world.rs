@@ -5270,6 +5270,23 @@ impl World {
             if i == self.g.human_rec(hx) {
                 continue;
             }
+            // Another human seat's record at its grave (netplay): never
+            // drawn once the seat is banished — it never respawns, so the
+            // record would lie there for the rest of the game, under the
+            // risen ghost too — and, MC1 family, not while it lies dead
+            // either (player-reported 2026-10-17: "the original flyer
+            // sprite … remains where the corpse died"). The death fall
+            // still draws. A DRAW filter, not a cull.
+            if e.class64 == 3
+                && self.seat_ixs().any(|s| {
+                    s != hx
+                        && i == self.g.human_rec(s)
+                        && (self.players[s].banished
+                            || (!matches!(self.game, GameId::Mc2) && self.player_dead(s)))
+                })
+            {
+                continue;
+            }
             // Owned manifestation, not a drawable — strict-retail
             // worlds hide by RETAIL's byte[0] bit instead, which also
             // covers a wizard-claimed authored jar (see `live_things`).

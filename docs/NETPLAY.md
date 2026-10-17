@@ -81,6 +81,13 @@ MC1 Nurrir (68) none). The jars are the rest. Before 10-17 the port gave
 a network human the (empty) campaign carry — no castle, unplayable.
 Pinned by `network_humans_start_with_the_arenas_book`.
 
+**A dead seat's carpet (MC1, 10-17):** another human's (3,0) record is
+not drawn at its grave (MC1 family: while it lies dead) nor ever once it
+is banished — it never respawns, so it used to lie there for the rest
+of the game, under the risen ghost too (player-reported). A draw filter
+in `World::live_poses`; the death fall still draws. Pinned by
+`a_dead_or_banished_seats_carpet_is_not_drawn`.
+
 **Authored seats:** the server reads which wizard seats the lobby's level
 authors a start marker for (`net::Referee::open_seats` →
 `LobbyCore::set_open`, `LobbyView::open`): only those can be held, the

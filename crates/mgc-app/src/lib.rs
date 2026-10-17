@@ -15311,6 +15311,60 @@ mod net_lockstep_tests {
         }
     }
 
+    /// MC1: the other player sees a dead seat's carpet record neither
+    /// at its grave nor after it is banished and its ghost flies off
+    /// (player-reported 2026-10-17: the full-opacity carpet stayed at
+    /// the corpse for good) — but sees it while that seat lives.
+    #[test]
+    fn a_dead_or_banished_seats_carpet_is_not_drawn() {
+        use mgc_sim::engine::world::LifeState;
+        let Some(mut a) = net_sim("mc1", 50, &[0, 1], 0) else {
+            eprintln!("skipping: no baked mc1 arena");
+            return;
+        };
+        let step = |sim: &mut Simulation, seat1: FlightInput| {
+            sim.step_seats(&[FlightInput::default(), seat1]);
+        };
+        let carpets = |a: &Simulation| {
+            a.world
+                .as_ref()
+                .unwrap()
+                .live_poses(Hx(0))
+                .into_iter()
+                .filter(|p| (p.class, p.model) == (3, 0))
+                .count()
+        };
+        for _ in 0..24 {
+            step(&mut a, FlightInput::default());
+        }
+        let alive = carpets(&a);
+        assert!(alive >= 1, "the other seat's carpet shows while it lives");
+        a.world.as_mut().unwrap().debug_kill_player(Hx(1));
+        let mut t = 0;
+        while a.world.as_ref().unwrap().vitals(Hx(1)).state != LifeState::Dead {
+            step(&mut a, FlightInput::default());
+            t += 1;
+            assert!(t < 3000, "seat 2 never came to rest dead");
+        }
+        assert_eq!(carpets(&a), alive - 1, "dead: not at the grave");
+        step(
+            &mut a,
+            FlightInput {
+                respawn: true,
+                ..FlightInput::default()
+            },
+        );
+        let fly = FlightInput {
+            thrust: 1.0,
+            ..FlightInput::default()
+        };
+        for _ in 0..120 {
+            step(&mut a, fly);
+        }
+        assert!(a.world.as_ref().unwrap().risen(Hx(1)));
+        assert_eq!(carpets(&a), alive - 1, "banished: never again");
+    }
+
     /// A network game's humans all start with the arena's own book —
     /// retail's networked arm: wizard row 0, `starting_spells ∧
     /// allowed_spells` (Bussorah: Fireball, Possess, Create Castle) —
