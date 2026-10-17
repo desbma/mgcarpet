@@ -512,7 +512,7 @@ impl Host {
         }
         let view = self.view();
         let seats = view.seats();
-        let mut lost = None;
+        let mut lost = Vec::new();
         for (id, conn) in &mut self.clients {
             let local = view.members.iter().position(|m| m.id == *id);
             let start = Msg::Start {
@@ -524,8 +524,10 @@ impl Host {
                 level: view.level.clone(),
                 rules: view.rules.clone(),
             };
-            if let Err(e) = conn.send(&start) {
-                lost.get_or_insert(format!("{}: {e}", conn.peer));
+            if let Err(e) = conn.send(&start)
+                && let Some(ix) = local
+            {
+                lost.push((ix, format!("{}: {e}", conn.peer)));
             }
         }
         self.core.begin();
@@ -728,7 +730,7 @@ impl Guest {
             local: Hx(local),
             level,
             config: rules,
-            lost: None,
+            lost: Vec::new(),
         })
     }
 }
@@ -756,8 +758,9 @@ pub struct Link {
     pub level: String,
     /// The session rules (`rules::collect` of the host's config).
     pub config: serde_json::Value,
-    /// Host: a client lost while starting (the lockstep closes at once).
-    lost: Option<String>,
+    /// Host: the seats lost while starting (seat, why) — they leave the
+    /// game at its first tick, like any departure; the rest play on.
+    lost: Vec<(usize, String)>,
 }
 
 /// CLI host (`--host`): open the lobby, wait for the clients to agree
@@ -905,11 +908,11 @@ impl Lockstep {
             desync: None,
             desync_seen: false,
             agreed: 0,
-            closed: link.lost,
+            closed: None,
             ended: false,
             gone: Vec::new(),
             departed: vec![None; link.seats.len()],
-            failed: Vec::new(),
+            failed: link.lost,
             departures: BTreeMap::new(),
         }
     }
@@ -1694,11 +1697,31 @@ mod tests {
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         while waiting.view().playing {
-            assert!(Instant::now() < deadline, "the lobby never reopened for him");
+            assert!(
+                Instant::now() < deadline,
+                "the lobby never reopened for him"
+            );
             waiting.poll();
         }
         assert_eq!(h.view().members.len(), 3, "he is still a member");
         assert!(waiting.closed().is_none());
+    }
+
+    /// A client lost while the game starts (its Start could not be
+    /// sent) leaves at the first tick like any departure — the game
+    /// goes on for the rest (it used to close the host's lockstep).
+    #[test]
+    fn a_client_lost_at_the_start_is_banished_not_fatal() {
+        let mut h = open_lobby("pw");
+        let mut g = named(&mut h, "ONE");
+        g.agree();
+        settle(&mut h, &mut g, |h, _| h.can_play());
+        let mut hl = h.play().ok().unwrap();
+        hl.lost.push((1, "a broken pipe".into()));
+        let mut hs = Lockstep::start(hl);
+        let left = pump(&mut [&mut hs], 30);
+        assert_eq!(left, vec![vec![1]], "seat 1 leaves at once");
+        assert!(hs.closed().is_none());
     }
 
     fn settle_start(g: &mut Guest) {

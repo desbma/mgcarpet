@@ -1006,6 +1006,11 @@ pub(crate) struct PalFlash {
     pub(crate) row: u8,
     /// Ticks left in the app-side fade home.
     pub(crate) ticks: u8,
+    /// The seat whose screen flashes; `None` = every seat. Retail's
+    /// owner compare (sub_44BE0) shows a caster's flash on HIS machine
+    /// only (audit 2026-10-17: one human's Global Death washed every
+    /// peer's view violet).
+    pub(crate) seat: Option<Hx>,
 }
 
 impl PalFlash {
@@ -1014,6 +1019,22 @@ impl PalFlash {
     pub(crate) fn arm(&mut self, row: u8) {
         self.row = row;
         self.ticks = Self::LIFE;
+        self.seat = None;
+    }
+
+    /// [`Self::arm`] for seat `hx`'s screen alone.
+    pub(crate) fn arm_seat(&mut self, row: u8, hx: Hx) {
+        self.arm(row);
+        self.seat = Some(hx);
+    }
+
+    /// The (row, ticks) seat `hx` sees.
+    pub(crate) fn seen_by(&self, hx: Hx) -> (u8, u8) {
+        if self.seat.is_none_or(|s| s == hx) {
+            (self.row, self.ticks)
+        } else {
+            (0, 0)
+        }
     }
 
     /// The overlay fade length. Retail paints one frame and fades back
@@ -7034,7 +7055,7 @@ impl Gen {
 
     /// The record homing the human's purse for the walkers' LIVE reads
     /// ([`no_human_live_purse`]).
-    fn human_purse_home(&self, hx: Hx) -> Option<usize> {
+    pub(crate) fn human_purse_home(&self, hx: Hx) -> Option<usize> {
         if no_human_live_purse() || crate::engine::world::no_human_mana_on_record() {
             return None;
         }
@@ -7065,11 +7086,12 @@ impl Gen {
 
     /// The human's mana ceiling (+136) as a walker reads it (see
     /// [`Self::human_purse`]).
-    pub(crate) fn human_ceiling(&self, ctx: &crate::mc1::mobs::MobCtx) -> u32 {
-        let hx = ctx.phx;
+    /// Seat `hx`'s mana ceiling: his purse record's `+136`, else his
+    /// view's. Named by seat — the walkers' `ctx` is seat 0's.
+    pub(crate) fn human_ceiling_of(&self, hx: Hx) -> u32 {
         match self.human_purse_home(hx) {
             Some(hr) => self.ent[hr].f136 as u32,
-            None => self.view(ctx.phx).mana_max,
+            None => self.view(hx).mana_max,
         }
     }
 
@@ -10612,6 +10634,21 @@ impl Gen {
     /// A wizard owner tag's team slot: PLAYER_TARGET = the human's
     /// seat ([`Gen::human_seat`], 0 in retail single-player), a rival's
     /// entity slot = its player slot (wizext var_48 in the original).
+    /// A HUMAN owner's colour slot for retail's owner-coloured art:
+    /// with one human it is retail's player 0 (single player stays
+    /// byte-identical, `--seat` included); with several each human is
+    /// his own wizard's colour — the MC2 castle flag and mana-worm
+    /// paths mapped every human to slot 0, the host's (audit
+    /// 2026-10-17). `None` for a non-human owner.
+    pub(crate) fn human_colour_slot(&self, owner: u16) -> Option<u8> {
+        let hx = self.hx_of_tag(owner)?;
+        Some(if self.human_seat.len() > 1 {
+            self.human_seat[hx].0
+        } else {
+            0
+        })
+    }
+
     pub(crate) fn owner_team(&self, owner: u16) -> Option<u8> {
         if let Some(hx) = self.hx_of_tag(owner) {
             return Some(self.human_seat[hx].0);
@@ -13319,7 +13356,13 @@ impl Snap for SoundEvent {
 
 impl Snap for PalFlash {
     fn put(&self, w: &mut Writer) {
-        let PalFlash { row, ticks } = self;
+        // The seat is a few ticks of presentation: not stored (the
+        // format stays), restored as every seat's.
+        let PalFlash {
+            row,
+            ticks,
+            seat: _,
+        } = self;
         w.put(row);
         w.put(ticks);
     }
@@ -13327,6 +13370,7 @@ impl Snap for PalFlash {
         Ok(PalFlash {
             row: r.get()?,
             ticks: r.get()?,
+            seat: None,
         })
     }
 }
@@ -15189,7 +15233,7 @@ mod tests {
             g.ent[b].f144 = rival as u16; // absorbed: the rival's
             let ctx = ctx_at(&mut g, 0x7F00, 0x7F00, 0);
             g.view_mut(ctx.phx).mana_max = human_ceiling;
-            g.mc1_ball_owner_contest(a, b, &ctx);
+            g.mc1_ball_owner_contest(a, b);
             (g.ent[a].f144, rival as u16)
         };
         let (won, _) = run(9_000);

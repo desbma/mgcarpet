@@ -732,7 +732,9 @@ fn mc2_map_dots(
                 if !p.player_owned {
                     continue;
                 }
-                let (b, d) = team_tab[0];
+                // The OWNER's colour (own-only, but the owner is not
+                // seat 0 on every peer — audit 2026-10-17).
+                let (b, d) = team(p.team).unwrap_or(team_tab[0]);
                 if blink3 { b } else { d }
             }
             (10, 0x56 | 0x57) => continue,
@@ -2069,10 +2071,11 @@ pub fn ghost_billboard(
     instrument_billboard(game, type_index, x, alt, z, yaw, 4, sprite_dims)
 }
 
-/// The sprite-stats row carrying the HUMAN's own carpet art, in both
-/// games: MC1's rivals take rows 273-279 and *"slot 0 keeps 44"*
-/// (`mc1/rivals.rs`, retail :54927-55), MC2's `carpet_sprite_row(0)`
-/// is the same 44.
+/// The sprite-stats row carrying the HUMAN's own carpet art at colour
+/// 0, in both games: MC1's rivals take rows 273-279 and *"slot 0 keeps
+/// 44"* (`mc1/rivals.rs`, retail :54927-55), MC2's
+/// `carpet_sprite_row(0)` is the same 44. A netplay seat flies its own
+/// colour's row (`World::human_carpet_row`).
 pub const HUMAN_CARPET_ROW: u16 = 44;
 
 /// THE PLAYER'S OWN CARPET, drawn solid — the `--thirdperson` subject.
@@ -2088,6 +2091,7 @@ pub const HUMAN_CARPET_ROW: u16 = 44;
 /// `--thirdperson` off the graded lanes entirely.
 pub fn human_billboard(
     game: GameId,
+    row: u16,
     x: f32,
     alt: f32,
     z: f32,
@@ -2095,7 +2099,7 @@ pub fn human_billboard(
     bank: f32,
     sprite_dims: &impl Fn(u16) -> Option<(u16, u16, u16)>,
 ) -> Option<Billboard> {
-    let mut b = instrument_billboard(game, HUMAN_CARPET_ROW, x, alt, z, yaw, 0, sprite_dims)?;
+    let mut b = instrument_billboard(game, row, x, alt, z, yaw, 0, sprite_dims)?;
     // The chase view's bank — the enhanced mover's law re-derived
     // from the recorded motion (`camera::ChaseCam`), so the sprite
     // leans into its turns the way the enhanced camera does.
@@ -2817,8 +2821,9 @@ mod tests {
         // A stub sprite index: every row is 64x64, flags 0.
         let dims = |_: u16| Some((64u16, 64u16, 0u16));
         for game in [GameId::Mc1, GameId::Mc2] {
-            let subject = human_billboard(game, 300.0, 4.0, -2.0, 0.5, 0.2, &dims)
-                .expect("the human carpet resolves in both games");
+            let subject =
+                human_billboard(game, HUMAN_CARPET_ROW, 300.0, 4.0, -2.0, 0.5, 0.2, &dims)
+                    .expect("the human carpet resolves in both games");
             let ghost = ghost_billboard(game, HUMAN_CARPET_ROW, 300.0, 4.0, -2.0, 0.5, &dims)
                 .expect("the ghost resolves from the same row");
             assert_eq!(subject.blend, 0, "{game:?}: the subject is opaque");

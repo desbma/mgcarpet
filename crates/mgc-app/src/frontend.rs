@@ -45,9 +45,11 @@ pub enum MenuAction {
         port: String,
         passphrase: String,
     },
-    /// Multiplayer → Join: connect to `addr`.
+    /// Multiplayer → Join: connect to `addr` on `port` (empty: the
+    /// default; an `addr` that names its own `host:port` wins).
     Join {
         addr: String,
+        port: String,
         passphrase: String,
     },
     Quit,
@@ -65,17 +67,51 @@ fn ok_rect(x1: f32, y1: f32, h: f32) -> (f32, f32, f32, f32) {
 fn cancel_rect(x1: f32, y1: f32, h: f32) -> (f32, f32, f32, f32) {
     (x1 + DIALOG_W - 12.0 - 39.0, y1 + h - 30.0, 39.0, 30.0)
 }
-/// The network scroll's clickable rows: Host, Join, the address/port
-/// field, the passphrase field, two recent hosts.
-fn net_rows(x1: f32, y1: f32) -> [(f32, f32, f32, f32); 6] {
+/// The network scroll's clickable rows: Host, Join, up to three
+/// fields ([`net_fields`]), two recent hosts.
+fn net_rows(x1: f32, y1: f32) -> [(f32, f32, f32, f32); 7] {
     [
         (x1 + 40.0, y1 + 30.0, 50.0, 14.0),
         (x1 + 120.0, y1 + 30.0, 50.0, 14.0),
         (x1 + 15.0, y1 + 48.0, 190.0, 14.0),
-        (x1 + 15.0, y1 + 64.0, 190.0, 14.0),
-        (x1 + 15.0, y1 + 84.0, 190.0, 14.0),
+        (x1 + 15.0, y1 + 63.0, 190.0, 14.0),
+        (x1 + 15.0, y1 + 78.0, 190.0, 14.0),
         (x1 + 15.0, y1 + 98.0, 190.0, 14.0),
+        (x1 + 15.0, y1 + 112.0, 190.0, 14.0),
     ]
+}
+
+/// A network scroll entry field.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NetField {
+    /// Join: the host's name or address.
+    Addr,
+    /// Host: the port to listen on.
+    Port,
+    /// Join: the host's port — its own field (player 2026-10-17: few
+    /// know the `host:port` form).
+    JoinPort,
+    Pass,
+}
+
+/// The fields of each face, top to bottom (`focus` indexes these).
+fn net_fields(host: bool) -> &'static [NetField] {
+    if host {
+        &[NetField::Port, NetField::Pass]
+    } else {
+        &[NetField::Addr, NetField::JoinPort, NetField::Pass]
+    }
+}
+
+/// A recent host's (address, port) — stored as `host:port`; a
+/// bracketed IPv6 keeps its brackets.
+pub(crate) fn split_host_port(a: &str) -> (String, String) {
+    match a.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
+            (h.to_string(), p.to_string())
+        }
+        _ => (a.to_string(), String::new()),
+    }
 }
 
 fn in_rect(mx: f32, my: f32, r: (f32, f32, f32, f32)) -> bool {
@@ -143,9 +179,12 @@ enum Modal {
     Network {
         host: bool,
         addr: String,
+        /// The port to host on.
         port: String,
+        /// The port to join on.
+        join_port: String,
         pass: String,
-        /// The field taking keystrokes: 0 address/port, 1 passphrase.
+        /// The field taking keystrokes: an index into [`net_fields`].
         focus: u8,
         recent: Vec<String>,
     },
@@ -158,7 +197,7 @@ enum Modal {
 
 /// The network scroll's box (x1, y1, w, h) — retail anchors the session
 /// scroll at (430,78); the port's is wider and centred.
-const NET_BOX: (f32, f32, f32, f32) = (210.0, 110.0, 220.0, 150.0);
+const NET_BOX: (f32, f32, f32, f32) = (210.0, 110.0, 220.0, 162.0);
 /// The message scroll's box (x1, y1, w); its height follows the
 /// wrapped text ([`MainMenu::message_layout`]).
 const MSG_BOX: (f32, f32, f32) = (190.0, 150.0, 260.0);
@@ -330,15 +369,17 @@ impl MainMenu {
             host,
             addr,
             port,
+            join_port,
             pass,
             focus,
             ..
         }) = &mut self.modal
         {
-            let (field, ok, max) = match (*focus, *host) {
-                (0, true) => (port, c.is_ascii_digit(), 5),
-                (0, false) => (addr, c.is_ascii_alphanumeric() || ".:-[]".contains(c), 40),
-                _ => (pass, c.is_ascii_alphanumeric() || "-_.!?".contains(c), 24),
+            let (field, ok, max) = match net_fields(*host)[usize::from(*focus)] {
+                NetField::Port => (port, c.is_ascii_digit(), 5),
+                NetField::JoinPort => (join_port, c.is_ascii_digit(), 5),
+                NetField::Addr => (addr, c.is_ascii_alphanumeric() || ".:-[]".contains(c), 40),
+                NetField::Pass => (pass, c.is_ascii_alphanumeric() || "-_.!?".contains(c), 24),
             };
             if ok && field.len() < max {
                 field.push(c);
@@ -367,14 +408,16 @@ impl MainMenu {
                 host,
                 addr,
                 port,
+                join_port,
                 pass,
                 focus,
                 ..
             }) => {
-                match (*focus, *host) {
-                    (0, true) => port.pop(),
-                    (0, false) => addr.pop(),
-                    _ => pass.pop(),
+                match net_fields(*host)[usize::from(*focus)] {
+                    NetField::Port => port.pop(),
+                    NetField::JoinPort => join_port.pop(),
+                    NetField::Addr => addr.pop(),
+                    NetField::Pass => pass.pop(),
                 };
             }
             Some(Modal::Name { buf }) => {
@@ -405,9 +448,12 @@ impl MainMenu {
                     s.0 = e;
                 }
             }
-            Some(Modal::Network {
-                focus: focus @ 0, ..
-            }) => *focus = 1,
+            // Enter steps to the next field; on the last it is OK.
+            Some(Modal::Network { host, focus, .. })
+                if usize::from(*focus) + 1 < net_fields(*host).len() =>
+            {
+                *focus += 1;
+            }
             Some(_) => self.press_ok(),
             None => {}
         }
@@ -415,8 +461,8 @@ impl MainMenu {
 
     /// Tab: the network scroll's other field.
     pub fn key_tab(&mut self) {
-        if let Some(Modal::Network { focus, .. }) = &mut self.modal {
-            *focus ^= 1;
+        if let Some(Modal::Network { host, focus, .. }) = &mut self.modal {
+            *focus = (*focus + 1) % net_fields(*host).len() as u8;
         }
     }
 
@@ -441,6 +487,7 @@ impl MainMenu {
                 host,
                 addr,
                 port,
+                join_port,
                 pass,
                 ..
             } => {
@@ -459,6 +506,7 @@ impl MainMenu {
                 } else {
                     MenuAction::Join {
                         addr: addr.clone(),
+                        port: join_port.clone(),
                         passphrase: pass.clone(),
                     }
                 });
@@ -517,11 +565,26 @@ impl MainMenu {
 
     /// Open the network scroll (Multiplayer), seeded with the last
     /// entries and the recent hosts.
-    pub fn open_network(&mut self, recent: Vec<String>, port: String, pass: String) {
+    pub fn open_network(
+        &mut self,
+        recent: Vec<String>,
+        port: String,
+        join_port: String,
+        pass: String,
+    ) {
+        let (addr, last_port) = recent
+            .first()
+            .map(|a| split_host_port(a))
+            .unwrap_or_default();
         self.modal = Some(Modal::Network {
             host: recent.is_empty(),
-            addr: recent.first().cloned().unwrap_or_default(),
+            addr,
             port,
+            join_port: if last_port.is_empty() {
+                join_port
+            } else {
+                last_port
+            },
             pass,
             focus: 0,
             recent,
@@ -596,28 +659,32 @@ impl MainMenu {
         if let Modal::Network {
             host,
             addr,
+            join_port,
             focus,
             recent,
             ..
         } = modal
         {
             let (x1, y1, w, h) = NET_BOX;
+            let pass_ix = |host: bool| (net_fields(host).len() - 1) as u8;
             for (k, r) in net_rows(x1, y1).into_iter().enumerate() {
                 if !in_rect(mx, my, r) {
                     continue;
                 }
                 match k {
-                    0 => *host = true,
-                    1 => *host = false,
-                    2 => *focus = 0,
-                    3 => *focus = 1,
-                    _ => match recent.get(k - 4) {
+                    0 | 1 => {
+                        *host = k == 0;
+                        *focus = 0;
+                    }
+                    2..=4 if k - 2 < net_fields(*host).len() => *focus = (k - 2) as u8,
+                    5 | 6 => match recent.get(k - 5) {
                         Some(a) if !*host => {
-                            *addr = a.clone();
-                            *focus = 1;
+                            (*addr, *join_port) = split_host_port(a);
+                            *focus = pass_ix(false);
                         }
                         _ => return,
                     },
+                    _ => return,
                 }
                 self.sounds.push(SND_CLICK);
                 return;
@@ -906,6 +973,7 @@ impl MainMenu {
                 host,
                 addr,
                 port,
+                join_port,
                 pass,
                 focus,
                 recent,
@@ -928,14 +996,19 @@ impl MainMenu {
                     }
                     (format!("{label}:"), v)
                 };
-                let lines = [
-                    field(
-                        if *host { "Port" } else { "Address" },
-                        if *host { port } else { addr },
-                        *focus == 0,
-                    ),
-                    field("Passphrase", pass, *focus == 1),
-                ];
+                let lines: Vec<_> = net_fields(*host)
+                    .iter()
+                    .enumerate()
+                    .map(|(k, f)| {
+                        let (label, value) = match f {
+                            NetField::Addr => ("Address", addr),
+                            NetField::Port | NetField::JoinPort if *host => ("Port", port),
+                            NetField::Port | NetField::JoinPort => ("Port", join_port),
+                            NetField::Pass => ("Passphrase", pass),
+                        };
+                        field(label, value, usize::from(*focus) == k)
+                    })
+                    .collect();
                 for (k, (label, value)) in lines.iter().enumerate() {
                     let r = rows[2 + k];
                     quads.extend(self.text(label, r.0, r.1, ink, scale));
@@ -950,7 +1023,7 @@ impl MainMenu {
                 }
                 if !*host {
                     for (k, a) in recent.iter().take(2).enumerate() {
-                        let r = rows[4 + k];
+                        let r = rows[5 + k];
                         let hov = in_rect(mx, my, r);
                         quads.extend(self.text(
                             &format!("> {a}"),
@@ -1082,6 +1155,73 @@ mod tests {
         m.key_enter();
         assert_eq!(m.take_action(), Some(MenuAction::Quit));
         assert!(m.modal.is_none());
+    }
+
+    /// The Join face has its own Port field (player 2026-10-17): the
+    /// last host comes back split into address and port, Tab and Enter
+    /// walk Address → Port → Passphrase, and OK joins with both; a
+    /// recent host's click fills both fields.
+    #[test]
+    fn joining_takes_the_address_and_the_port_apart() {
+        let mut m = bare();
+        m.open_network(
+            vec!["example.org:9000".into(), "[::1]:7000".into()],
+            "7777".into(),
+            "7777".into(),
+            "pw".into(),
+        );
+        let Some(Modal::Network {
+            host,
+            addr,
+            join_port,
+            ..
+        }) = &m.modal
+        else {
+            panic!("the network scroll")
+        };
+        assert!(!host, "a known host opens the Join face");
+        assert_eq!((addr.as_str(), join_port.as_str()), ("example.org", "9000"));
+        for _ in 0..20 {
+            m.key_backspace();
+        }
+        "lan-box".chars().for_each(|c| m.key_char(c));
+        m.key_tab();
+        for _ in 0..5 {
+            m.key_backspace();
+        }
+        "8123x".chars().for_each(|c| m.key_char(c));
+        m.key_enter();
+        assert_eq!(m.take_action(), None, "Enter steps to the passphrase");
+        m.key_enter();
+        assert_eq!(
+            m.take_action(),
+            Some(MenuAction::Join {
+                addr: "lan-box".into(),
+                port: "8123".into(),
+                passphrase: "pw".into(),
+            })
+        );
+        // A recent host's row fills both fields.
+        m.open_network(
+            vec!["a:1".into(), "[::1]:7000".into()],
+            "7777".into(),
+            "7777".into(),
+            "pw".into(),
+        );
+        let r = net_rows(NET_BOX.0, NET_BOX.1)[6];
+        m.modal_click(r.0 + 1.0, r.1 + 1.0);
+        let Some(Modal::Network {
+            addr, join_port, ..
+        }) = &m.modal
+        else {
+            panic!("the network scroll")
+        };
+        assert_eq!((addr.as_str(), join_port.as_str()), ("[::1]", "7000"));
+        assert_eq!(split_host_port("[::1]"), ("[::1]".into(), String::new()));
+        assert_eq!(
+            split_host_port("lan-box"),
+            ("lan-box".into(), String::new())
+        );
     }
 
     /// A long notice (a refused join) wraps at word bounds to the

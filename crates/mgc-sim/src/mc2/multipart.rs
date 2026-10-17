@@ -307,8 +307,8 @@ impl Gen {
     /// families are authored in Transform order,
     /// crate::mc2::COLOR_ART).
     pub(crate) fn mc2_ball_color(&self, target: u16) -> u16 {
-        if self.is_human_tag(target) {
-            return 105;
+        if let Some(slot) = self.human_colour_slot(target) {
+            return 105 + 8 * crate::mc2::color_art(slot) as u16;
         }
         match self.rival_ents.iter().position(|&e| e != 0 && e == target) {
             Some(slot) => 105 + 8 * crate::mc2::color_art(slot as u8) as u16,

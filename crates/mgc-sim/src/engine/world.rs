@@ -13539,7 +13539,7 @@ impl World {
         // A thrown jar of a spell the wizard still holds is refused by
         // `try_pickup`'s owned test and simply expires.
         if self.patches.no_spell_loss && !strict {
-            for m in self.human_spell_tokens() {
+            for m in self.seat_spell_tokens(hx) {
                 let s = self.g.ent[m].model65 as usize;
                 // No burst crosses the death. The strict scatter ends
                 // every window by turning the record into a jar (its
@@ -13952,7 +13952,7 @@ impl World {
             // them where retail lays its re-mints (:54894) and keep
             // them off the sacrifice stack the entry above re-armed.
             self.scrub_spell_tokens_off_recycle();
-            for m in self.human_spell_tokens() {
+            for m in self.seat_spell_tokens(hx) {
                 self.g.move_relink(m, seat.0, seat.1, seat.2);
             }
         } else {
@@ -14490,7 +14490,10 @@ impl World {
     /// (SMold:51387-95). The leaver's input that tick is the suicide
     /// key, so the wizard falls, and a banished seat never respawns.
     pub fn depart(&mut self, hx: Hx) {
-        if self.players.len() < 2 || hx.0 as usize >= self.players.len() || self.players[hx].banished {
+        if self.players.len() < 2
+            || hx.0 as usize >= self.players.len()
+            || self.players[hx].banished
+        {
             return;
         }
         self.banish(hx);
@@ -14637,7 +14640,7 @@ impl World {
             // `no_spell_loss`: nothing was scattered out of the book,
             // so nothing is re-minted — the live tokens are seated at
             // the respawn point like retail's fresh ones.
-            for m in self.human_spell_tokens() {
+            for m in self.seat_spell_tokens(hx) {
                 self.g.move_relink(m, dest.0, dest.1, dest.2);
             }
         } else {
@@ -20178,7 +20181,7 @@ impl World {
             state: self.human_state(hx),
             grace: self.players[hx].grace,
             hit_flash: self.players[hx].hit_flash,
-            pal_flash: (self.g.pal_flash.row, self.g.pal_flash.ticks),
+            pal_flash: self.g.pal_flash.seen_by(hx),
             lost: self.lost,
             castle_alert: self.g.castle_alert[hx] > 0,
             player_alert: self.g.player_alert[hx] > 0,
@@ -20602,7 +20605,9 @@ impl World {
                     slot,
                     name: name.to_string(),
                     alive: self.human_state(hx) == LifeState::Alive && !self.lost,
-                    eliminated: self.lost,
+                    // A network game's banished seat is out (retail
+                    // clears its in-play flag) — off the roster.
+                    eliminated: self.lost || self.players[hx].banished,
                     x: e.x as f32 / 256.0,
                     z: e.y as f32 / 256.0,
                     alt: e.z as f32 / 256.0,
@@ -20772,6 +20777,16 @@ impl World {
     /// retail's local index; 0 except under `--seat`.
     pub fn human_wizard_seat(&self, hx: Hx) -> u8 {
         self.g.human_seat(hx)
+    }
+
+    /// The sprite row of seat `hx`'s carpet art — his wizard colour's
+    /// (row 44 = colour 0 in both games).
+    pub fn human_carpet_row(&self, hx: Hx) -> u16 {
+        let slot = self.g.human_seat(hx);
+        match self.game {
+            GameId::Mc2 => crate::mc2::carpet_sprite_row(slot),
+            _ => crate::mc1::rivals::mc1_wizard_sprite_row(slot),
+        }
     }
 
     /// Seat `hx`'s walk view ([`crate::engine::features::SeatView`]).
@@ -24040,9 +24055,8 @@ impl World {
         self.g.mc2_recycle.stack = kept;
     }
 
-    /// `no_spell_loss`: the human's live spell tokens, in acquisition
-    /// order (MC1) / book order (MC2) — the set the patched death
-    /// path keeps and re-seats.
+    /// Every seat's live spell tokens ([`Self::seat_spell_tokens`]).
+    #[cfg(test)]
     fn human_spell_tokens(&self) -> Vec<usize> {
         self.players
             .ixs()
@@ -24050,7 +24064,12 @@ impl World {
             .collect()
     }
 
-    /// One seat's live spell tokens (see [`Self::human_spell_tokens`]).
+    /// `no_spell_loss`: seat `hx`'s live spell tokens, in acquisition
+    /// order (MC1) / book order (MC2) — the set the patched death path
+    /// keeps and re-seats. ONE seat's: the death and respawn arms used
+    /// every human's, so one player's death ended the others' running
+    /// spells, dropped jars of their spells at his corpse and relinked
+    /// their tokens to his castle (audit 2026-10-17).
     fn seat_spell_tokens(&self, hx: Hx) -> Vec<usize> {
         match self.game {
             GameId::Mc2 => (0..crate::mc2::rivals::MC2_SPELLS)
@@ -32505,7 +32524,7 @@ mod tests {
         w.set_human_mana(Hx::FIRST, 900);
         w.set_human_mana_max(Hx::FIRST, 4000);
         assert_eq!(
-            (w.g.human_purse(&ctx), w.g.human_ceiling(&ctx)),
+            (w.g.human_purse(&ctx), w.g.human_ceiling_of(ctx.phx)),
             (900, 4000),
             "the purse is the record's, live"
         );
@@ -42569,6 +42588,54 @@ mod tests {
         );
     }
 
+    /// `no_spell_loss` with TWO humans: one's death throws jars of HIS
+    /// spells only and leaves the other's tokens alone (audit
+    /// 2026-10-17: it acted on every human's — ending the other's
+    /// running spells and dropping jars of them at the corpse).
+    #[test]
+    fn no_spell_loss_death_touches_only_the_dying_seats_book() {
+        let mut w = bare_creature_world(2);
+        w.set_patches(crate::patches::WorldPatches {
+            no_spell_loss: true,
+            ..crate::patches::WorldPatches::RETAIL
+        });
+        let h1 = w.push_seat(5);
+        for hx in [Hx::FIRST, h1] {
+            w.set_dev_spells(hx, true);
+            w.grant_all_spells(hx);
+        }
+        w.g.move_relink(1, 30 << 8, 30 << 8, 3200);
+        for _ in 0..60 {
+            w.tick(firing_line(), PlayerCommand::default());
+        }
+        let mine = w.seat_spell_tokens(Hx::FIRST);
+        let theirs = w.seat_spell_tokens(h1);
+        assert!(
+            !mine.is_empty() && !theirs.is_empty(),
+            "both books hold tokens"
+        );
+        let before: Vec<_> = theirs
+            .iter()
+            .map(|&m| (w.g.ent[m].x, w.g.ent[m].y, w.g.ent[m].f26))
+            .collect();
+        w.players[Hx::FIRST].grace = 0;
+        hit_player(&mut w, 30000, 1);
+        w.tick(firing_line(), PlayerCommand::default());
+        w.tick(grounded_line(), PlayerCommand::default());
+        assert_eq!(w.vitals(Hx::FIRST).state, LifeState::Dead);
+        let jars =
+            w.g.ent
+                .iter()
+                .filter(|e| e.class64 == 12 && e.tick70 == DROPPED_JAR && e.flags & 0x400 == 0)
+                .count();
+        assert_eq!(jars, mine.len(), "jars of the dead seat's spells only");
+        let after: Vec<_> = theirs
+            .iter()
+            .map(|&m| (w.g.ent[m].x, w.g.ent[m].y, w.g.ent[m].f26))
+            .collect();
+        assert_eq!(after, before, "the other seat's tokens are untouched");
+    }
+
     /// `mc1_fix_dragon_tail`: a dragon far outside the awake radius
     /// (asleep, `f58 == 0`) keeps its tail in formation — the first
     /// segment sits `f56` behind the head — where retail's asleep arm
@@ -43452,6 +43519,62 @@ mod tests {
         assert_eq!(run(), run());
     }
 
+    /// The ball-merge owner contest weighs the OWNER's mana ceiling —
+    /// seat 1's for seat 1's ball. The walkers' `ctx` is seat 0's, so
+    /// it used to weigh the host's for any human (audit 2026-10-17).
+    #[test]
+    fn a_ball_contest_weighs_its_own_seats_ceiling() {
+        let mut w = flat_world();
+        let h1 = w.push_seat(5);
+        w.g.human_tag[h1].0 = 0xFFF0;
+        let set = |w: &mut World, hx: Hx, c: i32| match w.g.human_purse_home(hx) {
+            Some(hr) => w.g.ent[hr].f136 = c,
+            None => w.g.view_mut(hx).mana_max = c as u32,
+        };
+        set(&mut w, Hx::FIRST, 9_000);
+        set(&mut w, h1, 1_000);
+        let a = w.g.spawn_mana_ball(0x4000, 0x4000, 0).unwrap();
+        let b = w.g.spawn_mana_ball(0x4000, 0x4000, 0).unwrap();
+        let rival = w.g.spawn_class3(1, 0x2000, 0x2000, 0).unwrap();
+        w.g.ent[rival].f136 = 5_000;
+        w.g.ent[a].f144 = 0xFFF0; // survivor: seat 1's
+        w.g.ent[b].f144 = rival as u16;
+        w.g.mc1_ball_owner_contest(a, b);
+        assert_eq!(
+            w.g.ent[a].f144, rival as u16,
+            "seat 1's 1,000 loses to the rival's 5,000 (the host's 9,000 is not his)"
+        );
+    }
+
+    /// Owner-coloured MC2 art (the castle flag, a mana worm's band)
+    /// takes a SECOND human's own colour; one human stays retail's
+    /// player 0 (audit 2026-10-17: every human drew in the host's).
+    #[test]
+    fn a_second_humans_art_wears_his_own_colour() {
+        let mut w = mc2_flat_world();
+        let solo = w.g.human_tag[Hx::FIRST].0;
+        assert_eq!(w.g.mc2_ball_color(solo), 105, "one human: player 0");
+        let h1 = w.push_seat(2);
+        w.g.human_tag[h1].0 = 0xFFF0;
+        assert_eq!(w.g.mc2_ball_color(solo), 105, "the host flies colour 0");
+        assert_eq!(
+            w.g.mc2_ball_color(0xFFF0),
+            105 + 8 * crate::mc2::color_art(2) as u16,
+            "seat 1 flies colour 2"
+        );
+    }
+
+    /// A caster's Global Death flash is his screen's alone (audit
+    /// 2026-10-17: it washed every peer's view violet).
+    #[test]
+    fn a_global_death_flash_is_its_casters_alone() {
+        let mut w = flat_world();
+        let h1 = w.push_seat(5);
+        w.g.pal_flash.arm_seat(3, Hx::FIRST);
+        assert_eq!(w.vitals(Hx::FIRST).pal_flash.0, 3);
+        assert_eq!(w.vitals(h1).pal_flash.0, 0, "not the other seat's screen");
+    }
+
     /// Each seat's HUD shows HIS balloons only (player 2026-10-17: the
     /// two players saw each other's, crossing as balloons re-deployed).
     /// The other seat's balloon comes FIRST in the pool — the shape
@@ -43475,7 +43598,10 @@ mod tests {
             (e.max_life, e.act_life, e.f136, e.f140) = (100, life, 100, 0);
         }
         let hp = |w: &World, hx| w.loadout(hx).balloons[0].expect("a live balloon").0;
-        assert!((hp(&w, Hx::FIRST) - 1.0).abs() < 1e-3, "seat 0 reads its own");
+        assert!(
+            (hp(&w, Hx::FIRST) - 1.0).abs() < 1e-3,
+            "seat 0 reads its own"
+        );
         assert!((hp(&w, h1) - 0.25).abs() < 1e-3, "seat 1 reads its own");
     }
 

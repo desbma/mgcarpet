@@ -1917,12 +1917,14 @@ fn push_replay_instruments(
     driver: Option<&replay::ReplayDriver>,
     subject: bool,
     game: mgc_sim::ids::GameId,
+    // The subject's carpet art row: the local seat's colour.
+    row: u16,
     carpet: (f32, f32, f32, f32),
     bank: f32,
     dims: &impl Fn(u16) -> Option<(u16, u16, u16)>,
 ) {
     let (x, y, z, yaw) = carpet;
-    if subject && let Some(b) = entities::human_billboard(game, x, y, z, yaw, bank, dims) {
+    if subject && let Some(b) = entities::human_billboard(game, row, x, y, z, yaw, bank, dims) {
         out.push(b);
     }
     let Some(d) = driver else { return };
@@ -5263,6 +5265,12 @@ impl App {
             self.replay.as_ref(),
             subject,
             sess.level.game,
+            sess.sim
+                .world
+                .as_ref()
+                .map_or(entities::HUMAN_CARPET_ROW, |w| {
+                    w.human_carpet_row(local_hx())
+                }),
             interp_carpet(&sess.prev_flyer, &sess.sim.flyer[local_hx()], alpha),
             self.chase.bank_now(),
             &dims,
@@ -5568,6 +5576,9 @@ impl App {
                     self.replay.as_ref(),
                     subject,
                     level.game,
+                    sim.world.as_ref().map_or(entities::HUMAN_CARPET_ROW, |w| {
+                        w.human_carpet_row(local_hx())
+                    }),
                     (f.x, f.y, f.z, f.yaw),
                     self.chase.bank_now(),
                     &dims,
@@ -6947,7 +6958,11 @@ impl App {
                     }
                 }
                 MenuAction::Host { port, passphrase } => self.host_lobby(port, passphrase),
-                MenuAction::Join { addr, passphrase } => self.join_lobby(addr, passphrase),
+                MenuAction::Join {
+                    addr,
+                    port,
+                    passphrase,
+                } => self.join_lobby(addr, port, passphrase),
                 MenuAction::Quit => event_loop.exit(),
             }
         }
@@ -8071,8 +8086,9 @@ impl App {
                     // through the respawn wait. Name: the
                     // campaign's entered name (retail overrides
                     // the slot-0 table name with the player
-                    // string), else the table default.
-                    if !vitals.lost {
+                    // string), else the table default. A network
+                    // game's banishment takes the row off too.
+                    if !vitals.lost && !w.banished(local_hx()) {
                         let own = self.net_names.iter().find(|(s, _)| usize::from(*s) == seat);
                         let name = own
                             .map(|(_, n)| n.clone())
@@ -13042,6 +13058,9 @@ struct NetPrefs {
     recent: Vec<String>,
     #[serde(default)]
     port: String,
+    /// The last port joined on (the scroll's Join face).
+    #[serde(default)]
+    join_port: String,
     #[serde(default)]
     passphrase: String,
 }
@@ -13207,8 +13226,13 @@ impl App {
         } else {
             p.port
         };
+        let join_port = if p.join_port.is_empty() {
+            NET_PORT.to_string()
+        } else {
+            p.join_port
+        };
         if let Some(m) = &mut self.mainmenu {
-            m.open_network(p.recent, port, p.passphrase);
+            m.open_network(p.recent, port, join_port, p.passphrase);
         }
     }
 
@@ -13259,9 +13283,19 @@ impl App {
     }
 
     /// Join: connect off the frame loop ("Attempting Connection").
-    fn join_lobby(&mut self, addr: String, passphrase: String) {
+    fn join_lobby(&mut self, addr: String, port: String, passphrase: String) {
+        // The Port field joins the address — unless the address names
+        // its own (`host:port`, the form few know; it still works).
+        let addr = if port.is_empty() || !frontend::split_host_port(&addr).1.is_empty() {
+            addr
+        } else {
+            format!("{addr}:{port}")
+        };
         let mut prefs = NetPrefs::load();
         prefs.remember(&addr);
+        if !port.is_empty() {
+            prefs.join_port = port;
+        }
         prefs.passphrase = passphrase.clone();
         prefs.save();
         let addr = net_addr(&addr, "127.0.0.1");
@@ -13677,8 +13711,12 @@ mod lobby_rules_tests {
         // Every other pin holds the session's value.
         let mut a = down.clone();
         let mut b = seeded.clone();
-        a.as_object_mut().unwrap().remove("render.preference.fog_distance");
-        b.as_object_mut().unwrap().remove("render.preference.fog_distance");
+        a.as_object_mut()
+            .unwrap()
+            .remove("render.preference.fog_distance");
+        b.as_object_mut()
+            .unwrap()
+            .remove("render.preference.fog_distance");
         assert_eq!(a, b);
         assert!(step_lobby_rule(&seeded, LOBBY_RULES.len(), true, &specs).is_none());
     }
@@ -14169,10 +14207,21 @@ mod net_lockstep_tests {
                 // nameless "has died." is his alone.
                 let lines: Vec<&str> = w.notifications_for(Hx(0)).map(|(t, _)| t).collect();
                 assert!(
-                    lines.iter().any(|t| t.ends_with("banished from the realm.")),
+                    lines
+                        .iter()
+                        .any(|t| t.ends_with("banished from the realm.")),
                     "{game}: {lines:?}"
                 );
                 assert!(!lines.contains(&"has died."), "{game}: {lines:?}");
+                // And the leaver is off the others' roster.
+                let row = w
+                    .human_views(Hx(0))
+                    .into_iter()
+                    .find(|r| r.slot == w.human_wizard_seat(hx).min(7) as u8);
+                assert!(
+                    row.is_none_or(|r| r.eliminated),
+                    "{game}: still on the roster"
+                );
                 assert!(
                     w.vitals(hx).state != mgc_sim::engine::world::LifeState::Alive,
                     "{game}: the leaver's wizard still flies on peer {k}"

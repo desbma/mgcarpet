@@ -211,8 +211,16 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
    no triggers) and the greyscale death look. Open: other players see the
    ghost, so its flight must stay in the lockstep as a seat that cannot
    interact, not a local-only camera.
-   Also later: host handover; per-seat flight models; `Gen::local_seat()`
-   per peer; level end / campaign; more than two seats.
+   Also later: level end / campaign. (Per-seat flight models ✅, more than
+   two seats ✅.)
+6. 🏦 **Dedicated server + admin role** (player 2026-10-17, banked for its
+   own session) — REPLACES host handover, which cannot work behind a port
+   forward (clients reach only the server). A headless server process; the
+   admin is the first member, a player with more privileges, who may quit
+   while the rest play on. Open: does the server run the sim (authority,
+   hash + snapshot source) or only relay? Desync prevention (`libm` for the
+   sim's ~7 transcendental calls), a sectioned hash report, then snapshot
+   recovery follow in the same session (item 4 depends on it).
 
 ## Playtest log
 
@@ -392,3 +400,91 @@ Roadmap agreed with the player 2026-10-15 (recommended order):
   (3 peers; kill-switch proved: a hang-up instead of Leave fails it) and
   the reworked newcomer half of `after_a_game_the_lobby_reopens_for_the_next`.
   Xvfb: B leaves → B's waiting lobby → A wins → both in the reopened lobby.
+- 2026-10-17 #18: **JOIN HAS A PORT FIELD** (player: few know `host:port`).
+  The network scroll's Join face is Address / Port / Passphrase (Host
+  keeps Port / Passphrase); Tab and Enter walk the fields, Enter on the
+  last is OK. The join port is its own, remembered in `saves/netplay.json`
+  (`join_port`); a recent host (stored `host:port`) opens and clicks back
+  split into both fields; an address typed as `host:port` still wins.
+  Test `joining_takes_the_address_and_the_port_apart`.
+- 2026-10-17 #19: a client lost WHILE THE GAME STARTS (its Start send
+  failed) is a departure like any other — `Link::lost` carries the seats,
+  `Lockstep::start` queues them as failed sends, the first poll banishes
+  them at tick 0; it used to close the host's lockstep for everyone. Test
+  `a_client_lost_at_the_start_is_banished_not_fatal` (kill-switch: the
+  host stalls). Playtests #13-#18 all passed (player 10-17).
+- 2026-10-17 #20: **SEAT AUDIT** (3 parallel report-only agents: app
+  presentation, sim view API, sim seat-0 bias). FIXED, each with a test and
+  a kill-switch proof; single player unchanged (633/633 fixtures):
+  - `no_spell_loss` death/respawn used EVERY human's spell tokens — one
+    player's death ended the others' running spells, dropped jars of THEIR
+    spells at his corpse (duplicable) and relinked their tokens to his
+    castle. Now `seat_spell_tokens(hx)` (test
+    `no_spell_loss_death_touches_only_the_dying_seats_book`).
+  - The mana-ball owner contest weighed seat 0's mana ceiling for ANY
+    human (the walkers' `ctx` is seat 0's) — `human_ceiling_of(hx_of_tag)`
+    (test `a_ball_contest_weighs_its_own_seats_ceiling`).
+  - MC1 mana spheres of a second human drew in the host's colour —
+    owner's wizard colour when several humans play (one human: retail's 0).
+  - Global Death's violet flash washed every peer's view — `PalFlash`
+    carries the caster's seat (hash-silent; not in the snapshot) (test
+    `a_global_death_flash_is_its_casters_alone`).
+  - A banished/departed human stayed on the Alt roster (others' and his
+    own row) — `eliminated |= banished` (asserted in the leave test).
+  - MC2 map: own mines drew in seat 0's team colour — the owner's.
+  OPEN — need rulings or only matter outside the lobby's arenas:
+  - `World::won()` is world-global: one human's win (MC1 mana goal +
+    Space, MC2 end sequence) ends every peer's game as "completed" with
+    no winner named. Rec: in netplay a seat's win = game over naming that
+    seat (`net_standings`). Matters for the MC1 lobby (mana goal).
+  - Campaign maps in MP (`--host --level` only): the MC2 doomsday pyramid
+    fights only the host (rec: nearest live human, re-elected), its devour
+    cancels the HOST's Castle window for anyone's shot, doom summons home
+    on the host, kill-all credits the host; the MC2 STAGE ENGINE runs for
+    seat 0 only (co-op board vs per-seat boards = ruling) with its chimes
+    and level-end segment; cave drip spawns around the host only; the
+    castle fireball star only for the host's castle.
+  - Stats ledger rows (deaths by you, enhanced accuracy, MC2 spells found)
+    pool all humans — only matters if MP ever shows a stats screen.
+  - MC1 human deaths are never announced to others (MC2 announces
+    banishment only) — ruling. The level-start chime reaches seat 0 only
+    (cosmetic). `dev_minted` is global (cheat-only, cheats are off).
+- 2026-10-17 #21: **EFFECTS + COLOURS AUDIT** (2 report-only agents, on the
+  player's hint: monster effects and owner-coloured markers).
+  - Status effects: CLEAN. Webs (paralyze/slow — the manticore's spit is
+    the same (10,65) slow), knock/hurl/spin/whirl, flood/quake pull,
+    deflect debits, rebound, wraith steal, drain-life, duel tethers: each
+    resolves its victim by `hx_of_tag`, stores per seat, and the app reads
+    `local_hx()`. The `MobCtx` seat-0 trap is closed on these paths (it
+    holds only `phx` + flags; "the player" reads go through
+    `seat_at/seat_yaw/seat_dead/seat_purse(ctx, hx)`).
+  - Map dots/stamps: CLEAN (every colour from the owner via `p.team`;
+    volcano/fire/firestorm/lightning/meteor/quake entities stamp the
+    casting seat's tag).
+  - FIXED: the MC2 castle's team flag (world sprite) and the MC2 mana
+    worm's colour band (+ its coil spacing row) mapped EVERY human to
+    colour 0 — `Gen::human_colour_slot` (one human stays player 0); test
+    `a_second_humans_art_wears_his_own_colour`. The third-person / filmed
+    MC2 exit carpet drew colour-0 art — `World::human_carpet_row(local)`.
+  - OPEN (minor): a spread forest fire past its first hop names the
+    seeding fire, not the wizard, so it shows the environmental magenta
+    (same in single player — a design choice, not a seat leak; the
+    owner would need the fire-chain walk `stats_killer_of` does); two
+    Global Deaths at once share one
+    flash slot (cosmetic); apocalypse-rain spell XP goes to seat 0; the
+    doomsday pyramid (#20).
+- 2026-10-17 #22: ⚖ **THE STAR FIREBALL IS EVERY HUMAN'S** (player: MC2's
+  star-vs-sphere split is silly; take the simplest rule). Every
+  human-owned fireball source throws star sprite 42, on every screen —
+  the cast and the fire orb already did; the castle's shot now does too
+  (`is_human_tag(own)`, was the host's castle only). One human: retail.
+- 2026-10-17 #23: ⚖ the MC2 DOOMSDAY PYRAMID and the APOCALYPSE RAIN are
+  never in multiplayer (player): their seat-0 behaviour there is
+  undefined by ruling — no fix, no test; struck from the #20/#21 open
+  lists.
+- 2026-10-17 #24: ⚖ rulings closing the audit lists (player): a spread
+  forest fire's environmental colour is FINE (same in single player); MC2
+  multiplayer arenas carry NO objectives (retail `-level` on an arena
+  plays every narration one by one — the board is empty), so the
+  seat-0 stage engine is moot there; two Global Death flashes coalescing
+  is EXPECTED. The seat audit is closed.

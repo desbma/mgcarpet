@@ -587,9 +587,9 @@ impl Gen {
                     if self.ent[i].flags & 2 == 0 {
                         let own = self.ent[i].id24;
                         let slot = self
-                            .rival_ents
-                            .iter()
-                            .position(|&e| e != 0 && e == own)
+                            .human_colour_slot(own)
+                            .map(usize::from)
+                            .or_else(|| self.rival_ents.iter().position(|&e| e != 0 && e == own))
                             .unwrap_or(0);
                         self.ent[i].type86 += crate::mc2::color_art(slot as u8) as u16;
                         self.ent[i].flags |= 2;
@@ -3536,9 +3536,12 @@ impl Gen {
                 let lift = self.ent[i].f78 as i16;
                 self.ent[p].z = self.ent[p].z.wrapping_add(lift);
                 // The local player's castle FIREBALL swaps to the
-                // star muzzle sprite 42 (EF:30290-91) — `playerIndex`'s
-                // castle only, not every human's.
-                if own == self.human_tag[self.local_seat()].0 && spell == 0 {
+                // star muzzle sprite 42 (EF:30290-91) — retail:
+                // `playerIndex`'s castle only. ⚖ Player 2026-10-17:
+                // EVERY human-owned source throws the star, the same
+                // on every screen (a human's cast and fire orb already
+                // do) — with one human it is retail's own castle.
+                if self.is_human_tag(own) && spell == 0 {
                     let e = &mut self.ent[p];
                     e.type86 = 42;
                     e.frame88 = 0;

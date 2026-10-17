@@ -7496,12 +7496,19 @@ impl Gen {
         let own = self.ent[i].f144;
         let team = if mc2 || no_mc1_ball_owner_seat() {
             self.owner_team(own)
-        } else if self.is_human_tag(own) {
+        } else if let Some(hx) = self.hx_of_tag(own) {
             // The port's human tag. Retail carries the human's own
             // pool slot in `+144` (the conformance importer's `tr()`
             // rewrites it), and that record is the class-3 carpet, so
             // the seat test passes and its wizext reads player 0.
-            Some(0)
+            // With several humans each is his own wizard's colour (a
+            // second human's balls drew in the host's — audit
+            // 2026-10-17); one human stays retail's player 0.
+            Some(if self.human_seat.len() > 1 {
+                self.human_seat[hx].0
+            } else {
+                0
+            })
         } else if own != 0 && (own as usize) < self.ent.len() && self.ent[own as usize].class64 == 3
         {
             // A registered wizard seat answers with its player slot;
@@ -7769,7 +7776,7 @@ impl Gen {
                 // saturated over the untouched green — the violet
                 // flash. Gated on the owner being the local player,
                 // exactly as sub_44BE0's slot compare is.
-                self.pal_flash.arm(3);
+                self.pal_flash.arm_seat(3, hx);
             }
         }
         self.ent[i].flags |= 0x400;
@@ -8520,7 +8527,7 @@ impl Gen {
     /// The MC1 ball-merge OWNER CONTEST (`sub_277D0` :29700-73),
     /// lifted out of the merge so it can be pinned directly: the pair
     /// channel restores `+144` every tick and is blind to it.
-    pub(crate) fn mc1_ball_owner_contest(&mut self, i: usize, j: usize, ctx: &MobCtx) {
+    pub(crate) fn mc1_ball_owner_contest(&mut self, i: usize, j: usize) {
         // MC1 owner rule (`sub_277D0` :29700): OWNED BEATS
         // UNOWNED — an unowned survivor ADOPTS the absorbed
         // ball's owner (:29717; this is how magnet-pulled
@@ -8557,8 +8564,11 @@ impl Gen {
         // ceiling it carries moves with it — both
         // wizards' `mana_max` part on the next census.
         let w136 = |g: &Self, o: u16| {
-            if self.is_human_tag(o) {
-                g.human_ceiling(ctx).min(i32::MAX as u32) as i32
+            // The OWNER's ceiling: the walkers' `ctx` is seat 0's, so
+            // with several humans it weighed another player's
+            // (audit 2026-10-17).
+            if let Some(hx) = self.hx_of_tag(o) {
+                g.human_ceiling_of(hx).min(i32::MAX as u32) as i32
             } else if (o as usize) < g.ent.len() {
                 g.ent[o as usize].f136
             } else {
@@ -8624,7 +8634,7 @@ impl Gen {
     // Four arms resolve to `oi` on purpose: each is a separate retail
     // branch with its own EF citation, kept one-to-one.
     #[allow(clippy::if_same_then_else)]
-    fn mc2_ball_owner_contest(&self, oi: u16, oj: u16, fi: i32, fj: i32, ctx: &MobCtx) -> u16 {
+    fn mc2_ball_owner_contest(&self, oi: u16, oj: u16, fi: i32, fj: i32) -> u16 {
         if no_mc2_ball_owner_ladder() {
             return if fj > fi { oj } else { oi };
         }
@@ -8632,8 +8642,11 @@ impl Gen {
             !self.is_human_tag(o) && (o as usize) < g.ent.len() && g.ent[o as usize].class64 == 10
         };
         let w136 = |g: &Self, o: u16| -> i32 {
-            if self.is_human_tag(o) {
-                g.human_ceiling(ctx).min(i32::MAX as u32) as i32
+            // The OWNER's ceiling: the walkers' `ctx` is seat 0's, so
+            // with several humans it weighed another player's
+            // (audit 2026-10-17).
+            if let Some(hx) = self.hx_of_tag(o) {
+                g.human_ceiling_of(hx).min(i32::MAX as u32) as i32
             } else if (o as usize) < g.ent.len() {
                 g.ent[o as usize].f136
             } else {
@@ -9647,7 +9660,7 @@ impl Gen {
                     } else if oj == 0 {
                         oi
                     } else {
-                        self.mc2_ball_owner_contest(oi, oj, fi, fj, ctx)
+                        self.mc2_ball_owner_contest(oi, oj, fi, fj)
                     };
                     self.ent[i].f144 = winner;
                     // Mana Lock across merges (EF:26936-40): ONLY the
@@ -9661,7 +9674,7 @@ impl Gen {
                         self.ent[i].flags |= crate::mc2::mobs::F_CLAIM_LOCK;
                     }
                 } else {
-                    self.mc1_ball_owner_contest(i, j, ctx);
+                    self.mc1_ball_owner_contest(i, j);
                 }
                 self.ent[i].f140 = fi + fj;
                 // EF:26595 / EXE 0x5addc `call 0x5b120` — the m57's
