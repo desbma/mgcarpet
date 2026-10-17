@@ -366,6 +366,11 @@ pub trait Referee {
     fn verdict(&self) -> Option<String>;
     /// The game is over: drop the world.
     fn end(&mut self);
+    /// The wizard seats `level` authors a start for (bit k = seat k) —
+    /// the lobby holds its members to them ([`LobbyCore::set_open`]).
+    fn open_seats(&self, _level: &str) -> u8 {
+        u8::MAX
+    }
 }
 
 /// What a hosted server's app wants to know about it (its close
@@ -467,8 +472,10 @@ impl Server {
     /// Open a session on `listener` (a bound socket).
     pub fn new(listener: TcpListener, opts: ServerOpts, referee: Box<dyn Referee>) -> Self {
         let _ = listener.set_nonblocking(true);
+        let mut core = LobbyCore::new(opts.game, opts.level.clone(), opts.rules, MAX_PLAYERS);
+        core.set_open(referee.open_seats(&opts.level));
         Self {
-            core: LobbyCore::new(opts.game, opts.level, opts.rules, MAX_PLAYERS),
+            core,
             plays: opts.game,
             passphrase: opts.passphrase,
             build: opts.build,
@@ -642,7 +649,11 @@ impl Server {
                 if NetGame::of_level(&level) != Some(self.plays) {
                     self.note(format!("refused level {level}: not {}", self.plays.title()));
                 }
-                self.dirty |= self.core.set_level(level);
+                let open = self.referee.open_seats(&level);
+                if self.core.set_level(level) {
+                    self.core.set_open(open);
+                    self.dirty = true;
+                }
             }
             Ok(Msg::SetAi { ai }) => self.dirty |= self.core.set_ai(ai),
             Ok(Msg::SetRules { rules }) => self.dirty |= self.core.set_rules(rules),

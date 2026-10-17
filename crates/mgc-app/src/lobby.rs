@@ -140,6 +140,14 @@ pub struct LobbyView {
     /// when it ends.
     #[serde(default)]
     pub playing: bool,
+    /// The wizard seats the level authors a start for (bit k = seat k):
+    /// only these can be held (MC1's Bisnagar seats five, Comari four).
+    #[serde(default = "all_seats")]
+    pub open: u8,
+}
+
+fn all_seats() -> u8 {
+    u8::MAX
 }
 
 impl LobbyView {
@@ -151,9 +159,20 @@ impl LobbyView {
         self.admin == Some(self.you)
     }
 
-    /// Nobody holds `wizard`.
+    /// The level authors `wizard`'s start.
+    pub fn is_open(&self, wizard: u8) -> bool {
+        wizard < WIZARDS && self.open & (1 << wizard) != 0
+    }
+
+    /// Nobody holds `wizard`, and the level seats it.
     pub fn is_free(&self, wizard: u8) -> bool {
-        wizard < WIZARDS && self.members.iter().all(|m| m.wizard != wizard)
+        self.is_open(wizard) && self.members.iter().all(|m| m.wizard != wizard)
+    }
+
+    /// Every member holds a seat the level authors (a level change can
+    /// leave more members than it seats).
+    pub fn fits(&self) -> bool {
+        self.members.iter().all(|m| self.is_open(m.wizard))
     }
 
     /// The next free wizard stepping from `from` in direction `dir`
@@ -165,10 +184,11 @@ impl LobbyView {
             .find(|&w| self.is_free(w))
     }
 
-    /// Play is open: two members at least, and every one agreed (the
-    /// admin's row always reads agreed).
+    /// Play is open: two members at least, every one on a seat the
+    /// level authors, and every one agreed (the admin's row always
+    /// reads agreed).
     pub fn all_agreed(&self) -> bool {
-        self.members.len() > 1 && self.members.iter().all(|m| m.agreed)
+        self.members.len() > 1 && self.fits() && self.members.iter().all(|m| m.agreed)
     }
 
     /// The members besides the admin, and how many of them agreed.
@@ -209,6 +229,8 @@ pub struct LobbyCore {
     ai: u8,
     /// A game is in progress ([`LobbyView::playing`]).
     playing: bool,
+    /// The level's authored seats ([`LobbyView::open`]).
+    open: u8,
 }
 
 impl LobbyCore {
@@ -227,6 +249,7 @@ impl LobbyCore {
             max,
             ai: 0,
             playing: false,
+            open: u8::MAX,
         }
     }
 
@@ -247,7 +270,35 @@ impl LobbyCore {
             capacity: self.capacity as u8,
             ai: self.ai,
             playing: self.playing,
+            open: self.open,
         }
+    }
+
+    /// The seats the level authors (the server reads them off the level
+    /// at every change): a member on a seat it lacks moves to the first
+    /// free one it has (if any — else Play waits, [`LobbyView::fits`]);
+    /// the player limit and the AI count shrink to fit.
+    pub fn set_open(&mut self, open: u8) -> bool {
+        if open == self.open {
+            return false;
+        }
+        self.open = open;
+        for k in 0..self.members.len() {
+            let view = self.view_for(0);
+            if view.is_open(self.members[k].wizard) {
+                continue;
+            }
+            if let Some(w) = (0..WIZARDS).find(|&w| view.is_free(w)) {
+                self.members[k].wizard = w;
+            }
+        }
+        let seats = self.open.count_ones() as usize;
+        self.capacity = self
+            .capacity
+            .min(seats)
+            .max(self.members.len().max(2).min(self.max));
+        self.ai = self.ai.min(seats.saturating_sub(self.members.len()) as u8);
+        true
     }
 
     pub fn is_admin(&self, id: u32) -> bool {
@@ -394,7 +445,8 @@ impl LobbyCore {
     /// The admin sets the AI wizard count (0 up to the seats the humans
     /// leave); a RULE — a change voids every agreement.
     pub fn set_ai(&mut self, ai: u8) -> bool {
-        let ai = ai.min(WIZARDS.saturating_sub(self.members.len() as u8));
+        let seats = self.open.count_ones() as u8;
+        let ai = ai.min(seats.saturating_sub(self.members.len() as u8));
         if ai == self.ai {
             return false;
         }
@@ -446,7 +498,8 @@ impl LobbyCore {
     /// allows, never below the members already in. Not a rule — no
     /// agreement moves.
     pub fn set_capacity(&mut self, capacity: usize) -> bool {
-        let c = capacity.clamp(self.members.len().max(2), self.max.max(2));
+        let most = self.max.min(self.open.count_ones() as usize).max(2);
+        let c = capacity.clamp(self.members.len().max(2).min(most), most);
         let changed = c != self.capacity;
         self.capacity = c;
         changed
@@ -461,6 +514,37 @@ impl LobbyCore {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A level that authors fewer seats (MC1's Comari: four) holds its
+    /// members to them: a member on a missing seat moves, picks and the
+    /// limit stop at the authored ones, and Play waits while the
+    /// members outnumber them.
+    #[test]
+    fn only_the_levels_authored_seats_can_be_held() {
+        let (mut l, ids) = lobby_of(3, 8);
+        assert!(l.pick_wizard(ids[2], 6));
+        assert!(l.set_open(0b0000_1111));
+        let v = l.view_for(ids[0]);
+        assert_eq!(v.seats(), vec![0, 1, 2], "seat 6 moved to the free 2");
+        assert_eq!(v.capacity, 4);
+        assert!(!l.pick_wizard(ids[1], 5), "seat 5 is not authored");
+        assert!(!l.set_capacity(8) && l.view_for(0).capacity == 4);
+        assert!(l.set_ai(5) && l.view_for(0).ai == 1, "one free seat left");
+        let fourth = l.join(String::new()).unwrap();
+        assert!(l.join(String::new()).is_err(), "full at four");
+        // Two authored seats, four members: no Play until two leave.
+        l.set_open(0b0000_0011);
+        let v = l.view_for(ids[0]);
+        assert!(!v.fits());
+        for &id in [ids[1], ids[2], fourth].iter() {
+            l.agree(id, v.rev);
+        }
+        assert!(l.view_for(0).members.iter().all(|m| m.agreed));
+        assert!(!l.can_play());
+        l.leave(ids[2]);
+        l.leave(fourth);
+        assert!(l.can_play(), "two members on the two seats");
+    }
 
     /// A lobby of `n` members (the first is the admin), room for `cap`.
     fn lobby_of(n: usize, cap: usize) -> (LobbyCore, Vec<u32>) {

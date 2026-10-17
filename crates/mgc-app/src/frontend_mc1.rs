@@ -27,7 +27,10 @@
 //! explicit): 1 = START NEW GAME (confirm), 11 = CONTINUE
 //! (the next campaign level — the retail between-level beat),
 //! 5/6 = LOAD/SAVE submodes, 2 = change the save name, 4 = quit
-//! (confirm), 3 = multiplayer (not in this remake).
+//! (confirm), 3 = multiplayer: retail's gate is the `-network` switch
+//! (`byte_93958`); here the button is always live and opens a Host /
+//! Join scroll (the MC2 temple's fields, player ruling 2026-10-17), then
+//! the PMULTI lobby (`lobby_mc1.rs`).
 
 use std::path::Path;
 
@@ -50,7 +53,52 @@ pub enum Mc1Action {
     /// The edited save name (retail slot label, max 20).
     SetName(String),
     Quit,
+    /// Multiplayer: the app seeds the network scroll from the player's
+    /// entries ([`Mc1Menu::open_network`]).
+    Network,
+    /// Network scroll → Host: open a lobby on `port`.
+    Host {
+        port: String,
+        passphrase: String,
+    },
+    /// Network scroll → Join: connect to `addr` on `port`.
+    Join {
+        addr: String,
+        port: String,
+        passphrase: String,
+    },
 }
+
+/// A network scroll entry field.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NetField {
+    /// Join: the host's name or address.
+    Addr,
+    /// Host: the port to listen on.
+    Port,
+    /// Join: the host's port.
+    JoinPort,
+    Pass,
+}
+
+/// The fields of each face, top to bottom (`focus` indexes these).
+fn net_fields(host: bool) -> &'static [NetField] {
+    if host {
+        &[NetField::Port, NetField::Pass]
+    } else {
+        &[NetField::Addr, NetField::JoinPort, NetField::Pass]
+    }
+}
+
+/// The network scroll's rows (320-space): the Host / Join words, then
+/// the fields from y 90, 9 px apart, clear of OK and Cancel (no title —
+/// it ran into the scroll's top roller, player 10-17).
+const NET_FACE_Y: i32 = 80;
+const NET_FACES: [(i32, &str); 2] = [(112, "Host"), (180, "Join")];
+const NET_ROW_Y: i32 = 90;
+const NET_ROW_H: i32 = 9;
+const NET_LABEL_X: i32 = 94;
+const NET_VALUE_X: i32 = 144;
 
 const W: usize = 320;
 const H: usize = 200;
@@ -201,6 +249,45 @@ impl Bank {
         }
     }
 
+    /// Blit a multi-ink glyph (SFONT1: 1 = body, 2 = outline) — pixel
+    /// value v paints `inks[v - 1]` — clipped to `clip` (x0, y0, x1, y1,
+    /// exclusive ends; retail's `sub_51360` text viewport) on a 320×200
+    /// screen.
+    pub(crate) fn blit_inks(
+        &self,
+        id: usize,
+        x: i32,
+        y: i32,
+        inks: &[u8],
+        clip: (i32, i32, i32, i32),
+        buf: &mut [u8],
+    ) {
+        let Some((sx, sy, w, h)) = self.rects.get(id).copied().flatten() else {
+            return;
+        };
+        for row in 0..h {
+            let py = y + row as i32;
+            if py < clip.1.max(0) || py >= clip.3.min(H as i32) {
+                continue;
+            }
+            for col in 0..w {
+                let px = x + col as i32;
+                if px < clip.0.max(0) || px >= clip.2.min(W as i32) {
+                    continue;
+                }
+                let p = self.atlas[(sy + row) * self.atlas_w + sx + col];
+                if let Some(&ink) = (p as usize).checked_sub(1).and_then(|k| inks.get(k)) {
+                    buf[py as usize * W + px as usize] = ink;
+                }
+            }
+        }
+    }
+
+    /// A sprite's (w, h), if it has pixels.
+    pub(crate) fn size_of(&self, id: usize) -> Option<(usize, usize)> {
+        self.rects.get(id).copied().flatten().map(|r| (r.2, r.3))
+    }
+
     pub(crate) fn width_of(&self, id: usize) -> usize {
         self.rects
             .get(id)
@@ -221,6 +308,22 @@ enum Modal {
     /// The rename dialog (button 2): edits the CURRENT save name.
     EditName {
         buf: String,
+    },
+    /// Multiplayer: Host / Join, the port (and address), the passphrase.
+    Network {
+        host: bool,
+        addr: String,
+        port: String,
+        join_port: String,
+        pass: String,
+        /// The field taking keystrokes: an index into [`net_fields`].
+        focus: u8,
+    },
+    /// "Attempting connection" while a join is under way (no buttons).
+    Connecting,
+    /// A notice with OK (a refused join, a kick, a closed session).
+    Message {
+        text: String,
     },
 }
 
@@ -252,6 +355,9 @@ pub struct Mc1Menu {
     white: u8,
     /// Palette index for dim text ("--" rows).
     dim: u8,
+    /// Dark brown ink on the parchment (the network scroll's unpicked
+    /// Host / Join word — the mid-tone `dim` blended into the scroll).
+    brown: u8,
     anim: f32,
     sub: Sub,
     modal: Option<Modal>,
@@ -342,6 +448,12 @@ impl Mc1Menu {
             bright,
             white,
             dim,
+            brown: (0..256)
+                .min_by_key(|&i| {
+                    let d = |k: usize, v: i32| (i32::from(pal[i * 3 + k]) - v).pow(2);
+                    d(0, 22) + d(1, 13) + d(2, 6)
+                })
+                .unwrap_or(0) as u8,
             anim: 0.0,
             sub: Sub::None,
             modal: None,
@@ -375,7 +487,93 @@ impl Mc1Menu {
     }
 
     pub fn editing(&self) -> bool {
-        matches!(self.modal, Some(Modal::EditName { .. }))
+        matches!(
+            self.modal,
+            Some(Modal::EditName { .. } | Modal::Network { .. })
+        )
+    }
+
+    /// Open the network scroll, seeded with the last entries (the most
+    /// recent host fills the Join face; none opens the Host face).
+    pub fn open_network(
+        &mut self,
+        recent: Vec<String>,
+        port: String,
+        join_port: String,
+        pass: String,
+    ) {
+        let (addr, last_port) = recent
+            .first()
+            .map(|a| crate::frontend::split_host_port(a))
+            .unwrap_or_default();
+        self.modal = Some(Modal::Network {
+            host: recent.is_empty(),
+            addr,
+            port,
+            join_port: if last_port.is_empty() {
+                join_port
+            } else {
+                last_port
+            },
+            pass,
+            focus: 0,
+        });
+    }
+
+    pub fn open_connecting(&mut self) {
+        self.modal = Some(Modal::Connecting);
+    }
+
+    /// The app closes the connecting scroll once the join resolved.
+    pub fn close_connecting(&mut self) {
+        if matches!(self.modal, Some(Modal::Connecting)) {
+            self.modal = None;
+        }
+    }
+
+    /// A notice with OK (replaces whatever dialog is up).
+    pub fn open_message(&mut self, text: String) {
+        self.modal = Some(Modal::Message { text });
+    }
+
+    /// Tab: the network scroll's next field.
+    pub fn key_tab(&mut self) {
+        if let Some(Modal::Network { host, focus, .. }) = &mut self.modal {
+            *focus = (*focus + 1) % net_fields(*host).len() as u8;
+        }
+    }
+
+    /// OK on the network scroll: both fields are required (a session
+    /// has a passphrase); an empty one keeps the scroll up.
+    fn net_ok(&mut self) {
+        let Some(Modal::Network {
+            host,
+            addr,
+            port,
+            join_port,
+            pass,
+            ..
+        }) = &self.modal
+        else {
+            return;
+        };
+        let target = if *host { port } else { addr };
+        if target.is_empty() || pass.is_empty() {
+            return;
+        }
+        self.pending = Some(if *host {
+            Mc1Action::Host {
+                port: port.clone(),
+                passphrase: pass.clone(),
+            }
+        } else {
+            Mc1Action::Join {
+                addr: addr.clone(),
+                port: join_port.clone(),
+                passphrase: pass.clone(),
+            }
+        });
+        self.modal = None;
     }
 
     /// Esc: decline/close the modal, else leave the submode, else arm
@@ -384,6 +582,9 @@ impl Mc1Menu {
     /// applied to both frontends by player ruling so a second Esc
     /// always declines what the first one opened.
     pub fn escape(&mut self) {
+        if matches!(self.modal, Some(Modal::Connecting)) {
+            return;
+        }
         if self.modal.is_some() {
             self.modal = None;
         } else if self.sub != Sub::None {
@@ -394,6 +595,26 @@ impl Mc1Menu {
     }
 
     pub fn key_char(&mut self, c: char) {
+        if let Some(Modal::Network {
+            host,
+            addr,
+            port,
+            join_port,
+            pass,
+            focus,
+        }) = &mut self.modal
+        {
+            let (field, ok, max) = match net_fields(*host)[usize::from(*focus)] {
+                NetField::Port => (port, c.is_ascii_digit(), 5),
+                NetField::JoinPort => (join_port, c.is_ascii_digit(), 5),
+                NetField::Addr => (addr, c.is_ascii_alphanumeric() || ".:-[]".contains(c), 40),
+                NetField::Pass => (pass, c.is_ascii_alphanumeric() || "-_.!?".contains(c), 24),
+            };
+            if ok && field.len() < max {
+                field.push(c);
+            }
+            return;
+        }
         if !(c == ' ' || c.is_ascii_alphanumeric()) {
             return;
         }
@@ -406,14 +627,42 @@ impl Mc1Menu {
     }
 
     pub fn key_backspace(&mut self) {
-        if let Some(Modal::EditName { buf }) = &mut self.modal {
-            buf.pop();
+        match &mut self.modal {
+            Some(Modal::EditName { buf }) => {
+                buf.pop();
+            }
+            Some(Modal::Network {
+                host,
+                addr,
+                port,
+                join_port,
+                pass,
+                focus,
+            }) => {
+                match net_fields(*host)[usize::from(*focus)] {
+                    NetField::Port => port.pop(),
+                    NetField::JoinPort => join_port.pop(),
+                    NetField::Addr => addr.pop(),
+                    NetField::Pass => pass.pop(),
+                };
+            }
+            _ => {}
         }
     }
 
     /// Enter = the OK button on every dialog (the MC2 scroll widget's
     /// scancode-28 law, applied to both frontends by player ruling).
     pub fn key_enter(&mut self) {
+        // The network scroll: Enter steps to the next field; on the
+        // last it is OK.
+        if let Some(Modal::Network { host, focus, .. }) = &mut self.modal {
+            if usize::from(*focus) + 1 < net_fields(*host).len() {
+                *focus += 1;
+            } else {
+                self.net_ok();
+            }
+            return;
+        }
         match self.modal.take() {
             Some(Modal::EditName { buf }) => {
                 self.pending = Some(Mc1Action::SetName(buf));
@@ -424,7 +673,9 @@ impl Mc1Menu {
             }
             Some(Modal::ConfirmNew) => self.pending = Some(Mc1Action::NewGame),
             Some(Modal::ConfirmQuit) => self.pending = Some(Mc1Action::Quit),
-            None => {}
+            Some(Modal::Network { .. }) => unreachable!("handled above"),
+            Some(Modal::Connecting) => self.modal = Some(Modal::Connecting),
+            Some(Modal::Message { .. }) | None => {}
         }
     }
 
@@ -442,7 +693,6 @@ impl Mc1Menu {
             // regions answer (hover and click) until a slot is picked
             // or Esc backs out.
             _ if self.sub != Sub::None => (5..=10).contains(&id),
-            3 => false, // multiplayer: no network in this remake
             7..=10 => false,
             11 => self.game_active,
             _ => true,
@@ -464,6 +714,27 @@ impl Mc1Menu {
         if self.modal.is_some() {
             let ok = Self::ok_hit(mx, my);
             let cancel = Self::cancel_hit(mx, my);
+            if let Some(Modal::Network { host, focus, .. }) = &mut self.modal {
+                if ok {
+                    self.net_ok();
+                } else if cancel {
+                    self.modal = None;
+                } else if (NET_FACE_Y..NET_FACE_Y + NET_ROW_H).contains(&(my as i32)) {
+                    if let Some(k) = NET_FACES
+                        .iter()
+                        .position(|&(x, _)| (x - 8..x + 32).contains(&(mx as i32)))
+                    {
+                        *host = k == 0;
+                        *focus = 0;
+                    }
+                } else if (NET_LABEL_X..NET_LABEL_X + 150).contains(&(mx as i32)) {
+                    let row = (my as i32 - NET_ROW_Y).div_euclid(NET_ROW_H);
+                    if (0..net_fields(*host).len() as i32).contains(&row) {
+                        *focus = row as u8;
+                    }
+                }
+                return;
+            }
             match self.modal.take() {
                 Some(Modal::EditName { buf }) => {
                     if ok {
@@ -494,6 +765,12 @@ impl Mc1Menu {
                         self.modal = Some(Modal::ConfirmQuit);
                     }
                 }
+                Some(Modal::Message { text }) => {
+                    if !ok {
+                        self.modal = Some(Modal::Message { text });
+                    }
+                }
+                Some(m @ (Modal::Connecting | Modal::Network { .. })) => self.modal = Some(m),
                 None => {}
             }
             return;
@@ -537,6 +814,7 @@ impl Mc1Menu {
                     buf: self.player_name.clone(),
                 });
             }
+            (3, _) => self.pending = Some(Mc1Action::Network),
             (4, _) => self.modal = Some(Modal::ConfirmQuit),
             (5, Sub::None) => self.sub = Sub::Load,
             (6, Sub::None) => self.sub = Sub::Save,
@@ -554,6 +832,25 @@ impl Mc1Menu {
             }
             cx += self.font.width_of(id) as i32;
         }
+    }
+
+    /// `text` broken into lines of at most `room` px (at spaces).
+    fn wrap(&self, text: &str, room: usize) -> Vec<String> {
+        let mut lines = vec![String::new()];
+        for word in text.split_whitespace() {
+            let last = lines.last_mut().expect("one line");
+            let joined = if last.is_empty() {
+                word.to_string()
+            } else {
+                format!("{last} {word}")
+            };
+            if self.text_width(&joined) <= room || last.is_empty() {
+                *last = joined;
+            } else {
+                lines.push(word.to_string());
+            }
+        }
+        lines
     }
 
     fn text_width(&self, s: &str) -> usize {
@@ -632,6 +929,7 @@ impl Mc1Menu {
                 }
             }
             let mut texts: Vec<(String, i32, i32)> = Vec::new();
+            let mut dim_texts: Vec<(String, i32, i32, bool)> = Vec::new();
             let centered = |menu: &Self, s: &str| 65 + (189 - menu.text_width(s) as i32) / 2;
             match m {
                 Modal::EditName { buf: edit } => {
@@ -670,12 +968,63 @@ impl Mc1Menu {
                     texts.push((prompt.into(), centered(self, prompt), 78));
                     self.sprites.blit(7, 143, 90, &mut buf);
                 }
+                Modal::Network {
+                    host,
+                    addr,
+                    port,
+                    join_port,
+                    pass,
+                    focus,
+                } => {
+                    for (k, &(x, word)) in NET_FACES.iter().enumerate() {
+                        let on = (k == 0) == *host;
+                        let shown = if on { format!("[{word}]") } else { word.into() };
+                        dim_texts.push((shown, x, NET_FACE_Y, on));
+                    }
+                    for (k, f) in net_fields(*host).iter().enumerate() {
+                        let (label, value) = match f {
+                            NetField::Addr => ("Address", addr),
+                            NetField::Port => ("Port", port),
+                            NetField::JoinPort => ("Port", join_port),
+                            NetField::Pass => ("Passphrase", pass),
+                        };
+                        let y = NET_ROW_Y + NET_ROW_H * k as i32;
+                        let mut value = value.clone();
+                        if k == usize::from(*focus) && caret_on {
+                            value.push('_');
+                        }
+                        while self.text_width(&value) > 90 && !value.is_empty() {
+                            value.remove(0);
+                        }
+                        texts.push((label.into(), NET_LABEL_X, y));
+                        texts.push((value, NET_VALUE_X, y));
+                    }
+                }
+                Modal::Connecting => {
+                    let prompt = "Attempting connection";
+                    texts.push((prompt.into(), centered(self, prompt), 92));
+                }
+                Modal::Message { text } => {
+                    for (k, line) in self.wrap(text, 180).into_iter().take(4).enumerate() {
+                        let x = centered(self, &line);
+                        texts.push((line, x, 76 + 9 * k as i32));
+                    }
+                }
             }
-            self.sprites.blit(5, 66, 104, &mut buf);
-            self.sprites.blit(6, 238, 104, &mut buf);
+            match m {
+                Modal::Connecting => {}
+                Modal::Message { .. } => self.sprites.blit(5, 66, 104, &mut buf),
+                _ => {
+                    self.sprites.blit(5, 66, 104, &mut buf);
+                    self.sprites.blit(6, 238, 104, &mut buf);
+                }
+            }
             let white = self.white;
             for (s, x, y) in texts {
                 self.text(&s, x, y, white, &mut buf);
+            }
+            for (s, x, y, on) in dim_texts {
+                self.text(&s, x, y, if on { white } else { self.brown }, &mut buf);
             }
         }
         // The retail MENU pointer: the golden pointing HAND, STATIC.
@@ -760,5 +1109,43 @@ mod tests {
         m.modal = Some(Modal::ConfirmQuit);
         m.reset_dialogs();
         assert!(m.sub == Sub::None && m.modal.is_none());
+    }
+
+    /// Multiplayer (button 3) is live and asks the app for the network
+    /// scroll; the scroll's Join face fills from the most recent host,
+    /// Enter walks its fields and the last one joins; an empty
+    /// passphrase keeps it up.
+    #[test]
+    fn the_network_scroll_joins() {
+        let Some(mut m) = menu() else {
+            eprintln!("skipping: no baked mc1-ui");
+            return;
+        };
+        let (x, y) = spot(&m, 3);
+        m.click((320.0, 200.0), (x, y));
+        assert_eq!(m.take_action(), Some(Mc1Action::Network));
+        m.open_network(vec!["box:7000".into()], "7777".into(), "7777".into(), String::new());
+        assert!(m.editing());
+        m.key_enter();
+        m.key_enter();
+        m.key_enter();
+        assert!(m.take_action().is_none(), "no passphrase yet");
+        for c in "pw!".chars() {
+            m.key_char(c);
+        }
+        m.key_enter();
+        assert_eq!(
+            m.take_action(),
+            Some(Mc1Action::Join {
+                addr: "box".into(),
+                port: "7000".into(),
+                passphrase: "pw!".into(),
+            })
+        );
+        m.open_connecting();
+        m.escape();
+        assert!(matches!(m.modal, Some(Modal::Connecting)), "no way out mid-join");
+        m.close_connecting();
+        assert!(m.modal.is_none());
     }
 }

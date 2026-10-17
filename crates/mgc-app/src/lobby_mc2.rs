@@ -64,6 +64,12 @@ pub enum LobbyAction {
     },
     /// Host: the next player limit.
     CycleCapacity,
+    /// MC1: take this free wizard seat (a seat icon's click).
+    PickWizard(u8),
+    /// MC1, host: play arena level `n` (the map list's click).
+    SetArena(u32),
+    /// MC1, host: the player limit (the rules page's Players row).
+    SetCapacity(usize),
 }
 
 /// One row of the rules scroll: its label and current value text.
@@ -669,6 +675,9 @@ impl LobbyScreen {
         if v.playing {
             return "Waiting for the current game to finish".into();
         }
+        if !v.fits() {
+            return "Too many players for this arena".into();
+        }
         let (clients, agreed) = v.agreement();
         if v.is_admin() {
             if clients == 0 {
@@ -1043,6 +1052,7 @@ mod tests {
             capacity: 2,
             ai: 0,
             playing: false,
+            open: u8::MAX,
         }
     }
 

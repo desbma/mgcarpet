@@ -20,6 +20,7 @@ mod frontend;
 mod frontend_mc1;
 mod launcher_screen;
 mod lobby;
+mod lobby_mc1;
 mod lobby_mc2;
 mod menu;
 mod minimenu;
@@ -1375,6 +1376,27 @@ fn load_level_with(
             );
             book
         }
+        // A NETWORK game: retail's networked arm (:49200-04, :49237-40)
+        // grants every human the level's wizard ROW 0 —
+        // `starting_spells ∧ allowed_spells` — with no campaign carry
+        // (an arena's own start: Bussorah = Fireball, Possess, Create
+        // Castle). The plausible seed is a campaign aid, not a rule.
+        None if net_ai.is_some() && mc1_family => package
+            .wizards
+            .as_ref()
+            .and_then(|w| w.wizards.first())
+            .map(|row0| {
+                (0..row0.starting_spells.len() as u8)
+                    .filter(|&s| {
+                        row0.starting_spells[s as usize] != 0
+                            && row0
+                                .allowed_spells
+                                .as_ref()
+                                .is_none_or(|m| m.get(s as usize).is_some_and(|&v| v == 1))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         None => {
             let mut book: Vec<u8> = campaign_carry
                 .iter()
@@ -2344,6 +2366,8 @@ enum UiAtlas {
     MenuMc1,
     /// The MC2 multiplayer lobby's atlas.
     LobbyMc2,
+    /// The MC1 lobby's CPU-composed frame (re-uploaded every frame).
+    LobbyMc1,
     /// The frontend-owned level-UI atlas (the P options menu over a
     /// frontend screen — fonts + panel art without a session).
     FrontendUi,
@@ -6762,20 +6786,14 @@ impl App {
 
     /// One main-menu frame, dispatched per campaign.
     fn menu_screen_frame(&mut self, dt: f32, event_loop: &ActiveEventLoop) {
-        if self
-            .campaign
-            .as_ref()
-            .is_some_and(|c| c.id != campaign::CampaignId::Mc2)
-        {
+        // The netplay lobby replaces the main menu while it is open.
+        self.poll_join();
+        if self.netlobby.is_some() {
+            self.lobby_frame(dt);
+        } else if self.mc1_frontend() {
             self.menu_screen_frame_mc1(dt, event_loop);
         } else {
-            // The netplay lobby replaces the temple while it is open.
-            self.poll_join();
-            if self.netlobby.is_some() {
-                self.lobby_frame(dt);
-            } else {
-                self.menu_screen_frame_mc2(dt, event_loop);
-            }
+            self.menu_screen_frame_mc2(dt, event_loop);
         }
     }
 
@@ -6917,6 +6935,13 @@ impl App {
                     self.ui_atlas = UiAtlas::None;
                 }
                 Mc1Action::Quit => event_loop.exit(),
+                Mc1Action::Network => self.open_network_dialog(),
+                Mc1Action::Host { port, passphrase } => self.host_lobby(port, passphrase),
+                Mc1Action::Join {
+                    addr,
+                    port,
+                    passphrase,
+                } => self.join_lobby(addr, port, passphrase),
             }
         }
     }
@@ -9191,18 +9216,14 @@ impl ApplicationHandler for App {
                     if down && button == MouseButton::Left {
                         let size = self.view_size();
                         let cursor = self.cursor;
-                        if self
-                            .campaign
-                            .as_ref()
-                            .is_some_and(|c| c.id != campaign::CampaignId::Mc2)
-                        {
+                        if let Some(nl) = &mut self.netlobby {
+                            nl.screen.click(size, cursor);
+                            return;
+                        }
+                        if self.mc1_frontend() {
                             if let Some(m) = &mut self.mc1menu {
                                 m.click(size, cursor);
                             }
-                            return;
-                        }
-                        if let Some(nl) = &mut self.netlobby {
-                            nl.screen.click(size, cursor);
                             return;
                         }
                         let request = self.mainmenu.as_mut().and_then(|m| m.click(size, cursor));
@@ -9610,14 +9631,14 @@ impl ApplicationHandler for App {
                             .campaign
                             .as_ref()
                             .is_some_and(|c| c.id != campaign::CampaignId::Mc2);
-                        if mc1 {
+                        if let Some(nl) = &mut self.netlobby {
+                            nl.screen.escape();
+                        } else if mc1 {
                             if let Some(m) = &mut self.mc1menu {
                                 m.escape();
                             } else {
                                 event_loop.exit();
                             }
-                        } else if let Some(nl) = &mut self.netlobby {
-                            nl.screen.escape();
                         } else if let Some(m) = &mut self.mainmenu {
                             m.escape();
                         } else {
@@ -9681,15 +9702,15 @@ impl ApplicationHandler for App {
                         .campaign
                         .as_ref()
                         .is_some_and(|c| c.id != campaign::CampaignId::Mc2);
-                    let target = if self.screen == Screen::Menu && mc1 {
-                        if self.mc1menu.as_ref().is_some_and(|m| m.editing()) {
-                            Edit::Mc1Menu
+                    let target = if self.screen == Screen::Menu && self.netlobby.is_some() {
+                        if self.netlobby.as_ref().is_some_and(|l| l.screen.editing()) {
+                            Edit::Lobby
                         } else {
                             Edit::None
                         }
-                    } else if self.screen == Screen::Menu && self.netlobby.is_some() {
-                        if self.netlobby.as_ref().is_some_and(|l| l.screen.editing()) {
-                            Edit::Lobby
+                    } else if self.screen == Screen::Menu && mc1 {
+                        if self.mc1menu.as_ref().is_some_and(|m| m.editing()) {
+                            Edit::Mc1Menu
                         } else {
                             Edit::None
                         }
@@ -9747,6 +9768,9 @@ impl ApplicationHandler for App {
                             }
                             Edit::Mc1Menu => {
                                 if let Some(m) = &mut self.mc1menu {
+                                    if tab {
+                                        m.key_tab();
+                                    }
                                     if backspace {
                                         m.key_backspace();
                                     } else if enter {
@@ -13091,10 +13115,105 @@ pub fn game_main(event_loop: Option<EventLoop<()>>) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
+/// The lobby screen of the session's game: MC2's temple doorway
+/// (HSCREEN0 case 7) or MC1/HW's PMULTI — two views over one lobby,
+/// speaking the same [`lobby_mc2::LobbyAction`]s.
+enum LobbyUi {
+    Mc2(Box<lobby_mc2::LobbyScreen>),
+    Mc1(Box<lobby_mc1::Mc1LobbyScreen>),
+}
+
+impl LobbyUi {
+    fn update(&mut self, view: &lobby::LobbyView) {
+        match self {
+            Self::Mc2(s) => s.update(view),
+            Self::Mc1(s) => s.update(view),
+        }
+    }
+
+    fn set_rules(&mut self, rows: Vec<lobby_mc2::RuleRow>, passphrase: Option<String>) {
+        match self {
+            Self::Mc2(s) => s.set_rules(rows, passphrase),
+            Self::Mc1(s) => s.set_rules(rows, passphrase),
+        }
+    }
+
+    fn tick(&mut self, dt: f32) {
+        match self {
+            Self::Mc2(s) => s.tick(dt),
+            Self::Mc1(s) => s.tick(dt),
+        }
+    }
+
+    fn take_actions(&mut self) -> Vec<lobby_mc2::LobbyAction> {
+        match self {
+            Self::Mc2(s) => s.take_actions(),
+            Self::Mc1(s) => s.take_actions(),
+        }
+    }
+
+    /// The click samples (MC1's lobby is silent, as retail's).
+    fn take_sounds(&mut self) -> Vec<u8> {
+        match self {
+            Self::Mc2(s) => s.take_sounds(),
+            Self::Mc1(_) => Vec::new(),
+        }
+    }
+
+    fn click(&mut self, size: (f32, f32), cursor: (f32, f32)) {
+        match self {
+            Self::Mc2(s) => s.click(size, cursor),
+            Self::Mc1(s) => s.click(size, cursor),
+        }
+    }
+
+    fn escape(&mut self) {
+        match self {
+            Self::Mc2(s) => s.escape(),
+            Self::Mc1(s) => s.escape(),
+        }
+    }
+
+    fn editing(&self) -> bool {
+        match self {
+            Self::Mc2(s) => s.editing(),
+            Self::Mc1(s) => s.editing(),
+        }
+    }
+
+    fn key_char(&mut self, c: char) {
+        match self {
+            Self::Mc2(s) => s.key_char(c),
+            Self::Mc1(s) => s.key_char(c),
+        }
+    }
+
+    fn key_backspace(&mut self) {
+        match self {
+            Self::Mc2(s) => s.key_backspace(),
+            Self::Mc1(s) => s.key_backspace(),
+        }
+    }
+
+    fn key_enter(&mut self) {
+        match self {
+            Self::Mc2(s) => s.key_enter(),
+            Self::Mc1(s) => s.key_enter(),
+        }
+    }
+
+    fn alert(&mut self, text: String) {
+        match self {
+            Self::Mc2(s) => s.alert(text),
+            Self::Mc1(s) => s.alert(text),
+        }
+    }
+}
+
 /// The netplay lobby between games: the session and its screen.
 struct NetLobby {
     guest: net::Guest,
-    screen: lobby_mc2::LobbyScreen,
+    screen: LobbyUi,
     /// The rules the scroll's rows were last read from (and the
     /// admin's passphrase).
     rules_shown: Option<(serde_json::Value, u8, Option<String>)>,
@@ -13173,12 +13292,10 @@ fn name_humans(names: &[(u8, String)], views: &mut [mgc_sim::engine::world::Riva
     }
 }
 
-/// MC2's arenas — retail levels 50-59, the lobby's level list.
-const MC2_ARENAS: std::ops::RangeInclusive<u32> = 50..=59;
-
-fn mc2_arena_path(n: u32) -> String {
+/// Arena level `n` of `game` (`NetGame::arenas`, the lobby's list).
+fn arena_path(game: lobby::NetGame, n: u32) -> String {
     get_baked_directory()
-        .join(format!("mc2/level-{n:03}.mgcl"))
+        .join(format!("{}/level-{n:03}.mgcl", game.key()))
         .to_string_lossy()
         .into_owned()
 }
@@ -13189,10 +13306,16 @@ fn arena_of(path: &str) -> Option<u32> {
     stem.strip_prefix("level-")?.parse().ok()
 }
 
-/// The lobby's level field: retail `"%d. %s"` with `level − 49`.
+/// The lobby's level field: retail `"%d. %s"` with `level − 49` (MC2's
+/// names; MC1's list names its arenas itself, so here just the number).
 fn arena_label(path: &str) -> String {
+    let mc2 = lobby::NetGame::of_level(path).is_none_or(|g| g == lobby::NetGame::Mc2);
     arena_of(path).map_or_else(String::new, |n| {
-        format!("{}. {}", n.saturating_sub(49), worldmap::mc2_level_name(n))
+        if mc2 {
+            format!("{}. {}", n.saturating_sub(49), worldmap::mc2_level_name(n))
+        } else {
+            format!("arena {}", n.saturating_sub(49))
+        }
     })
 }
 
@@ -13349,7 +13472,11 @@ impl App {
         } else {
             p.join_port
         };
-        if let Some(m) = &mut self.mainmenu {
+        if self.mc1_frontend() {
+            if let Some(m) = &mut self.mc1menu {
+                m.open_network(p.recent, port, join_port, p.passphrase);
+            }
+        } else if let Some(m) = &mut self.mainmenu {
             m.open_network(p.recent, port, join_port, p.passphrase);
         }
     }
@@ -13357,13 +13484,36 @@ impl App {
     fn net_message(&mut self, text: impl Into<String>) {
         let text = text.into();
         eprintln!("net: {text}");
-        if let Some(m) = &mut self.mainmenu {
+        if self.mc1_frontend() {
+            if let Some(m) = &mut self.mc1menu {
+                m.open_message(text);
+            }
+        } else if let Some(m) = &mut self.mainmenu {
             m.open_message(text);
         }
     }
 
+    /// The running campaign is MC1 or HW (their 320×200 frontend).
+    fn mc1_frontend(&self) -> bool {
+        self.campaign
+            .as_ref()
+            .is_some_and(|c| c.id != campaign::CampaignId::Mc2)
+    }
+
     fn open_lobby(&mut self, guest: net::Guest) {
-        match lobby_mc2::LobbyScreen::load(&get_baked_directory().join("assets/mc2-ui")) {
+        let game = guest.view().game;
+        let screen = match game {
+            lobby::NetGame::Mc2 => {
+                lobby_mc2::LobbyScreen::load(&get_baked_directory().join("assets/mc2-ui"))
+                    .map(|s| LobbyUi::Mc2(Box::new(s)))
+            }
+            lobby::NetGame::Mc1 | lobby::NetGame::Mc1hw => lobby_mc1::Mc1LobbyScreen::load(
+                &get_baked_directory().join("assets/mc1-ui"),
+                game == lobby::NetGame::Mc1hw,
+            )
+            .map(|s| LobbyUi::Mc1(Box::new(s))),
+        };
+        match screen {
             Ok(screen) => {
                 self.netlobby = Some(NetLobby {
                     guest,
@@ -13392,7 +13542,7 @@ impl App {
             game: self.net_game(),
             passphrase: passphrase.clone(),
             build: net::build_id(),
-            level: mc2_arena_path(*MC2_ARENAS.start()),
+            level: arena_path(self.net_game(), *self.net_game().arenas().start()),
             rules: rules::session(&self.cfg),
             admin_key: None,
             frozen_after: net::FROZEN_AFTER,
@@ -13426,8 +13576,9 @@ impl App {
         self.connect_lobby(net_addr(&addr, "127.0.0.1"), passphrase, String::new());
     }
 
-    /// The game this app's lobby plays — the running campaign's (the
-    /// MC2 temple's Multiplayer button is the only way in so far).
+    /// The game this app's lobby plays — the running campaign's (its
+    /// main menu's Multiplayer button is the way in: MC2's temple, MC1 /
+    /// HW's button 3).
     fn net_game(&self) -> lobby::NetGame {
         match self.campaign.as_ref().map(|c| c.id) {
             Some(campaign::CampaignId::Mc1) => lobby::NetGame::Mc1,
@@ -13454,7 +13605,11 @@ impl App {
                 std::time::Duration::from_secs(10),
             )
         }));
-        if let Some(m) = &mut self.mainmenu {
+        if self.mc1_frontend() {
+            if let Some(m) = &mut self.mc1menu {
+                m.open_connecting();
+            }
+        } else if let Some(m) = &mut self.mainmenu {
             m.open_connecting();
         }
     }
@@ -13473,6 +13628,9 @@ impl App {
                 .unwrap_or_else(|_| Err("the connection attempt crashed".into()))
         });
         if let Some(m) = &mut self.mainmenu {
+            m.close_connecting();
+        }
+        if let Some(m) = &mut self.mc1menu {
             m.close_connecting();
         }
         match joined {
@@ -13541,7 +13699,27 @@ impl App {
         let actions = nl.screen.take_actions();
         let sounds = nl.screen.take_sounds();
         let mut quads = vec![ui::solid([0.0, 0.0, size.0, size.1], [0.0, 0.0, 0.0, 1.0])];
-        quads.extend(nl.screen.quads(size, cursor, &arena_label(&view.level)));
+        // MC1's screen composes on the CPU: its frame IS the atlas.
+        let mut frame = None;
+        match &mut nl.screen {
+            LobbyUi::Mc2(s) => quads.extend(s.quads(size, cursor, &arena_label(&view.level))),
+            LobbyUi::Mc1(s) => {
+                let (rgba, q) = s.frame(size, cursor);
+                quads.extend(q);
+                frame = Some((rgba, s.has_pointer()));
+            }
+        }
+        // MC1: the frame carries the menu's hand, else the software arrow.
+        match frame {
+            Some((_, true)) => {
+                if let Some(w) = &self.window {
+                    w.set_cursor_visible(false);
+                }
+            }
+            Some((_, false)) => self.append_software_cursor(&mut quads),
+            None => {}
+        }
+        let Some(nl) = &mut self.netlobby else { return };
         if !sounds.is_empty()
             && self.cfg.audio.sound
             && let Some(a) = &mut self.audio
@@ -13555,10 +13733,17 @@ impl App {
             }
         }
         if let Some(r) = &mut self.renderer {
-            if self.ui_atlas != UiAtlas::LobbyMc2 {
-                let (w, h, px) = nl.screen.atlas();
-                r.load_ui_atlas(w, h, px);
-                self.ui_atlas = UiAtlas::LobbyMc2;
+            match (&nl.screen, frame) {
+                (_, Some((rgba, _))) => {
+                    r.load_ui_atlas(320, 200, &rgba);
+                    self.ui_atlas = UiAtlas::LobbyMc1;
+                }
+                (LobbyUi::Mc2(s), None) if self.ui_atlas != UiAtlas::LobbyMc2 => {
+                    let (w, h, px) = s.atlas();
+                    r.load_ui_atlas(w, h, px);
+                    self.ui_atlas = UiAtlas::LobbyMc2;
+                }
+                _ => {}
             }
             r.set_ui_quads(quads);
         }
@@ -13590,6 +13775,11 @@ impl App {
                     g.pick_wizard(w);
                 }
             }
+            A::PickWizard(w) => {
+                if view.is_free(w) {
+                    g.pick_wizard(w);
+                }
+            }
             // Play: the admin's starts the game (the server checks the
             // agreement); everyone else's toggles his agreement.
             A::Play if admin => g.play(),
@@ -13603,7 +13793,8 @@ impl App {
             // The rest are the admin's.
             _ if !admin => {}
             A::PrevLevel | A::NextLevel => {
-                let (lo, hi) = (*MC2_ARENAS.start(), *MC2_ARENAS.end());
+                let arenas = view.game.arenas();
+                let (lo, hi) = (*arenas.start(), *arenas.end());
                 let n = arena_of(&view.level).unwrap_or(lo);
                 let n = match (forward, n) {
                     (true, n) if n >= hi => lo,
@@ -13611,8 +13802,13 @@ impl App {
                     (false, n) if n <= lo => hi,
                     (false, n) => n - 1,
                 };
-                g.set_level(mc2_arena_path(n));
+                g.set_level(arena_path(view.game, n));
             }
+            A::SetArena(n) if view.game.arenas().contains(&n) => {
+                g.set_level(arena_path(view.game, n));
+            }
+            A::SetArena(_) => {}
+            A::SetCapacity(n) => g.set_capacity(n.clamp(2, net::MAX_PLAYERS)),
             A::Kick(id) => g.kick(id),
             A::CycleCapacity => {
                 let next = usize::from(view.capacity) + 1;
@@ -13874,6 +14070,22 @@ fn net_verdict(w: &mgc_sim::engine::world::World, names: &[(u8, String)]) -> Opt
     Some(format!("{winner} is victorious!"))
 }
 
+/// The wizard seats a level authors a start marker for (bit k = seat
+/// k; `entities::player_start_seat`) — all eight when it can't be read
+/// (the game's start reports the real error).
+fn level_open_seats(path: &std::path::Path) -> u8 {
+    let Ok(package) = std::fs::File::open(path)
+        .map_err(|e| e.to_string())
+        .and_then(|f| mgcl::read(std::io::BufReader::new(f)).map_err(|e| e.to_string()))
+    else {
+        return u8::MAX;
+    };
+    let game = mgc_sim::ids::GameId::from(package.meta.game);
+    (0..8u8)
+        .filter(|&k| entities::player_start_seat(game, &package.things.things, k).is_some())
+        .fold(0, |m, k| m | 1 << k)
+}
+
 /// The server's own world (`net::Referee`): every lobby game built the
 /// way each player builds his (`net_level` + `session_sim`, the
 /// session's rules over the defaults), stepped headless with every
@@ -13930,6 +14142,10 @@ impl net::Referee for ServerWorld {
     fn verdict(&self) -> Option<String> {
         let w = self.sim.as_ref()?.world.as_ref()?;
         net_verdict(w, &self.names)
+    }
+
+    fn open_seats(&self, level: &str) -> u8 {
+        level_open_seats(std::path::Path::new(level))
     }
 
     fn end(&mut self) {
@@ -15053,6 +15269,71 @@ mod net_lockstep_tests {
             )
             .err();
             assert!(err.is_none(), "arena {i}: {err:?}");
+        }
+    }
+
+    /// Every MC1 and HW arena (the PMULTI list: MC1 50-69, HW 50-59)
+    /// authors all eight seats but MC1's Comari (69), which authors four
+    /// (the lobby holds its members to them, `LobbyCore::set_open`); its
+    /// authored seats all load together, and two humans load on its last
+    /// two.
+    #[test]
+    fn every_mc1_arena_seats_its_authored_seats() {
+        for (game, arenas) in [("mc1", 50..=69), ("mc1hw", 50..=59)] {
+            if !level(game, 50).exists() {
+                eprintln!("skipping: no baked {game} arenas");
+                continue;
+            }
+            for i in arenas {
+                let open = super::level_open_seats(&level(game, i));
+                let want = match (game, i) {
+                    ("mc1", 69) => 0x0F,
+                    _ => 0xFF,
+                };
+                assert_eq!(open, want, "{game} arena {i}");
+                let all: Vec<u8> = (0..8).filter(|k| open & 1 << k != 0).collect();
+                for seats in [&all[..], &all[all.len() - 2..]] {
+                    let err = load_level(
+                        &level(game, i),
+                        None,
+                        true,
+                        &SpellbookSeed::Level,
+                        &[],
+                        None,
+                        None,
+                        false,
+                        seats,
+                    )
+                    .err();
+                    assert!(err.is_none(), "{game} arena {i} seats {seats:?}: {err:?}");
+                }
+            }
+        }
+    }
+
+    /// A network game's humans all start with the arena's own book —
+    /// retail's networked arm: wizard row 0, `starting_spells ∧
+    /// allowed_spells` (Bussorah: Fireball, Possess, Create Castle) —
+    /// not the empty campaign carry (player-reported 2026-10-17: no
+    /// castle, unplayable). HW's Halaj (59) authors a wide start.
+    #[test]
+    fn network_humans_start_with_the_arenas_book() {
+        for (game, arena, want) in [
+            ("mc1", 50, vec![0u8, 3, 16]),
+            ("mc1", 68, vec![]),
+            ("mc1hw", 53, (0..24).collect()),
+        ] {
+            let Some(sim) = net_sim(game, arena, &[0, 5], 0) else {
+                eprintln!("skipping: no baked {game} {arena}");
+                continue;
+            };
+            let w = sim.world.as_ref().unwrap();
+            for k in 0..2 {
+                let owned: Vec<u8> = (0..24u8)
+                    .filter(|&s| w.loadout(Hx(k)).owned[s as usize])
+                    .collect();
+                assert_eq!(owned, want, "{game} {arena} human {k}");
+            }
         }
     }
 

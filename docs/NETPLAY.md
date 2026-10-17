@@ -43,6 +43,52 @@ Closing the hosting app — or its player's Exit from the lobby — with
 other players on its server warns first ("N players still in this
 session - close/exit again…"); the second try within 5 s stops the
 server.
+**In the game (MC1 / Hidden Worlds, 2026-10-17, first pass for the
+player to assess):** `mgcarpet --campaign mc1` (or `mc1hw`) → the main
+menu's Multiplayer button (retail's `-network`-gated button 3, always live
+here) → the "Network session" parchment: Host / Join, Port (and Address),
+Passphrase — Enter walks the fields, Tab cycles them → the retail PMULTI
+lobby (frontend selector 4, `lobby_mc1.rs`; recon
+`docs/traces/mc1-multiplayer-lobby.md`):
+- the seat icons = wizard seats (MC1's colour is the seat): lit = a
+  member's (blinking until he agrees; the host's steady), idle = free,
+  off = the session is full or the arena authors no start for it; click
+  a free seat to take it; the host clicks an off seat to open a place,
+  another member's seat to kick (confirmed on the parchment); each held
+  seat's player name sits on its icon's column (FONT1, outlined) — the
+  top row's on two zig-zag lines above it, the bottom row's on two
+  below (player design 10-17); yours white, the others gold; hover a lit
+  seat for its name with (host) / (agreed);
+- the map list (retail's 5 rows, up / down strips scroll): the host
+  picks the arena (MC1 levels 50-69 Bussorah..Comari, HW 50-59
+  Goyaan..Halaj — names baked from the EXEs' `off_99A84`), everyone sees
+  it selected (white);
+- the channel box reads "Rules": the session rules on the SCROLL.DAT
+  parchment — the passphrase (the host's), Players (in / limit) and the
+  same rows as MC2's scroll; the host steps them, clients read;
+- START: the host's starts once everyone agreed, a client's toggles his
+  agreement; EXIT / Esc leaves (a hosting player: warned first);
+- the status line under the seats says what the lobby waits for; the
+  screen is silent (retail stops the music); retail's ABORT has nothing
+  to abort (the join happens on the menu).
+
+**Starting spells (MC1/HW):** every networked human starts with the
+arena's own book — retail's network arm (remc1 :49200-04, :49237-40):
+the level's wizard ROW 0, `starting_spells ∧ allowed_spells`, no
+campaign carry (Bussorah: Fireball, Possess, Create Castle; most arenas
+a similar three, a few wide or empty — HW Barabban (53) grants all 24,
+MC1 Nurrir (68) none). The jars are the rest. Before 10-17 the port gave
+a network human the (empty) campaign carry — no castle, unplayable.
+Pinned by `network_humans_start_with_the_arenas_book`.
+
+**Authored seats:** the server reads which wizard seats the lobby's level
+authors a start marker for (`net::Referee::open_seats` →
+`LobbyCore::set_open`, `LobbyView::open`): only those can be held, the
+player limit and AI count cap at them, a member on a missing seat moves
+to a free one, and Play waits ("Too many players for this arena") while
+the members outnumber them. Of every arena only MC1's Comari (69) is
+short (four seats); MC2's ten and HW's ten author all eight.
+
 The campaign steps aside for a lobby game (no campaign book — every seat
 gets the level's own — and no campaign progress or saves). Entries
 persist in `saves/netplay.json` (recent hosts, port, passphrase).

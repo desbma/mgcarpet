@@ -157,7 +157,11 @@ pub const FORMAT_VERSION: u32 = 2;
 ///    `lobby-bg.bin` / `lobby-pal.bin`, `lobby-sprites.{bin,json}` and
 ///    the eight wizard portraits (`lobby-portraits.{bin,json}`,
 ///    `lobby-portrait-pals.bin`).
-pub const BAKE_EPOCH: u32 = 28;
+/// 29: `assets/mc1-ui` gains the MC1/HW multiplayer lobby (PMULTI,
+///    frontend selector 4): `pmulti-bg.bin` / `pmulti-pal.bin`,
+///    `pmulti-sprites.{bin,json}` (PMULTSPR), `sfont1.{bin,json}` and
+///    `arena-names.json` (the EXEs' `off_99A84` tables).
+pub const BAKE_EPOCH: u32 = 29;
 
 /// Which original game an asset belongs to. Serialized as the short
 /// tags used in `meta.json`.

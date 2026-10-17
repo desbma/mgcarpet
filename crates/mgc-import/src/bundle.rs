@@ -934,6 +934,48 @@ fn exe_level_names(exe: &[u8]) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// The file offset of an LE executable's object loaded at `base` (the
+/// MZ header's `e_lfanew` → "LE"; object table at LE+0x40, data pages
+/// at LE+0x80). The repo-root EXEs and the CD's differ only in their
+/// stub, so the object's offset moves (CARPET data: 0x957F8 vs 0x91600).
+fn le_object_file_offset(exe: &[u8], base: u32) -> Option<usize> {
+    let u32_at = |at: usize| Some(u32::from_le_bytes(exe.get(at..at + 4)?.try_into().ok()?));
+    let le = u32_at(0x3C)? as usize;
+    if exe.get(le..le + 2)? != b"LE" {
+        return None;
+    }
+    let page = u32_at(le + 0x28)? as usize;
+    let table = le + u32_at(le + 0x40)? as usize;
+    let pages = u32_at(le + 0x80)? as usize;
+    (0..u32_at(le + 0x44)? as usize).find_map(|i| {
+        let ent = table + 24 * i;
+        (u32_at(ent + 4)? == base).then_some(())?;
+        Some(pages + (u32_at(ent + 12)? as usize).checked_sub(1)? * page)
+    })
+}
+
+/// The lobby's arena names (`off_99A84`): a table of `count` pointers
+/// at data VA 0x99A84 in both EXEs. The pointers are stored UNRELOCATED
+/// (offsets into the data object at VA 0x90000), so a name's file
+/// offset is the pointer + the data object's file offset
+/// (docs/traces/mc1-multiplayer-lobby.md §4). Every entry must be a
+/// short printable string, otherwise this is not the shipped EXE and
+/// the result is None.
+fn exe_arena_names(exe: &[u8], count: usize) -> Option<Vec<String>> {
+    let data = le_object_file_offset(exe, 0x90000)?;
+    let table = 0x99A84 - 0x90000 + data;
+    (0..count)
+        .map(|i| {
+            let at = table + 4 * i;
+            let p = u32::from_le_bytes(exe.get(at..at + 4)?.try_into().ok()?) as usize;
+            let start = p.checked_add(data)?;
+            let len = exe.get(start..)?.iter().take(33).position(|&b| b == 0)?;
+            let s = std::str::from_utf8(&exe[start..start + len]).ok()?;
+            (!s.is_empty() && s.bytes().all(|b| (0x20..0x7f).contains(&b))).then(|| s.to_string())
+        })
+        .collect()
+}
+
 /// The MC1/HW frontend bundle → `assets/mc1-ui/`: the 320×200 main
 /// menu (bg + palette + MMMASK hotspot bitmap + MMSPR button/dialog
 /// sprites), the GLOBE/TIMER menu animations (Bullfrog FMV deltas,
@@ -1313,6 +1355,79 @@ pub fn bake_mc1_menu(src: &GameSource, out_dir: &Path) -> Result<Vec<(String, St
                 ppal.len()
             );
         }
+    }
+
+    // PMULTI: the multiplayer lobby (frontend selector 4,
+    // `sub_4D680_4D9C0`; docs/traces/mc1-multiplayer-lobby.md §2, §8),
+    // epoch 29. The 320×200 background + palette, the PMULTSPR seat
+    // icons (26 entries, 640-space: [1-8] off, [9-16] idle, [17-24]
+    // connected) and SFONT1, the lobby's text font (`sub_51480`,
+    // :59763 — also the MC1 movie subtitle font, baked separately
+    // into `mc1-movies`). Optional: an older install just has no
+    // lobby art.
+    let pmulti = [
+        "PMULTI.DAT",
+        "PMULTI.PAL",
+        "PMULTSPR.DAT",
+        "PMULTSPR.TAB",
+        "SFONT1.DAT",
+        "SFONT1.TAB",
+    ];
+    if pmulti
+        .iter()
+        .all(|f| src.exists(&format!("DATA/SCREENS/{f}")))
+    {
+        let lbg = get("DATA/SCREENS/PMULTI.DAT")?;
+        let lpal = get("DATA/SCREENS/PMULTI.PAL")?;
+        if lbg.len() != 64_000 || lpal.len() != 768 {
+            return Err(BakeError::Level(
+                Path::new("DATA/SCREENS/PMULTI.DAT").to_path_buf(),
+                0,
+                format!("unexpected sizes: bg {} pal {}", lbg.len(), lpal.len()),
+            ));
+        }
+        emit("pmulti-bg.bin", &lbg)?;
+        emit("pmulti-pal.bin", &lpal)?;
+        for (stem, out) in [("PMULTSPR", "pmulti-sprites"), ("SFONT1", "sfont1")] {
+            let rel = format!("DATA/SCREENS/{stem}.DAT");
+            let dat = get(&rel)?;
+            let tab = get(&format!("DATA/SCREENS/{stem}.TAB"))?;
+            let decoded = crate::hspr::decode(&dat, &tab)
+                .map_err(|e| BakeError::Level(Path::new(&rel).to_path_buf(), 0, e.to_string()))?;
+            let packed = sprites::pack(&decoded, UI_ATLAS_WIDTH);
+            emit(&format!("{out}.bin"), &packed.atlas)?;
+            emit(
+                &format!("{out}.json"),
+                &serde_json::to_vec_pretty(&packed.index).expect("sprite index serializes"),
+            )?;
+        }
+        for f in pmulti {
+            sources.push(BundleSource {
+                file: f.into(),
+                sha256: hex(&Sha256::digest(&get(&format!("DATA/SCREENS/{f}"))?)),
+            });
+        }
+    } else {
+        eprintln!("note: mc1: no DATA/SCREENS/PMULTI* — skipping the lobby art");
+    }
+
+    // The lobby's arena names (`off_99A84[row]`, drawn in the map
+    // list): MC1 levels 50-69, HW 50-59. Optional like the world names.
+    let mut arenas = serde_json::Map::new();
+    for (key, exe, count) in [("mc1", "CARPET.EXE", 20), ("mc1hw", "HIDDEN.EXE", 10)] {
+        let Ok(raw) = src.read(exe) else { continue };
+        match exe_arena_names(&raw, count) {
+            Some(list) => {
+                arenas.insert(key.into(), list.into());
+            }
+            None => eprintln!("note: mc1: no arena-name table in {exe}"),
+        }
+    }
+    if !arenas.is_empty() {
+        emit(
+            "arena-names.json",
+            &serde_json::to_vec_pretty(&arenas).expect("arena names serialize"),
+        )?;
     }
 
     // The world names the performance screen titles itself with
