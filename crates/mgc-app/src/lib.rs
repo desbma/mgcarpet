@@ -319,11 +319,7 @@ fn request_time_listener() -> bool {
     !*V.get_or_init(|| std::env::var_os("MGC_NO_REQUEST_TIME_LISTENER").is_some())
 }
 
-fn campaign_record(
-    tag: &str,
-    slot: usize,
-    new_game: bool,
-) -> Result<Option<SlotRecord>, String> {
+fn campaign_record(tag: &str, slot: usize, new_game: bool) -> Result<Option<SlotRecord>, String> {
     if new_game {
         return Ok(None);
     }

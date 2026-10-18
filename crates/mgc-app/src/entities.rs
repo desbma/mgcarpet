@@ -3245,7 +3245,14 @@ mod tests {
         // and its 2x2 dot leaves both walks once swapped.
         icons.portal_icons.insert(223, mini);
         for game in [GameId::Mc1, GameId::Mc2] {
-            let s = map_stamps_from_poses(game, &[pose(10, 34, false, 223)], &icons, false, false, true);
+            let s = map_stamps_from_poses(
+                game,
+                &[pose(10, 34, false, 223)],
+                &icons,
+                false,
+                false,
+                true,
+            );
             assert_eq!(s.len(), 1);
             assert_eq!(s[0].uv, mini.uv);
             assert!(matches!(
