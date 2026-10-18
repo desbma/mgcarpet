@@ -844,14 +844,26 @@ impl Server {
     /// `frozen_after`: still playing, silent that long, and missing
     /// from the next turn (the others ran ahead and wait on him — they
     /// are silent too, but not missing).
+    ///
+    /// No pending turn at all means nobody has run ahead — nobody is
+    /// waiting on anybody (the game's first inputs not in yet: a slow
+    /// load is not a hang). Then only a whole-table hang, silent four
+    /// times as long, is dropped, so a game of hung apps still ends.
+    /// (Counting "no turn" as "missing from it" dropped EVERY player
+    /// whose first input came late — a waiting one too; seen on macOS
+    /// as the frozen-player test dropping the player that played on.)
     fn drop_frozen(&mut self) {
         let Some(g) = &self.game else { return };
         let next = g.pending.get(&g.next_complete);
         let frozen: Vec<u32> = (0..g.ids.len())
             .filter(|&ix| {
                 g.active(ix)
-                    && g.heard[ix].elapsed() > self.frozen_after
-                    && next.is_none_or(|turn| turn[ix].is_none())
+                    && match next {
+                        Some(turn) => {
+                            turn[ix].is_none() && g.heard[ix].elapsed() > self.frozen_after
+                        }
+                        None => g.heard[ix].elapsed() > self.frozen_after * 4,
+                    }
             })
             .map(|ix| g.ids[ix])
             .collect();
