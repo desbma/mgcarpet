@@ -6055,6 +6055,20 @@ impl App {
         }
         self.screen = Screen::Map;
         self.confine_map_pointer();
+        // One-shot pointer recenter (player-reported 2026-10-17): in
+        // flight the pointer is grabbed and only its DELTAS count, so
+        // it is left wherever it drifted — usually on a window edge,
+        // which on the map is the edge-scroll band, and the map lurched
+        // away from the level it had just anchored on. Centred, it
+        // scrolls nothing until the player moves it.
+        let size = self.view_size();
+        self.cursor = (size.0 * 0.5, size.1 * 0.5);
+        if let Some(w) = &self.window {
+            let _ = w.set_cursor_position(winit::dpi::PhysicalPosition::new(
+                self.cursor.0 as f64,
+                self.cursor.1 as f64,
+            ));
+        }
         // Map entry: the carpet parks on the level just played
         // (completed, failed or replayed), the camera anchors, the
         // narrative latch re-arms; the new portal pops on sight.
