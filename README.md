@@ -1,6 +1,6 @@
 # mgcarpet
 
-A modern, cross-platform engine reimplementation of Bullfrog's
+A modern, cross-platform engine port/reimplementation of Bullfrog's
 **Magic Carpet** (1994), its **Hidden Worlds** expansion, and
 **Magic Carpet 2: The Netherworlds** (1995), written from scratch in Rust
 on wgpu (WGSL shaders), winit and cpal.
@@ -22,6 +22,29 @@ behavioral fidelity by default, deviations deliberate and opt-in.
 
 It is built with heavy use of Claude Code (Fable / Opus) as well as other
 AI tools.
+
+However, this is not a "cleanroom AI decompile", the likes of which
+have been popping up lately. Decompile has been used primarily in the
+early stages as a reference, and is not a fundamental part. All
+features are implemented deliberately, most to faithfully match what the
+original look & feel of the retail game was like, but never blindly or
+mindlessly. And given the buggy state of the retail games, a substantial
+amount of deliberate usually subtle deviations have been implemented to
+improve playability, graphics, effects, etc., over the original legendary,
+but nonetheless dated game.
+
+The primary mechanism for ensuring correctness is not 1:1 decompile,
+rather per-tick comparisons to recorded retail gameplay, which results
+in faithfulness of the outcome, rather than the means. Even though the
+code structure, especially for the sim, may resemble what retail looked
+like, it is nonetheless cleaned up and fixed, wherever that was needed.
+
+And most importantly, the sim, and with it the general game behaviour,
+is where the attempts at real faithfulness end. The entire graphics
+rendering pipeline is intentionally discarded and built from scratch,
+with the intent to look like the original retail game, while at the same
+time leveraging all modern technologies that make it far more stable
+and playable.
 
 ![Magic Carpet 1 - Final level](docs/media/mc1-l49.webp)
 ![Hidden Worlds - Level 20 rough start](docs/media/mc1hw-l20.webp)
@@ -98,6 +121,10 @@ divergence is registered rather than papered over.
 Deviations from the retail game are deliberate - bug fixes or playability
 improvements - and nearly all of them can be switched back to the retail
 behaviour with a toggle.
+
+Multiplayer is functional, but mostly redesigned to take the good from
+the original game, while also bringing in stability as well as other modes
+of playing.
 
 The main issue of all retail Magic Carpet games is the dreaded entity pool
 with its highly limited size and frequent overflows, resulting in strange
