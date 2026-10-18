@@ -3315,7 +3315,7 @@ impl App {
                     .render
                     .preference
                     .fullscreen
-                    .then_some(winit::window::Fullscreen::Borderless(None)),
+                    .then(|| winit::window::Fullscreen::Borderless(window_monitor(window))),
             );
         }
     }
@@ -6769,7 +6769,7 @@ impl App {
         let monitor = self
             .window
             .as_ref()
-            .and_then(|w| w.current_monitor())
+            .and_then(|w| window_monitor(w))
             .map(|m| (m.size().width, m.size().height));
         l.set_monitor(monitor);
         let (rgba, quads) = l.frame(size, self.cursor, &self.cfg);
@@ -11903,6 +11903,36 @@ fn mc1_campaign_carry(run: Option<&CampaignRun>) -> Vec<u8> {
 /// every tick (EF:60665, :55628) — solid monochrome until Space.
 /// The quick keys as campaign carry: `None` while nothing is bound, so
 /// an unbound campaign keeps the old save shape and seeds from scratch.
+/// The monitor a window sits on: the one its frame overlaps most,
+/// computed here rather than left to `Borderless(None)`. winit's own
+/// answer is a cached guess on X11 (updated as the window moves), and
+/// a window as large as or larger than its monitor — the Full HD / QHD
+/// / 4K window sizes — can leave that guess on the first monitor, so
+/// fullscreen jumped there (player-reported 2026-10-18). Falls back to
+/// winit's answer when the position is unknown (Wayland reports none).
+fn window_monitor(window: &Window) -> Option<winit::monitor::MonitorHandle> {
+    let Ok(pos) = window.outer_position() else {
+        return window.current_monitor();
+    };
+    let size = window.outer_size();
+    let (x0, y0) = (i64::from(pos.x), i64::from(pos.y));
+    let (x1, y1) = (x0 + i64::from(size.width), y0 + i64::from(size.height));
+    window
+        .available_monitors()
+        .map(|m| {
+            let (mp, ms) = (m.position(), m.size());
+            let (mx0, my0) = (i64::from(mp.x), i64::from(mp.y));
+            let (mx1, my1) = (mx0 + i64::from(ms.width), my0 + i64::from(ms.height));
+            let w = (x1.min(mx1) - x0.max(mx0)).max(0);
+            let h = (y1.min(my1) - y0.max(my0)).max(0);
+            (w * h, m)
+        })
+        .filter(|(area, _)| *area > 0)
+        .max_by_key(|(area, _)| *area)
+        .map(|(_, m)| m)
+        .or_else(|| window.current_monitor())
+}
+
 fn quick_keys_carry(binds: &[Option<u8>; 10]) -> Option<[Option<u8>; 10]> {
     binds.iter().any(Option::is_some).then_some(*binds)
 }
