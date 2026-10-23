@@ -5808,8 +5808,12 @@ impl World {
         } else {
             0
         };
+        // The (10,23) bolt hit-flash: `sub_3AE80` (:47062) sets bit 0,
+        // which the original's billboard test (`& 0x21`, :36830) skips,
+        // and no particle rides it — retail draws nothing.
+        let hit_flash = e.class64 == 10 && e.model65 == 23 && e.flags & 1 != 0;
         PoseGameBits {
-            skip: false,
+            skip: hit_flash,
             segment,
             life_frac,
             blend,
@@ -30529,6 +30533,26 @@ mod tests {
         assert!(
             !w.live_poses(Hx::FIRST).iter().any(|p| p.slot == s as u16),
             "the (10,25) blast must not draw"
+        );
+        w.g.ent[s].flags &= !1;
+        assert!(
+            w.live_poses(Hx::FIRST).iter().any(|p| p.slot == s as u16),
+            "positive control: with bit 0 clear the model is still posed"
+        );
+    }
+
+    /// The MC1 (10,23) bolt hit-flash is invisible in retail: `sub_3AE80`
+    /// (:47062) sets byte[0] bit 0, nothing clears it, and every billboard
+    /// pass skips `& 0x21` (:36830).
+    /// POSITIVE CONTROL: clearing bit 0 brings the pose back.
+    #[test]
+    fn the_mc1_bolt_hit_flash_draws_no_billboard() {
+        let mut w = flat_world();
+        let s = w.g.spawn_effect(23, 0x8000, 0x8000, 800).expect("flash spawns");
+        assert_ne!(w.g.ent[s].flags & 1, 0, "the ctor sets byte[0] bit 0");
+        assert!(
+            !w.live_poses(Hx::FIRST).iter().any(|p| p.slot == s as u16),
+            "the (10,23) hit-flash must not draw"
         );
         w.g.ent[s].flags &= !1;
         assert!(
